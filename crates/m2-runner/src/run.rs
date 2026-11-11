@@ -1048,6 +1048,68 @@ mod tests {
         Ok(())
     }
 
+    /// The submission slot keeps the NUT on one core for the whole window.
+    ///
+    /// That is the only thing the margin is for. A package submitted in the
+    /// last slot of a rotation names a core the node stops holding before it
+    /// can share and distribute, and the lane would record a node that did
+    /// nothing wrong as having failed to share.
+    #[test]
+    fn a_submission_slot_holds_its_core_for_the_whole_margin(
+    ) -> Result<(), m2_reference::chain::ChainError> {
+        let chain = anchored_chain(47000)?;
+        let margin = 2u32;
+        let rotation = jam_types::rotation_period();
+
+        // Every starting point in a rotation, so the one that has to skip
+        // ahead is covered rather than whichever the clock happens to land on.
+        for offset in 0..rotation {
+            let from = chain.best_slot() + offset;
+            let plan = chain
+                .submission_slot_for(TEST_NUT_INDEX, from, margin)
+                .expect("a slot within one rotation always qualifies");
+            assert!(plan.slot >= from, "the plan never aims into the past");
+            assert!(
+                plan.slot < from + rotation,
+                "and never further than one rotation out"
+            );
+            assert_eq!(
+                chain.core_for(TEST_NUT_INDEX, plan.slot),
+                Some(plan.core),
+                "the plan names the core the NUT actually holds"
+            );
+            for slot in plan.slot..plan.slot + margin {
+                assert_eq!(
+                    chain.core_for(TEST_NUT_INDEX, slot),
+                    Some(plan.core),
+                    "the core must not move under the node during the window \
+                     (start {}, slot {slot})",
+                    plan.slot
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A margin no rotation can satisfy has no answer, rather than a slot
+    /// that silently fails to hold.
+    #[test]
+    fn a_margin_longer_than_a_rotation_has_no_submission_slot(
+    ) -> Result<(), m2_reference::chain::ChainError> {
+        let chain = anchored_chain(48000)?;
+        assert!(
+            chain
+                .submission_slot_for(
+                    TEST_NUT_INDEX,
+                    chain.best_slot(),
+                    jam_types::rotation_period() + 1
+                )
+                .is_none(),
+            "no slot has more than a rotation left in its rotation"
+        );
+        Ok(())
+    }
+
     /// CE 133's extrinsic message is the bodies concatenated, and the only
     /// thing that says where one ends is the package's own declared lengths.
     ///

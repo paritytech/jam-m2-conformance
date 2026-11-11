@@ -7,16 +7,27 @@
 
 use std::sync::Mutex;
 
+use std::sync::Arc;
+
 use jam_types::Decode;
 use jamnp_s::{
-    codec::ce131_136::{GuaranteedWorkReport, SharingBundle, SharingContext},
-    trace::wall_ts,
+    clock,
+    codec::ce131_136::{
+        GuaranteedWorkReport, SharingBundle, SharingContext, WorkPackageSubmission,
+    },
+    framing::{frame, frame_message, CE133},
+    trace::{wall_ts, Direction as TraceDir, Trace},
+    transport::{Conn, ReadError},
 };
+use m2_reference::reports::ScheduledSubmission;
 use m2_scenario::dsl::{ObsKind, ObsLog};
+use m2_scenario::scenarios::n3::SubmittedPackage;
 use m2_scenario::scenarios::n3::{ReportSeen, SharingSeen};
-use m2_scenario::scenarios::obs::{NUT_SENT_BAD_REPORT, NUT_SENT_BAD_SHARING};
+use m2_scenario::scenarios::obs::{
+    EMU_SENT_133, NUT_SENT_BAD_REPORT, NUT_SENT_BAD_SHARING, PACKAGE_REFUSED,
+};
 
-use crate::emu::{record, StreamReader};
+use crate::emu::{record, slot_start_ms, StreamReader};
 
 /// Read a CE 134 sharing stream the NUT opened, recording what it shared.
 ///
@@ -109,6 +120,87 @@ pub fn handle_inbound_report(
         encoded_report: jam_types::Encode::encode(&distribution.report),
         at_wall_ms,
     });
+}
+
+/// Submit `plan`'s work package to the NUT over CE 133, as a builder
+/// (`simple.md:351-376`).
+///
+/// Two messages on one stream, then FIN: `Core Index ++ Work-Package`, then
+/// the extrinsic bodies concatenated. The node answers with its own FIN to
+/// accept, or resets the stream to refuse, and the refusal is recorded
+/// against this submission rather than into the log alone -- a reset carries
+/// no reason, so only the sender knows which package was refused.
+///
+/// The submission goes out at the start of its slot rather than ahead of it,
+/// which is the opposite of a ticket. A ticket has to be in the node's hands
+/// before the slot it is expected in; a package is work for the rotation it
+/// arrives in, and one that arrives early names a core the node may not hold
+/// yet.
+pub async fn spawn_package_sender(
+    connection: Conn,
+    plan: ScheduledSubmission,
+    trace: Arc<std::sync::Mutex<Trace>>,
+    obs: Arc<Mutex<ObsLog>>,
+    submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
+    peer: u16,
+) {
+    sleep_until_slot(plan.slot).await;
+
+    let Ok((mut send, mut recv)) = connection.open_bi().await else {
+        return;
+    };
+    let submission = WorkPackageSubmission {
+        core_index: plan.core,
+        work_package: plan.package.clone(),
+        extrinsics: plan.extrinsics.clone(),
+    };
+
+    let first = frame(CE133, &submission.encode_initial());
+    let second = frame_message(&submission.encode_extrinsics());
+    crate::emu::trace_record(peer, CE133, send.id(), &first, &trace, TraceDir::Rx);
+    crate::emu::trace_record(peer, CE133, send.id(), &second, &trace, TraceDir::Rx);
+    record(&obs, peer, ObsKind::Other(EMU_SENT_133));
+    if send.write_all(&first).await.is_err() || send.write_all(&second).await.is_err() {
+        return;
+    }
+
+    let index = {
+        let mut recorded = crate::emu::lock(&submissions);
+        recorded.push(SubmittedPackage {
+            peer,
+            core: plan.core,
+            slot: plan.slot,
+            package_hash: plan.package_hash,
+            sent_at_wall_ms: wall_ts(),
+            // Not known until the node answers, below.
+            refused: false,
+        });
+        recorded.len() - 1
+    };
+    send.finish();
+
+    // Only a reset counts as a refusal. A connection that died for its own
+    // reasons also fails this read, and recording that as a refusal would
+    // credit the node with a judgement it never made.
+    let mut buf = [0u8; 1024];
+    if let Err(ReadError::Reset(_)) = recv.read(&mut buf).await {
+        crate::emu::lock(&submissions)[index].refused = true;
+        record(&obs, peer, ObsKind::Other(PACKAGE_REFUSED));
+    }
+}
+
+/// Wait until `slot` begins.
+async fn sleep_until_slot(slot: u32) {
+    let target_ms = slot_start_ms(slot);
+    loop {
+        let now = wall_ts();
+        if now >= target_ms {
+            return;
+        }
+        clock::current()
+            .sleep(std::time::Duration::from_millis(target_ms - now))
+            .await;
+    }
 }
 
 #[cfg(test)]

@@ -53,3 +53,26 @@ pub struct ReportSeen {
     pub encoded_report: Vec<u8>,
     pub at_wall_ms: u64,
 }
+
+/// A CE 133 submission the harness made, and what the node did with it.
+///
+/// The counterpart of N2's `DeliveredTicket`: the refusal goes on the record
+/// of the submission it answers, not into the observation log alone. A stream
+/// reset carries no reason, so the log can only say that one happened; which
+/// package was refused is a fact only the sender holds.
+#[derive(Debug, Clone)]
+pub struct SubmittedPackage {
+    /// The emulated validator that submitted, acting as a builder.
+    pub peer: u16,
+    /// Core the submission was addressed to.
+    pub core: u16,
+    /// Slot it was submitted in.
+    pub slot: u32,
+    /// GP hash of the package, as the engine computes it. CE 134's mappings
+    /// are keyed by this, so it is how the lane tells whether what the node
+    /// shared is what it was given.
+    pub package_hash: [u8; 32],
+    pub sent_at_wall_ms: u64,
+    /// The NUT reset the stream rather than FIN'ing it (`simple.md:374-375`).
+    pub refused: bool,
+}

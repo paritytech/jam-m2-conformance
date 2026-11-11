@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jam_types::{Decode, Encode, JAM_COMMON_ERA};
+use jam_types::{Decode, Encode};
 use jamnp_s::{
     clock,
     codec::ce131_136::{Ticket, TicketDistribution},
@@ -28,9 +28,6 @@ use m2_scenario::scenarios::obs::{
 };
 
 use crate::emu::NO_ADVERTISED_FINAL;
-
-/// Seconds per slot (JAM common slot period).
-const SLOT_PERIOD_SEC: u64 = 6;
 
 /// Slack on top of [`TICKET_ARRIVAL_LEAD_MS`] when timing a delivery.
 ///
@@ -257,8 +254,7 @@ async fn hold_until_the_node_can_accept(
 
 /// When a ticket due in `slot` must be on the wire.
 fn delivery_deadline_ms(slot: u32) -> u64 {
-    let slot_start_ms = (JAM_COMMON_ERA + u64::from(slot) * SLOT_PERIOD_SEC) * 1000;
-    slot_start_ms.saturating_sub(TICKET_ARRIVAL_LEAD_MS + DELIVERY_MARGIN_MS)
+    crate::emu::slot_start_ms(slot).saturating_sub(TICKET_ARRIVAL_LEAD_MS + DELIVERY_MARGIN_MS)
 }
 
 /// Wait until a ticket due in `slot` should go out: far enough before the slot
@@ -341,7 +337,7 @@ mod tests {
         #[test]
         fn delivery_leads_the_slot_it_is_expected_in() {
             let slot = 1000u32;
-            let slot_start_ms = (JAM_COMMON_ERA + u64::from(slot) * SLOT_PERIOD_SEC) * 1000;
+            let slot_start_ms = crate::emu::slot_start_ms(slot);
             let target = delivery_deadline_ms(slot);
             assert!(
                 slot_start_ms - target >= TICKET_ARRIVAL_LEAD_MS,

@@ -15,6 +15,8 @@
 //! | 48 | NUT sent a CE 131/132 frame that would not decode |
 //! | 50 | NUT sent a CE 134 sharing stream that would not decode |
 //! | 51 | NUT sent a CE 135 frame that would not decode |
+//! | 52 | emulator submitted a work package over CE 133 |
+//! | 53 | NUT refused a CE 133 submission: it reset the stream |
 //!
 //! Code 44 is retired. It meant two unrelated things -- the NUT refusing a
 //! ticket, and the NUT sending a frame the harness could not decode -- and
@@ -61,3 +63,13 @@ pub const NUT_SENT_UNDECODABLE: u8 = 48;
 pub const NUT_SENT_BAD_SHARING: u8 = 50;
 /// The NUT sent a CE 135 frame the harness could not read.
 pub const NUT_SENT_BAD_REPORT: u8 = 51;
+
+/// The emulator submitted a work package to the NUT over CE 133.
+pub const EMU_SENT_133: u8 = 52;
+/// The NUT refused a CE 133 submission, by resetting its stream.
+///
+/// As with N2's ticket refusals, why it refused is not inferred here: a reset
+/// carries no reason, and the cause is whatever the harness deliberately put
+/// in that submission. Which package was refused is recorded on
+/// `scenarios::n3::SubmittedPackage`; this code only says one happened.
+pub const PACKAGE_REFUSED: u8 = 53;

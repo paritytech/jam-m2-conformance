@@ -25,12 +25,13 @@ use jamnp_s::{
     transport::{quic::QuicTransport, Conn, Listener, RecvHalf, SendHalf, Transport},
 };
 use m2_reference::chain::RefChain;
+use m2_reference::reports::ScheduledSubmission;
 use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::{DeliveredTicket, NutBlock};
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
 use m2_scenario::scenarios::n0;
 use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
-use m2_scenario::scenarios::n3::{ReportSeen, SharingSeen};
+use m2_scenario::scenarios::n3::{ReportSeen, SharingSeen, SubmittedPackage};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
@@ -83,8 +84,15 @@ pub struct Emulator {
     obs: Arc<Mutex<ObsLog>>,
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
     ticket_plans: Arc<Mutex<HashMap<u16, Vec<ScheduledTicket>>>>,
-    /// Published to [`EmuShared::ticket_plans_set`] by `set_ticket_plans`.
-    ticket_plans_set: watch::Sender<bool>,
+    /// Published to [`EmuShared::plans_set`] by `set_ticket_plans` and
+    /// `set_submission_plan`.
+    plans_set: watch::Sender<bool>,
+    /// The CE 133 submission for this run, claimed by the first connection
+    /// to the NUT. One per run, not one per peer: a work package is submitted
+    /// by a builder, and one builder is enough to pose the row.
+    submission_plan: Arc<Mutex<Option<ScheduledSubmission>>>,
+    /// CE 133 submissions the emulator made, with what the node did with them.
+    submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
     ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
@@ -136,7 +144,11 @@ pub struct EmuShared {
     /// names slots the tickets will not arrive in. So a sender cannot read
     /// its plan at connect time -- it has to wait for one to exist, and an
     /// empty map at connect time means "not yet", not "nothing to send".
-    pub ticket_plans_set: watch::Receiver<bool>,
+    pub plans_set: watch::Receiver<bool>,
+    /// The CE 133 submission for this run; see [`Emulator::set_submission_plan`].
+    pub submission_plan: Arc<Mutex<Option<ScheduledSubmission>>>,
+    /// CE 133 submissions the emulator made.
+    pub submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
     /// Tickets actually put on the wire, with the wall-clock time they were
     /// sent. The sender knows each ticket's id, so the N1 lane reads this
     /// rather than re-deriving ids from the observation log.
@@ -180,6 +192,14 @@ impl EmuShared {
         lock(&self.ticket_plans)
             .remove(&peer)
             .filter(|p| !p.is_empty())
+    }
+
+    /// Take this run's CE 133 submission, leaving nothing behind.
+    ///
+    /// `None` once taken, so a second connection does not submit the same
+    /// package twice -- which a node would be right to treat as a duplicate.
+    pub fn take_submission_plan(&self) -> Option<ScheduledSubmission> {
+        lock(&self.submission_plan).take()
     }
 
     /// True for the first caller only: the sync probes are assertions about
@@ -261,7 +281,9 @@ impl Emulator {
             obs: Arc::new(Mutex::new(ObsLog::new())),
             nut_blocks: Arc::new(Mutex::new(Vec::new())),
             ticket_plans: Arc::new(Mutex::new(HashMap::new())),
-            ticket_plans_set: watch::channel(false).0,
+            plans_set: watch::channel(false).0,
+            submission_plan: Arc::new(Mutex::new(None)),
+            submissions: Arc::new(Mutex::new(Vec::new())),
             deliveries: Arc::new(Mutex::new(Vec::new())),
             ce128_probes: Arc::new(Mutex::new(Vec::new())),
             ce129_probes: Arc::new(Mutex::new(Vec::new())),
@@ -282,7 +304,22 @@ impl Emulator {
         // After the map, never before: a sender woken by this goes straight
         // to `take_ticket_plan`. `send_replace` rather than `send` so the flag
         // sticks even when no sender is listening yet.
-        self.ticket_plans_set.send_replace(true);
+        self.plans_set.send_replace(true);
+    }
+
+    /// Set the CE 133 submission for this run.
+    ///
+    /// Gated behind the same flag as the ticket plans and for the same
+    /// reason: a plan written while the node is still importing the seeded
+    /// chain names a slot the submission will not arrive in.
+    pub fn set_submission_plan(&self, plan: ScheduledSubmission) {
+        *lock(&self.submission_plan) = Some(plan);
+        self.plans_set.send_replace(true);
+    }
+
+    /// CE 133 submissions the emulator made, with what the node did with them.
+    pub fn submissions(&self) -> Arc<Mutex<Vec<SubmittedPackage>>> {
+        Arc::clone(&self.submissions)
     }
 
     /// The tickets the emulator put on the wire, with their send times.
@@ -320,7 +357,9 @@ impl Emulator {
             nut_blocks: Arc::clone(&self.nut_blocks),
             announce: self.announce.clone(),
             ticket_plans: Arc::clone(&self.ticket_plans),
-            ticket_plans_set: self.ticket_plans_set.subscribe(),
+            plans_set: self.plans_set.subscribe(),
+            submission_plan: Arc::clone(&self.submission_plan),
+            submissions: Arc::clone(&self.submissions),
             deliveries: Arc::clone(&self.deliveries),
             ce128_probes: Arc::clone(&self.ce128_probes),
             ce129_probes: Arc::clone(&self.ce129_probes),
@@ -573,6 +612,7 @@ async fn endpoint_task(
         // side opened it: the NUT reaching us first must not cost the peer its
         // whole ticket plan.
         start_ticket_delivery(&connection, peer_index, &shared);
+        start_package_submission(&connection, peer_index, &shared);
         start_sync_probe(&connection, peer_index, &shared);
         // One task per connection: with UP 0 persistent the handler runs for
         // the lifetime of the connection, so awaiting it here would stall the
@@ -584,6 +624,40 @@ async fn endpoint_task(
     }
 }
 
+/// Spawn the CE 133 submitter on this connection, if it is the one that
+/// claims this run's plan.
+///
+/// The same wait as the ticket sender, for the same reason: connections come
+/// up while the node is still importing the seeded chain, and a plan read at
+/// connect time is not there yet. The claim makes the submission happen once
+/// per run rather than once per connection -- a node offered the same package
+/// twice would be right to refuse the second.
+fn start_package_submission(connection: &Conn, peer: u16, shared: &EmuShared) {
+    let connection = connection.clone();
+    let mut plans_set = shared.plans_set.clone();
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        while !*plans_set.borrow_and_update() {
+            // Err only once the `Emulator` is dropped, which ends the run.
+            if plans_set.changed().await.is_err() {
+                return;
+            }
+        }
+        let Some(plan) = shared.take_submission_plan() else {
+            return;
+        };
+        crate::report_io::spawn_package_sender(
+            connection,
+            plan,
+            Arc::clone(&shared.trace),
+            Arc::clone(&shared.obs),
+            Arc::clone(&shared.submissions),
+            peer,
+        )
+        .await;
+    });
+}
+
 /// Spawn the ticket sender for `peer` once a plan exists and if its plan has
 /// not been taken yet.
 ///
@@ -593,7 +667,7 @@ async fn endpoint_task(
 /// map at connect time found it empty and delivered nothing.
 fn start_ticket_delivery(connection: &Conn, peer: u16, shared: &EmuShared) {
     let connection = connection.clone();
-    let mut plans_set = shared.ticket_plans_set.clone();
+    let mut plans_set = shared.plans_set.clone();
     let shared = shared.clone();
     tokio::spawn(async move {
         while !*plans_set.borrow_and_update() {
@@ -1146,6 +1220,19 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 ///
 /// Public so the runner can record decisions it makes about a connection
 /// before any emulator code runs on it, such as the post-grace fallback dial.
+/// Seconds per slot (JAM common slot period).
+pub const SLOT_PERIOD_SEC: u64 = 6;
+
+/// Wall-clock milliseconds at which `slot` begins.
+///
+/// Wall clock, not run-relative: everything that schedules against a slot --
+/// ticket delivery, package submission -- is compared by the lanes against
+/// absolute slot starts, and a run-relative stamp would put every event
+/// before the run began.
+pub fn slot_start_ms(slot: u32) -> u64 {
+    (jam_types::JAM_COMMON_ERA + u64::from(slot) * SLOT_PERIOD_SEC) * 1000
+}
+
 pub fn record(obs: &Mutex<ObsLog>, peer: u16, kind: ObsKind) {
     let at = mono_ts();
     lock(obs).push(
@@ -1182,6 +1269,108 @@ mod tests {
             ports.iter().all(|&p| p >= 40001),
             "ports must be >= base + 1"
         );
+        Ok(())
+    }
+
+    /// The CE 133 submitter puts both messages on one stream and records the
+    /// node's answer.
+    ///
+    /// End to end over the carrier: the submission is spawned from the accept
+    /// loop on a connection the node opened, and a plan that is never claimed
+    /// produces no stream at all, which is the failure this catches.
+    #[tokio::test]
+    async fn a_ce133_submission_reaches_the_node_as_two_messages() -> Result<(), EmuError> {
+        use jamnp_s::framing::CE133;
+        use jamnp_s::transport::mock::MockNetwork;
+        use jamnp_s::transport::Transport;
+        use m2_reference::reports::ScheduledSubmission;
+        use std::time::Duration;
+
+        const GENESIS: [u8; 32] = [0xcc; 32];
+        let net = MockNetwork::new();
+        let emu = Emulator::n0_on(Arc::new(net.clone()), vec![1], GENESIS, 40200).await?;
+        let addr = emu.local_addrs()[0];
+        let ref_chain = Arc::new(RefChain::tiny(0).map_err(chain_err)?);
+
+        // Slot 0 is long past, so the sender does not wait for a slot start.
+        let package = vec![0xa1; 48];
+        let extrinsics = vec![vec![0x01, 0x02], vec![0x03]];
+        emu.set_submission_plan(ScheduledSubmission {
+            slot: 0,
+            core: 1,
+            package: package.clone(),
+            package_hash: [0x5a; 32],
+            extrinsics: extrinsics.clone(),
+        });
+        let submissions = emu.submissions();
+        let _accepting = emu.accept_loop(ref_chain);
+
+        let conn = net
+            .connect(
+                EndpointConfig {
+                    genesis_hash: GENESIS,
+                    builder: false,
+                },
+                SigningKey::from([9u8; 32]),
+                "peer".to_string(),
+                addr,
+            )
+            .await
+            .expect("the stand-in node reaches the emulated validator");
+
+        // The emulator opens the CE 133 stream to us.
+        let (send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.accept_bi())
+            .await
+            .expect("the submission arrives in time")
+            .expect("a stream is opened");
+
+        let mut reader = FrameReader::new();
+        let mut buf = [0u8; 4096];
+        let mut messages: Vec<(u8, Vec<u8>)> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while messages.len() < 2 {
+                if let Ok(Some(item)) = reader.next_frame() {
+                    messages.push(item);
+                    continue;
+                }
+                match recv.read(&mut buf).await {
+                    Ok(Some(n)) => reader.push(&buf[..n]),
+                    _ => break,
+                }
+            }
+        })
+        .await
+        .expect("both messages arrive in time");
+
+        assert_eq!(messages.len(), 2, "two messages on one stream");
+        assert_eq!(messages[0].0, CE133, "under the CE 133 kind byte");
+        let mut expected_first = 1u16.encode();
+        expected_first.extend_from_slice(&package);
+        assert_eq!(
+            messages[0].1, expected_first,
+            "message 1 is the core index then the package, unprefixed"
+        );
+        assert_eq!(
+            messages[1].1,
+            vec![0x01, 0x02, 0x03],
+            "message 2 is the extrinsic bodies concatenated"
+        );
+
+        // FIN rather than reset: the node accepted it.
+        drop(send);
+        let recorded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(first) = lock(&submissions).first() {
+                    return first.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the submission is recorded");
+        assert_eq!(recorded.core, 1);
+        assert_eq!(recorded.slot, 0);
+        assert_eq!(recorded.package_hash, [0x5a; 32]);
         Ok(())
     }
 

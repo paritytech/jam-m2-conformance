@@ -24,6 +24,46 @@ pub struct GuaranteedWork {
     pub guarantee: jam_std_common::ReportGuarantee,
 }
 
+/// The GP work-package hash, as the engine computes it.
+///
+/// Not recomputed here. CE 134's mappings are keyed by this hash, so the lane
+/// correlates what the node shared with what the harness submitted by it, and
+/// a harness that hashed packages its own way would be comparing its
+/// arithmetic against the node's rather than the node against the protocol.
+pub fn package_hash(package: &jam_types::WorkPackage) -> jam_types::WorkPackageHash {
+    jam_std_common::ImmutableWorkPackage::from(package).hash()
+}
+
+/// A CE 133 submission the harness will make, resolved down to wire values.
+///
+/// The package is carried encoded because that is what goes on the wire and
+/// what the faults act on: an oversized initial message is a property of the
+/// bytes, not of the structure.
+#[derive(Debug, Clone)]
+pub struct ScheduledSubmission {
+    /// Slot to submit in; see [`RefChain::submission_slot_for`].
+    pub slot: u32,
+    /// Core index to address the submission to.
+    ///
+    /// Normally the core the NUT holds at `slot`. The "not a guarantor" fault
+    /// is exactly this field naming a different one.
+    pub core: u16,
+    /// GP-encoded work package.
+    pub package: Vec<u8>,
+    /// Hash of that package, for correlating with what the node shares.
+    pub package_hash: [u8; 32],
+    /// Extrinsic bodies, in the order the package declares them.
+    pub extrinsics: Vec<Vec<u8>>,
+}
+
+/// Where a CE 133 submission is aimed: a slot, and the core the NUT holds
+/// at that slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmissionPlan {
+    pub slot: u32,
+    pub core: CoreIndex,
+}
+
 /// A package as a builder would put it on CE 133, with the extrinsic bodies
 /// that go with it as message 2.
 ///
@@ -68,6 +108,43 @@ impl RefChain {
             package,
             extrinsics,
         }
+    }
+
+    /// Where to aim a CE 133 submission: the first slot at or after `from`
+    /// that still has `margin` slots left in its rotation, and the core the
+    /// NUT holds there.
+    ///
+    /// The core alone is not enough. CE 133 says the package goes to a
+    /// guarantor "in the NUT's rotation", and a validator holds a different
+    /// core after every rotation boundary. Submitting in the last slot before
+    /// one leaves the node no room to share the package and distribute the
+    /// report before the assignment it was given moves out from under it, and
+    /// the lane would record a node that did nothing wrong as having failed
+    /// to share.
+    ///
+    /// `None` if no slot within one rotation of `from` qualifies, which can
+    /// only happen if `margin` is at least the rotation period.
+    pub fn submission_slot_for(&self, nut: u16, from: u32, margin: u32) -> Option<SubmissionPlan> {
+        let rotation = jam_types::rotation_period();
+        let epoch = jam_types::epoch_period();
+        for slot in from..from.saturating_add(rotation) {
+            // Rotations are counted inside the epoch, so the position within
+            // one is epoch-relative. `slot % rotation` agrees only when the
+            // epoch is a whole number of rotations -- true under tiny, and
+            // not something to rely on.
+            let in_epoch = slot % epoch;
+            let left_in_rotation = rotation - (in_epoch % rotation);
+            // The epoch boundary moves the assignment too: it reshuffles on
+            // new entropy, not just by the rotation offset. A window that
+            // straddles one is no safer than one that straddles a rotation.
+            let left_in_epoch = epoch - in_epoch;
+            if left_in_rotation.min(left_in_epoch) >= margin {
+                return self
+                    .core_for(nut, slot)
+                    .map(|core| SubmissionPlan { slot, core });
+            }
+        }
+        None
     }
 
     /// Build `items` into a package, refine it on `core`, and sign the
