@@ -17,6 +17,7 @@
 //! | 51 | NUT sent a CE 135 frame that would not decode |
 //! | 52 | emulator submitted a work package over CE 133 |
 //! | 53 | NUT refused a CE 133 submission: it reset the stream |
+//! | 54 | emulator answered a CE 134 share with a hash and signature |
 //!
 //! Code 44 is retired. It meant two unrelated things -- the NUT refusing a
 //! ticket, and the NUT sending a frame the harness could not decode -- and
@@ -73,3 +74,10 @@ pub const EMU_SENT_133: u8 = 52;
 /// in that submission. Which package was refused is recorded on
 /// `scenarios::n3::SubmittedPackage`; this code only says one happened.
 pub const PACKAGE_REFUSED: u8 = 53;
+
+/// An emulated co-guarantor answered a CE 134 share (`simple.md:456`).
+///
+/// Its absence where a share was seen means the harness had no answer to
+/// give -- no package of ours was in flight -- not that the node went
+/// unanswered through any fault of its own.
+pub const EMU_ANSWERED_134: u8 = 54;

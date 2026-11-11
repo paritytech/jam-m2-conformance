@@ -25,7 +25,7 @@ use jamnp_s::{
     transport::{quic::QuicTransport, Conn, Listener, RecvHalf, SendHalf, Transport},
 };
 use m2_reference::chain::RefChain;
-use m2_reference::reports::ScheduledSubmission;
+use m2_reference::reports::{ScheduledSubmission, SharingAnswer};
 use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::{DeliveredTicket, NutBlock};
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
@@ -93,6 +93,9 @@ pub struct Emulator {
     submission_plan: Arc<Mutex<Option<ScheduledSubmission>>>,
     /// CE 133 submissions the emulator made, with what the node did with them.
     submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
+    /// What an emulated co-guarantor answers a CE 134 share with, once the
+    /// submission it belongs to has been planned.
+    sharing_answer: Arc<Mutex<Option<SharingAnswer>>>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
     ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
@@ -149,6 +152,8 @@ pub struct EmuShared {
     pub submission_plan: Arc<Mutex<Option<ScheduledSubmission>>>,
     /// CE 133 submissions the emulator made.
     pub submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
+    /// The CE 134 answer for this run's submission, if one was planned.
+    pub sharing_answer: Arc<Mutex<Option<SharingAnswer>>>,
     /// Tickets actually put on the wire, with the wall-clock time they were
     /// sent. The sender knows each ticket's id, so the N1 lane reads this
     /// rather than re-deriving ids from the observation log.
@@ -284,6 +289,7 @@ impl Emulator {
             plans_set: watch::channel(false).0,
             submission_plan: Arc::new(Mutex::new(None)),
             submissions: Arc::new(Mutex::new(Vec::new())),
+            sharing_answer: Arc::new(Mutex::new(None)),
             deliveries: Arc::new(Mutex::new(Vec::new())),
             ce128_probes: Arc::new(Mutex::new(Vec::new())),
             ce129_probes: Arc::new(Mutex::new(Vec::new())),
@@ -312,7 +318,11 @@ impl Emulator {
     /// Gated behind the same flag as the ticket plans and for the same
     /// reason: a plan written while the node is still importing the seeded
     /// chain names a slot the submission will not arrive in.
-    pub fn set_submission_plan(&self, plan: ScheduledSubmission) {
+    pub fn set_submission_plan(&self, plan: ScheduledSubmission, answer: SharingAnswer) {
+        // The answer first: the node can open CE 134 the moment the
+        // submission lands, and a responder that found no answer would FIN
+        // empty and the node would rightly proceed without us.
+        *lock(&self.sharing_answer) = Some(answer);
         *lock(&self.submission_plan) = Some(plan);
         self.plans_set.send_replace(true);
     }
@@ -360,6 +370,7 @@ impl Emulator {
             plans_set: self.plans_set.subscribe(),
             submission_plan: Arc::clone(&self.submission_plan),
             submissions: Arc::clone(&self.submissions),
+            sharing_answer: Arc::clone(&self.sharing_answer),
             deliveries: Arc::clone(&self.deliveries),
             ce128_probes: Arc::clone(&self.ce128_probes),
             ce129_probes: Arc::clone(&self.ce129_probes),
@@ -835,9 +846,11 @@ async fn handle_stream(
             crate::report_io::handle_inbound_sharing(
                 &content,
                 &mut reader,
+                &mut send,
                 peer_index,
                 obs,
                 &shared.sharing_seen,
+                &shared.sharing_answer,
             )
             .await;
         }
@@ -1272,6 +1285,94 @@ mod tests {
         Ok(())
     }
 
+    /// A share is answered with the reference's report hash and this
+    /// validator's signature over it (`simple.md:456`).
+    ///
+    /// The reply carries no kind byte: the node opened the stream, so what
+    /// comes back on it is a bare message. Getting that wrong would put a
+    /// stray 134 in front of the hash and the node would read the first 32
+    /// bytes of a 33-byte value.
+    #[tokio::test]
+    async fn a_ce134_share_is_answered_with_the_reference_hash_and_signature(
+    ) -> Result<(), EmuError> {
+        use jamnp_s::codec::ce131_136::{SharingContext, SharingReply};
+        use jamnp_s::framing::CE134;
+        use jamnp_s::transport::mock::MockNetwork;
+        use jamnp_s::transport::Transport;
+        use m2_reference::reports::SharingAnswer;
+        use std::time::Duration;
+
+        const GENESIS: [u8; 32] = [0xdd; 32];
+        const PEER: u16 = 1;
+        let net = MockNetwork::new();
+        let emu =
+            Emulator::n0_on(Arc::new(net.clone()), vec![PEER as usize], GENESIS, 40300).await?;
+        let addr = emu.local_addrs()[0];
+        let ref_chain = Arc::new(RefChain::tiny(0).map_err(chain_err)?);
+
+        let report_hash = [0x3c; 32];
+        let signature = [0x9e; 64];
+        *lock(&emu.sharing_answer) = Some(SharingAnswer {
+            report_hash,
+            // Validator 4 holds the core too; only this peer's own signature
+            // may come back on this stream.
+            signatures: vec![(PEER, signature), (4, [0x11; 64])],
+        });
+        let _accepting = emu.accept_loop(ref_chain);
+
+        let conn = net
+            .connect(
+                EndpointConfig {
+                    genesis_hash: GENESIS,
+                    builder: false,
+                },
+                SigningKey::from([9u8; 32]),
+                "peer".to_string(),
+                addr,
+            )
+            .await
+            .expect("the stand-in node reaches the emulated validator");
+
+        let (mut send, mut recv) = conn.open_bi().await.expect("CE 134 opens");
+        let context = SharingContext {
+            core_index: 0,
+            shard_count: 6,
+            mappings: Vec::new(),
+        };
+        send.write_all(&frame(CE134, &context.encode()))
+            .await
+            .expect("message 1 goes out");
+        send.write_all(&frame_message(&[0xab; 16]))
+            .await
+            .expect("message 2 goes out");
+        send.finish();
+
+        // We opened the stream, so the answer is a bare message under CE 134.
+        let mut reader = FrameReader::with_kind(CE134);
+        let mut buf = [0u8; 4096];
+        let answer = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(Some((_, content))) = reader.next_frame() {
+                    return content;
+                }
+                match recv.read(&mut buf).await {
+                    Ok(Some(n)) => reader.push(&buf[..n]),
+                    _ => return Vec::new(),
+                }
+            }
+        })
+        .await
+        .expect("the answer arrives in time");
+
+        let decoded = SharingReply::decode(&mut &answer[..]).expect("the answer is a CE 134 reply");
+        assert_eq!(decoded.report_hash.0, report_hash);
+        assert_eq!(
+            decoded.signature, signature,
+            "the peer signs as itself, not as another holder of the core"
+        );
+        Ok(())
+    }
+
     /// The CE 133 submitter puts both messages on one stream and records the
     /// node's answer.
     ///
@@ -1283,7 +1384,8 @@ mod tests {
         use jamnp_s::framing::CE133;
         use jamnp_s::transport::mock::MockNetwork;
         use jamnp_s::transport::Transport;
-        use m2_reference::reports::ScheduledSubmission;
+        use m2_reference::reports::{ScheduledSubmission, SharingAnswer};
+
         use std::time::Duration;
 
         const GENESIS: [u8; 32] = [0xcc; 32];
@@ -1295,14 +1397,22 @@ mod tests {
         // Slot 0 is long past, so the sender does not wait for a slot start.
         let package = vec![0xa1; 48];
         let extrinsics = vec![vec![0x01, 0x02], vec![0x03]];
-        emu.set_submission_plan(ScheduledSubmission {
-            slot: 0,
-            core: 1,
-            package: package.clone(),
-            package_hash: [0x5a; 32],
-            extrinsics: extrinsics.clone(),
-            co_guarantors: vec![2, 3],
-        });
+        emu.set_submission_plan(
+            ScheduledSubmission {
+                slot: 0,
+                core: 1,
+                package: package.clone(),
+                package_hash: [0x5a; 32],
+                extrinsics: extrinsics.clone(),
+                co_guarantors: vec![2, 3],
+            },
+            // This test only drives the submission; the stand-in node never
+            // shares anything back, so no answer is ever looked up.
+            SharingAnswer {
+                report_hash: [0x7c; 32],
+                signatures: Vec::new(),
+            },
+        );
         let submissions = emu.submissions();
         let _accepting = emu.accept_loop(ref_chain);
 

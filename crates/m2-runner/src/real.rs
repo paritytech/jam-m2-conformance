@@ -173,8 +173,9 @@ pub(crate) fn build_real_run_ctx(
         submissions: lock(&data.submissions).clone(),
         shares: lock(&data.sharing_seen).clone(),
         reports: lock(&data.reports_seen).clone(),
-        // The harness does not answer CE 134 yet; see `report_io`.
-        answers_sharing: false,
+        // The harness answers CE 134 whenever it planned a submission, which
+        // is exactly when it has a report hash and signatures to answer with.
+        answers_sharing: !lock(&data.submissions).is_empty(),
     };
     RunCtx {
         n0,

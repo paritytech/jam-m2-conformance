@@ -1,30 +1,28 @@
 //! N3 guaranteeing I/O for the emulated validators (CE 133/134/135).
 //!
-//! Inbound only, so far: the NUT's CE 134 sharing streams and CE 135 report
-//! distributions are decoded and recorded. Nothing here refines, signs or
-//! judges anything — the records go to the N3 lane, which grades them against
-//! values `m2-reference` computed.
+//! Outbound: a work package is submitted over CE 133. Inbound: the NUT's CE
+//! 134 sharing streams are recorded and answered, and its CE 135 report
+//! distributions are recorded. Nothing here refines, signs or judges
+//! anything — the answer's hash and signature are computed in `m2-reference`
+//! when the submission is planned, and the records go to the N3 lane.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use std::sync::Arc;
-
-use jam_types::Decode;
+use jam_types::{Decode, Encode};
 use jamnp_s::{
     clock,
     codec::ce131_136::{
-        GuaranteedWorkReport, SharingBundle, SharingContext, WorkPackageSubmission,
+        GuaranteedWorkReport, SharingBundle, SharingContext, SharingReply, WorkPackageSubmission,
     },
     framing::{frame, frame_message, CE133},
     trace::{wall_ts, Direction as TraceDir, Trace},
-    transport::{Conn, ReadError},
+    transport::{Conn, ReadError, SendHalf},
 };
-use m2_reference::reports::ScheduledSubmission;
+use m2_reference::reports::{ScheduledSubmission, SharingAnswer};
 use m2_scenario::dsl::{ObsKind, ObsLog};
-use m2_scenario::scenarios::n3::SubmittedPackage;
-use m2_scenario::scenarios::n3::{ReportSeen, SharingSeen};
+use m2_scenario::scenarios::n3::{ReportSeen, SharingSeen, SubmittedPackage};
 use m2_scenario::scenarios::obs::{
-    EMU_SENT_133, NUT_SENT_BAD_REPORT, NUT_SENT_BAD_SHARING, PACKAGE_REFUSED,
+    EMU_ANSWERED_134, EMU_SENT_133, NUT_SENT_BAD_REPORT, NUT_SENT_BAD_SHARING, PACKAGE_REFUSED,
 };
 
 use crate::emu::{record, slot_start_ms, StreamReader};
@@ -44,12 +42,15 @@ use crate::emu::{record, slot_start_ms, StreamReader};
 /// a case the spec covers — the NUT should proceed with its other
 /// co-guarantor. The lane must therefore not read a missing guarantee
 /// signature as the node's defect while this is true.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_inbound_sharing(
     first: &[u8],
     reader: &mut StreamReader,
+    send: &mut SendHalf,
     peer: u16,
     obs: &Mutex<ObsLog>,
     seen: &Mutex<Vec<SharingSeen>>,
+    answer: &Mutex<Option<SharingAnswer>>,
 ) {
     let at_wall_ms = wall_ts();
     let Ok(context) = SharingContext::decode(&mut &first[..]) else {
@@ -86,6 +87,27 @@ pub(crate) async fn handle_inbound_sharing(
         bundle,
         at_wall_ms,
     });
+
+    // `Work-Report Hash ++ Ed25519 Signature`, then FIN. Only for a validator
+    // that holds the core: a signature from one that does not is not a
+    // weaker answer, it is one the node must reject, and sending it would
+    // make the harness the source of the defect.
+    let reply = crate::emu::lock(answer)
+        .as_ref()
+        .and_then(|answer| {
+            answer
+                .signature_for(peer)
+                .map(|signature| (answer.report_hash, signature))
+        })
+        .map(|(report_hash, signature)| SharingReply {
+            report_hash: jam_types::WorkReportHash::from(report_hash),
+            signature,
+        });
+    if let Some(reply) = reply {
+        record(obs, peer, ObsKind::Other(EMU_ANSWERED_134));
+        let _ = send.write_all(&frame_message(&reply.encode())).await;
+    }
+    send.finish();
 }
 
 /// Record a CE 135 work-report distribution the NUT sent

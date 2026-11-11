@@ -19,6 +19,11 @@ use crate::chain::{ChainError, RefChain};
 /// guarantee, and the report is what a block must come to carry.
 pub struct GuaranteedWork {
     pub package: jam_types::WorkPackage,
+    /// The extrinsic bodies the package declares, in wire order. CE 133's
+    /// second message is these concatenated, so the submission needs them
+    /// from the same build as the package: building twice would re-read the
+    /// chain head and could produce a different package entirely.
+    pub extrinsics: Vec<Vec<u8>>,
     pub report: jam_std_common::WorkReport,
     pub bundle: Vec<u8>,
     pub guarantee: jam_std_common::ReportGuarantee,
@@ -61,6 +66,53 @@ pub struct ScheduledSubmission {
     /// be grading the node against its own arithmetic rather than against the
     /// chain.
     pub co_guarantors: Vec<u16>,
+}
+
+/// What an emulated co-guarantor answers a CE 134 share with
+/// (`simple.md:456`): the hash of the refined work-report, and a signature
+/// over it that can go into a guaranteed work-report.
+///
+/// Computed from the package the harness submitted rather than from the
+/// bundle the node shares back. That is deliberate twice over: decoding a
+/// bundle would make the harness's answer depend on the node getting the
+/// bundle right, and the reference report is the value the lane compares the
+/// node's against anyway. A node that refined something else will disagree
+/// with this hash, which is the finding, not an error.
+#[derive(Debug, Clone)]
+pub struct SharingAnswer {
+    /// Hash of the report the reference refined from the submitted package.
+    pub report_hash: [u8; 32],
+    /// One signature per validator holding the core, by validator index.
+    ///
+    /// Includes the NUT's own, which the harness never sends: the engine
+    /// signs for every holder because it has every keyset, and filtering it
+    /// out here would leave the emulator deciding who may answer.
+    pub signatures: Vec<(u16, [u8; 64])>,
+}
+
+impl GuaranteedWork {
+    /// The CE 134 answer an emulated co-guarantor gives for this work.
+    pub fn sharing_answer(&self) -> SharingAnswer {
+        SharingAnswer {
+            report_hash: self.report.hash().0,
+            signatures: self
+                .guarantee
+                .signatures
+                .iter()
+                .map(|signed| (signed.val_index, signed.signature.to_bytes()))
+                .collect(),
+        }
+    }
+}
+
+impl SharingAnswer {
+    /// The signature `validator` should reply with, if it holds the core.
+    pub fn signature_for(&self, validator: u16) -> Option<[u8; 64]> {
+        self.signatures
+            .iter()
+            .find(|(index, _)| *index == validator)
+            .map(|(_, signature)| *signature)
+    }
 }
 
 /// Where a CE 133 submission is aimed: a slot, and the core the NUT holds
@@ -178,6 +230,7 @@ impl RefChain {
         let mut harness = self.harness();
         let (package, xts) = harness.build_package(items);
         let wire = package.clone();
+        let xts: Vec<Vec<u8>> = xts.into_iter().collect();
         let (report, bundle, _) = harness
             .try_compose_report(package, &xts, core)
             .map_err(|e| ChainError::Chain(format!("compose report: {e}")))?;
@@ -186,6 +239,7 @@ impl RefChain {
             .map_err(|e| ChainError::Chain(format!("compose guarantee: {e}")))?;
         Ok(GuaranteedWork {
             package: wire,
+            extrinsics: xts,
             report,
             bundle: bundle.to_vec(),
             guarantee,

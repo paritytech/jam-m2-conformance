@@ -297,7 +297,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         emu.set_ticket_plans(plans_by_peer(&ticket_plan));
         if cli.lanes.needs_package() {
             match plan_package_for_this_run(&ref_chain, nut_index) {
-                Ok(plan) => emu.set_submission_plan(plan),
+                Ok((plan, answer)) => emu.set_submission_plan(plan, answer),
                 // A run that cannot plan a submission still grades every
                 // other lane; N3 reports the rule as unexercised rather than
                 // failing the node for the harness's inability to ask.
@@ -329,7 +329,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                 trace,
                 ce128_probes,
                 ce129_probes,
-                _emu: emu,
+                _emu: Box::new(emu),
             },
             count,
             dial_tasks,
@@ -662,10 +662,17 @@ const SUBMISSION_MARGIN_SLOTS: u32 = 2;
 
 /// Build this run's CE 133 submission: one trivial work item, aimed at a slot
 /// the NUT guarantees a core in with room left to act.
+#[allow(clippy::type_complexity)]
 fn plan_package_for_this_run(
     ref_chain: &RefChain,
     nut_index: usize,
-) -> Result<m2_reference::reports::ScheduledSubmission, m2_reference::chain::ChainError> {
+) -> Result<
+    (
+        m2_reference::reports::ScheduledSubmission,
+        m2_reference::reports::SharingAnswer,
+    ),
+    m2_reference::chain::ChainError,
+> {
     // From the next slot, not this one: planning into the slot the chain is
     // already in leaves no time for the submission to go out before it ends.
     let from = ref_chain.next_slot();
@@ -686,15 +693,21 @@ fn plan_package_for_this_run(
         Vec::new(),
         0,
     );
-    let built = ref_chain.build_work_package(vec![item]);
-    Ok(m2_reference::reports::ScheduledSubmission {
-        slot: plan.slot,
-        core: plan.core,
-        package: jam_types::Encode::encode(&built.package),
-        package_hash: m2_reference::reports::package_hash(&built.package).0,
-        extrinsics: built.extrinsics,
-        co_guarantors: plan.co_guarantors,
-    })
+    // One computation, not two. The package the harness submits and the
+    // report its co-guarantors sign for have to be the same package, and
+    // building it twice would re-read the chain head in between.
+    let work = ref_chain.guarantee_work(vec![item], plan.core)?;
+    Ok((
+        m2_reference::reports::ScheduledSubmission {
+            slot: plan.slot,
+            core: plan.core,
+            package: jam_types::Encode::encode(&work.package),
+            package_hash: m2_reference::reports::package_hash(&work.package).0,
+            extrinsics: work.extrinsics.clone(),
+            co_guarantors: plan.co_guarantors,
+        },
+        work.sharing_answer(),
+    ))
 }
 
 /// Reported when the harness could not pose the CE 133 row at all.
