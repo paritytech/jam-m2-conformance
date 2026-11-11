@@ -8,7 +8,11 @@
 //! Nothing in this module refines or signs anything — every reference value
 //! is computed in `m2-reference` and injected.
 
+use std::collections::HashSet;
+
 use jam_types::WorkPackageHash;
+
+use crate::dsl::{check, log, Check, Control, Severity};
 
 /// A CE 134 sharing request the NUT opened to an emulated co-guarantor
 /// (`simple.md:406-458`).
@@ -75,4 +79,373 @@ pub struct SubmittedPackage {
     pub sent_at_wall_ms: u64,
     /// The NUT reset the stream rather than FIN'ing it (`simple.md:374-375`).
     pub refused: bool,
+}
+
+/// How long the node has to open CE 134 after a package reaches it.
+///
+/// DESIGN §11 N3 gives "~3 s". The tilde is why the row that reads this is
+/// Soft: DESIGN §5 marks timing-tolerance clauses soft, and a node that
+/// shares correctly but slowly is not the same defect as one that does not
+/// share at all.
+pub const SHARE_WINDOW_MS: u64 = 3_000;
+
+/// The facts the N3 lane grades, injected by the runner.
+#[derive(Debug, Clone)]
+pub struct N3Ctx {
+    /// The node under test's validator index.
+    pub nut_index: u16,
+    /// CE 133 submissions the harness made.
+    pub submissions: Vec<SubmittedPackage>,
+    /// CE 134 shares the NUT opened to emulated co-guarantors.
+    pub shares: Vec<SharingSeen>,
+    /// CE 135 distributions the NUT sent.
+    pub reports: Vec<ReportSeen>,
+    /// The validators holding the submitted core alongside the NUT.
+    ///
+    /// Read off the engine's assignment for the submission's slot, not
+    /// recomputed: the lane asserts the node agrees with the chain, and a
+    /// harness that derived the set itself would be grading the node against
+    /// its own arithmetic.
+    pub co_guarantors: Vec<u16>,
+    /// Whether the harness answers CE 134 with a work-report hash and
+    /// signature.
+    ///
+    /// While false the harness is the reason the node cannot assemble a
+    /// guarantee, so the rows that depend on one say so instead of failing
+    /// the node for the harness's omission.
+    pub answers_sharing: bool,
+}
+
+/// N3 — CE 133: a submitted package is accepted and shared with both
+/// co-guarantors (`simple.md:351-376`, DESIGN §11 N3).
+///
+/// Gated on a submission having happened. A run that never submitted anything
+/// would otherwise pass every row here without the node having been asked a
+/// single question.
+pub fn n3_ce133_submission(ctx: &N3Ctx) -> Check {
+    let ctx = ctx.clone();
+    check("n3_ce133_submission", Severity::Hard, move |_obs| {
+        let control = Control::new(
+            "n3_ce133_not_exercised",
+            "a work package submitted to the NUT",
+            !ctx.submissions.is_empty(),
+        );
+        if !control.present() {
+            return vec![control.absent("n3_ce133_not_exercised")];
+        }
+
+        let mut results = Vec::new();
+        for submitted in &ctx.submissions {
+            results.push(log::check_detail(
+                "n3_ce133_accepted",
+                !submitted.refused,
+                Severity::Hard,
+                || {
+                    format!(
+                        "the NUT reset the CE 133 stream for the package {} on core {}",
+                        short(&submitted.package_hash),
+                        submitted.core
+                    )
+                },
+            ));
+            // A node that refused the package owes no sharing, and grading it
+            // for not sharing would report one defect twice.
+            if submitted.refused {
+                continue;
+            }
+
+            // Shares that answer *this* submission. A share recorded before
+            // the package went out cannot be a response to it.
+            let answering: Vec<&SharingSeen> = ctx
+                .shares
+                .iter()
+                .filter(|share| share.at_wall_ms >= submitted.sent_at_wall_ms)
+                .collect();
+            let reached: HashSet<u16> = answering.iter().map(|share| share.peer).collect();
+
+            for co_guarantor in &ctx.co_guarantors {
+                results.push(log::check_detail(
+                    "n3_ce133_shares_with_both_co_guarantors",
+                    reached.contains(co_guarantor),
+                    Severity::Hard,
+                    || {
+                        format!(
+                            "the NUT never opened CE 134 to validator {co_guarantor}, which \
+                             holds core {} with it; it reached {:?}",
+                            submitted.core, reached
+                        )
+                    },
+                ));
+            }
+
+            // The share has to be of the package we sent. A node that shares
+            // something else has not failed to share, it has shared the wrong
+            // thing, and the two are different findings.
+            //
+            // Only where the node sent mappings at all. They map the *import*
+            // list's package hashes to segments-roots (`simple.md:449`), so a
+            // package with no imported segments correctly has none -- and a
+            // row written as "names it, or there were none" would be true
+            // whatever the node did, which is a check that cannot fail.
+            for share in answering.iter().filter(|s| !s.mappings.is_empty()) {
+                let names_it = share
+                    .mappings
+                    .iter()
+                    .any(|(package, _)| package.0 == submitted.package_hash);
+                results.push(log::check_detail(
+                    "n3_ce134_shares_the_submitted_package",
+                    names_it,
+                    Severity::Hard,
+                    || {
+                        format!(
+                            "the CE 134 to validator {} maps {:?}, none of which is the \
+                             submitted package {}",
+                            share.peer,
+                            share
+                                .mappings
+                                .iter()
+                                .map(|(p, _)| short(&p.0))
+                                .collect::<Vec<_>>(),
+                            short(&submitted.package_hash)
+                        )
+                    },
+                ));
+            }
+
+            // Timing last, and soft: a node that shared correctly but slowly
+            // is not the node that did not share.
+            if let Some(first) = answering.iter().map(|s| s.at_wall_ms).min() {
+                let took = first.saturating_sub(submitted.sent_at_wall_ms);
+                results.push(log::check_detail(
+                    "n3_ce133_shares_within_the_window",
+                    took <= SHARE_WINDOW_MS,
+                    Severity::Soft,
+                    || format!("the NUT took {took} ms to open CE 134, past {SHARE_WINDOW_MS} ms"),
+                ));
+            }
+        }
+        results
+    })
+}
+
+/// Every N3 check, in the order the lane reports them.
+pub fn all(ctx: &N3Ctx) -> Vec<Check> {
+    vec![n3_ce133_submission(ctx)]
+}
+
+/// First eight bytes of a hash, for finding details.
+fn short(hash: &[u8; 32]) -> String {
+    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::{CheckResult, ObsLog, Outcome};
+
+    /// The NUT in these fixtures; validators 1 and 2 hold its core with it.
+    const NUT: u16 = 5;
+    const CO: [u16; 2] = [1, 2];
+    const CORE: u16 = 0;
+    const SENT_AT: u64 = 1_000_000;
+    const PACKAGE: [u8; 32] = [0x5a; 32];
+
+    fn run(check: &Check) -> Vec<CheckResult> {
+        (check.run)(&ObsLog::new())
+    }
+    fn failed(results: &[CheckResult], name: &str, severity: Severity) -> bool {
+        results
+            .iter()
+            .any(|r| r.name == name && r.outcome == Outcome::Fail(severity))
+    }
+    fn names(results: &[CheckResult]) -> Vec<&str> {
+        results.iter().map(|r| r.name).collect()
+    }
+
+    fn submission(refused: bool) -> SubmittedPackage {
+        SubmittedPackage {
+            peer: 1,
+            core: CORE,
+            slot: 100,
+            package_hash: PACKAGE,
+            sent_at_wall_ms: SENT_AT,
+            refused,
+        }
+    }
+
+    fn share(
+        peer: u16,
+        at_wall_ms: u64,
+        mappings: Vec<(WorkPackageHash, [u8; 32])>,
+    ) -> SharingSeen {
+        SharingSeen {
+            peer,
+            core_index: CORE,
+            shard_count: 6,
+            mappings,
+            bundle: Some(vec![0xab; 8]),
+            at_wall_ms,
+        }
+    }
+
+    fn ctx(submissions: Vec<SubmittedPackage>, shares: Vec<SharingSeen>) -> N3Ctx {
+        N3Ctx {
+            nut_index: NUT,
+            submissions,
+            shares,
+            reports: Vec::new(),
+            co_guarantors: CO.to_vec(),
+            answers_sharing: false,
+        }
+    }
+
+    /// The happy path: accepted, shared with both, in time.
+    #[test]
+    fn a_package_shared_with_both_co_guarantors_passes() {
+        let results = run(&n3_ce133_submission(&ctx(
+            vec![submission(false)],
+            vec![
+                share(CO[0], SENT_AT + 500, Vec::new()),
+                share(CO[1], SENT_AT + 900, Vec::new()),
+            ],
+        )));
+        assert!(
+            results.iter().all(|r| r.outcome == Outcome::Pass),
+            "expected all passes, got {:?}",
+            results
+                .iter()
+                .filter(|r| r.outcome != Outcome::Pass)
+                .map(|r| r.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A run that submitted nothing reports the rule as unexercised rather
+    /// than collecting passes for questions the node was never asked.
+    #[test]
+    fn a_run_with_no_submission_proves_nothing() {
+        let results = run(&n3_ce133_submission(&ctx(Vec::new(), Vec::new())));
+        assert_eq!(names(&results), vec!["n3_ce133_not_exercised"]);
+        assert!(
+            results.iter().all(|r| r.outcome != Outcome::Pass),
+            "an unexercised rule must not report as passed"
+        );
+    }
+
+    #[test]
+    fn a_refused_submission_fails_the_acceptance_row() {
+        let results = run(&n3_ce133_submission(&ctx(
+            vec![submission(true)],
+            Vec::new(),
+        )));
+        assert!(failed(&results, "n3_ce133_accepted", Severity::Hard));
+    }
+
+    /// A refusal is one defect, not two: the node that refused the package
+    /// owes no sharing, so the sharing rows must not also fire.
+    #[test]
+    fn a_refused_submission_is_not_also_graded_for_not_sharing() {
+        let results = run(&n3_ce133_submission(&ctx(
+            vec![submission(true)],
+            Vec::new(),
+        )));
+        assert!(
+            !names(&results).contains(&"n3_ce133_shares_with_both_co_guarantors"),
+            "got {:?}",
+            names(&results)
+        );
+    }
+
+    #[test]
+    fn sharing_with_only_one_co_guarantor_fails() {
+        let results = run(&n3_ce133_submission(&ctx(
+            vec![submission(false)],
+            vec![share(CO[0], SENT_AT + 100, Vec::new())],
+        )));
+        assert!(failed(
+            &results,
+            "n3_ce133_shares_with_both_co_guarantors",
+            Severity::Hard
+        ));
+    }
+
+    /// A share recorded before the package went out cannot be an answer to
+    /// it. Without the ordering test a node that shared someone else's
+    /// package earlier in the run would look like it had answered ours.
+    #[test]
+    fn a_share_from_before_the_submission_does_not_count() {
+        let results = run(&n3_ce133_submission(&ctx(
+            vec![submission(false)],
+            vec![
+                share(CO[0], SENT_AT - 1, Vec::new()),
+                share(CO[1], SENT_AT + 100, Vec::new()),
+            ],
+        )));
+        assert!(failed(
+            &results,
+            "n3_ce133_shares_with_both_co_guarantors",
+            Severity::Hard
+        ));
+    }
+
+    /// Slow is soft; DESIGN §5 marks timing-tolerance clauses soft.
+    #[test]
+    fn sharing_past_the_window_is_a_soft_failure() {
+        let results = run(&n3_ce133_submission(&ctx(
+            vec![submission(false)],
+            vec![
+                share(CO[0], SENT_AT + SHARE_WINDOW_MS + 1, Vec::new()),
+                share(CO[1], SENT_AT + SHARE_WINDOW_MS + 2, Vec::new()),
+            ],
+        )));
+        assert!(failed(
+            &results,
+            "n3_ce133_shares_within_the_window",
+            Severity::Soft
+        ));
+        assert!(
+            !failed(
+                &results,
+                "n3_ce133_shares_with_both_co_guarantors",
+                Severity::Hard
+            ),
+            "slow is not the same defect as not sharing"
+        );
+    }
+
+    /// Mappings that name a different package are a share of the wrong thing.
+    #[test]
+    fn mappings_that_do_not_name_the_submitted_package_fail() {
+        let other = WorkPackageHash::from([0x11; 32]);
+        let results = run(&n3_ce133_submission(&ctx(
+            vec![submission(false)],
+            vec![
+                share(CO[0], SENT_AT + 10, vec![(other, [0x22; 32])]),
+                share(CO[1], SENT_AT + 20, Vec::new()),
+            ],
+        )));
+        assert!(failed(
+            &results,
+            "n3_ce134_shares_the_submitted_package",
+            Severity::Hard
+        ));
+    }
+
+    /// A package with no imported segments has no mappings, and the row is
+    /// absent rather than passing on a condition it could never fail.
+    #[test]
+    fn no_mappings_means_the_mapping_row_is_not_reported() {
+        let results = run(&n3_ce133_submission(&ctx(
+            vec![submission(false)],
+            vec![
+                share(CO[0], SENT_AT + 10, Vec::new()),
+                share(CO[1], SENT_AT + 20, Vec::new()),
+            ],
+        )));
+        assert!(
+            !names(&results).contains(&"n3_ce134_shares_the_submitted_package"),
+            "got {:?}",
+            names(&results)
+        );
+    }
 }
