@@ -57,6 +57,7 @@ pub struct LaneSet {
     pub n0: bool,
     pub n1: bool,
     pub n2: bool,
+    pub n3: bool,
 }
 
 impl LaneSet {
@@ -68,20 +69,22 @@ impl LaneSet {
             n0: false,
             n1: false,
             n2: false,
+            n3: false,
         };
         for name in raw.split(',').map(str::trim).filter(|n| !n.is_empty()) {
             match name.to_ascii_lowercase().as_str() {
                 "n0" => set.n0 = true,
                 "n1" => set.n1 = true,
                 "n2" => set.n2 = true,
+                "n3" => set.n3 = true,
                 other => {
                     return Err(format!(
-                        "unknown lane {other:?}; implemented lanes are n0, n1, n2"
+                        "unknown lane {other:?}; implemented lanes are n0, n1, n2, n3"
                     ))
                 }
             }
         }
-        if !(set.n0 || set.n1 || set.n2) {
+        if !(set.n0 || set.n1 || set.n2 || set.n3) {
             return Err("no lanes selected".to_string());
         }
         Ok(set)
@@ -92,6 +95,13 @@ impl LaneSet {
     /// blocks carried them.
     pub fn needs_tickets(&self) -> bool {
         self.n1 || self.n2
+    }
+
+    /// Whether the run needs a work package submitted. Only N3 reads it, and
+    /// building and submitting one costs a refinement the other lanes have no
+    /// use for.
+    pub fn needs_package(&self) -> bool {
+        self.n3
     }
 }
 
@@ -234,7 +244,8 @@ mod tests {
             LaneSet {
                 n0: true,
                 n1: false,
-                n2: true
+                n2: true,
+                n3: false
             }
         );
         assert!(

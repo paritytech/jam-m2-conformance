@@ -19,6 +19,8 @@ use m2_scenario::ctx::{
     NutTicketFacts, TicketDelivery as CtxDelivery, TicketFault as CtxFault, SLOT_PERIOD_MS,
 };
 
+use m2_scenario::scenarios::n3::{N3Ctx, ReportSeen, SharingSeen, SubmittedPackage};
+
 use crate::scenario::RunCtx;
 
 /// Reference-side facts the N1/N2 context builders read after the observation
@@ -33,6 +35,12 @@ pub(crate) struct RealRunData {
     pub(crate) nut_index: usize,
     pub(crate) emu_indices: Vec<usize>,
     pub(crate) epoch_contexts: EpochContexts,
+    /// CE 133 submissions the emulator made, with the node's answers.
+    pub(crate) submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
+    /// CE 134 shares the node opened.
+    pub(crate) sharing_seen: Arc<Mutex<Vec<SharingSeen>>>,
+    /// CE 135 distributions the node sent.
+    pub(crate) reports_seen: Arc<Mutex<Vec<ReportSeen>>>,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
@@ -156,10 +164,23 @@ pub(crate) fn build_real_run_ctx(
         &nut_blocks,
         own_ticket_ids,
     );
+    // Always built, never gated on the lane: when N3 was not selected no
+    // package was planned, so the records are empty and the lane is not
+    // evaluated. When it was selected and nothing was submitted anyway, the
+    // lane says the rule was not exercised, which is the truth and not a pass.
+    let n3 = N3Ctx {
+        nut_index: data.nut_index as u16,
+        submissions: lock(&data.submissions).clone(),
+        shares: lock(&data.sharing_seen).clone(),
+        reports: lock(&data.reports_seen).clone(),
+        // The harness does not answer CE 134 yet; see `report_io`.
+        answers_sharing: false,
+    };
     RunCtx {
         n0,
         n1: Some(n1),
         n2: Some(n2),
+        n3: Some(n3),
     }
 }
 

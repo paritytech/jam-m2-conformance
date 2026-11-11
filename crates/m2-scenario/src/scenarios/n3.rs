@@ -79,6 +79,14 @@ pub struct SubmittedPackage {
     pub sent_at_wall_ms: u64,
     /// The NUT reset the stream rather than FIN'ing it (`simple.md:374-375`).
     pub refused: bool,
+    /// The validators holding `core` at `slot` alongside the NUT: who the
+    /// node is expected to open CE 134 to.
+    ///
+    /// On the submission rather than on the lane context, because the
+    /// assignment is a property of this core at this slot. A run that
+    /// submitted twice across a rotation boundary has two different answers,
+    /// and a single per-run list would grade the second against the first.
+    pub co_guarantors: Vec<u16>,
 }
 
 /// How long the node has to open CE 134 after a package reaches it.
@@ -100,13 +108,6 @@ pub struct N3Ctx {
     pub shares: Vec<SharingSeen>,
     /// CE 135 distributions the NUT sent.
     pub reports: Vec<ReportSeen>,
-    /// The validators holding the submitted core alongside the NUT.
-    ///
-    /// Read off the engine's assignment for the submission's slot, not
-    /// recomputed: the lane asserts the node agrees with the chain, and a
-    /// harness that derived the set itself would be grading the node against
-    /// its own arithmetic.
-    pub co_guarantors: Vec<u16>,
     /// Whether the harness answers CE 134 with a work-report hash and
     /// signature.
     ///
@@ -163,7 +164,7 @@ pub fn n3_ce133_submission(ctx: &N3Ctx) -> Check {
                 .collect();
             let reached: HashSet<u16> = answering.iter().map(|share| share.peer).collect();
 
-            for co_guarantor in &ctx.co_guarantors {
+            for co_guarantor in &submitted.co_guarantors {
                 results.push(log::check_detail(
                     "n3_ce133_shares_with_both_co_guarantors",
                     reached.contains(co_guarantor),
@@ -270,6 +271,7 @@ mod tests {
             package_hash: PACKAGE,
             sent_at_wall_ms: SENT_AT,
             refused,
+            co_guarantors: CO.to_vec(),
         }
     }
 
@@ -294,7 +296,6 @@ mod tests {
             submissions,
             shares,
             reports: Vec::new(),
-            co_guarantors: CO.to_vec(),
             answers_sharing: false,
         }
     }

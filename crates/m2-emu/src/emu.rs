@@ -1301,6 +1301,7 @@ mod tests {
             package: package.clone(),
             package_hash: [0x5a; 32],
             extrinsics: extrinsics.clone(),
+            co_guarantors: vec![2, 3],
         });
         let submissions = emu.submissions();
         let _accepting = emu.accept_loop(ref_chain);

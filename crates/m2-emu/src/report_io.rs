@@ -174,6 +174,7 @@ pub async fn spawn_package_sender(
             sent_at_wall_ms: wall_ts(),
             // Not known until the node answers, below.
             refused: false,
+            co_guarantors: plan.co_guarantors.clone(),
         });
         recorded.len() - 1
     };

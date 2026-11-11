@@ -54,14 +54,24 @@ pub struct ScheduledSubmission {
     pub package_hash: [u8; 32],
     /// Extrinsic bodies, in the order the package declares them.
     pub extrinsics: Vec<Vec<u8>>,
+    /// The validators that hold `core` at `slot` alongside the NUT.
+    ///
+    /// Computed here, off the engine's assignment, because it is the set the
+    /// node is expected to share with. A harness that derived it itself would
+    /// be grading the node against its own arithmetic rather than against the
+    /// chain.
+    pub co_guarantors: Vec<u16>,
 }
 
 /// Where a CE 133 submission is aimed: a slot, and the core the NUT holds
 /// at that slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionPlan {
     pub slot: u32,
     pub core: CoreIndex,
+    /// The validators holding `core` at `slot` besides the NUT: who it is
+    /// expected to open CE 134 to.
+    pub co_guarantors: Vec<u16>,
 }
 
 /// A package as a builder would put it on CE 133, with the extrinsic bodies
@@ -139,9 +149,16 @@ impl RefChain {
             // straddles one is no safer than one that straddles a rotation.
             let left_in_epoch = epoch - in_epoch;
             if left_in_rotation.min(left_in_epoch) >= margin {
-                return self
-                    .core_for(nut, slot)
-                    .map(|core| SubmissionPlan { slot, core });
+                return self.core_for(nut, slot).map(|core| SubmissionPlan {
+                    slot,
+                    core,
+                    co_guarantors: self
+                        .guarantors_for(core, slot)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|v| *v != nut)
+                        .collect(),
+                });
             }
         }
         None

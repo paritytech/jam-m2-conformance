@@ -266,6 +266,13 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // window, with the plan none the wiser. Planning against a node that
         // can already accept makes the slots the schedule names the slots the
         // tickets arrive in.
+        // The same readiness gate serves the package lane. A node still
+        // importing the chain it was handed is not guaranteeing anything
+        // either, and a submission aimed at a slot it spends catching up in
+        // would grade it for work it was never in a position to do.
+        if cli.lanes.needs_package() && !cli.lanes.needs_tickets() {
+            wait_until_the_node_can_accept_tickets(&shared, cli.observe_secs).await;
+        }
         let (ticket_ctx, ticket_plan, target_epoch) = if cli.lanes.needs_tickets() {
             wait_until_the_node_can_accept_tickets(&shared, cli.observe_secs).await;
             plan_tickets_for_this_run(&ref_chain, nut_index)
@@ -288,6 +295,18 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // Each emulated validator's tickets go out on the connection to it,
         // whichever side opened it; the senders pick the plan up from here.
         emu.set_ticket_plans(plans_by_peer(&ticket_plan));
+        if cli.lanes.needs_package() {
+            match plan_package_for_this_run(&ref_chain, nut_index) {
+                Ok(plan) => emu.set_submission_plan(plan),
+                // A run that cannot plan a submission still grades every
+                // other lane; N3 reports the rule as unexercised rather than
+                // failing the node for the harness's inability to ask.
+                Err(e) => conn_findings.push(no_package_plan_finding(&e)),
+            }
+        }
+        let submissions = emu.submissions();
+        let sharing_seen = emu.sharing_seen();
+        let reports_seen = emu.reports_seen();
         let ce128_probes = emu.ce128_probes();
         let ce129_probes = emu.ce129_probes();
         let real_run = RealRunData {
@@ -300,6 +319,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             nut_index,
             emu_indices: emu_indices.clone(),
             epoch_contexts,
+            submissions,
+            sharing_seen,
+            reports_seen,
         };
         (
             ObsSource::Emulator {
@@ -627,6 +649,62 @@ fn empty_ticket_plan_finding(ref_chain: &RefChain, target_epoch: u32) -> Finding
              epoch {target_epoch} has closed, so the ticket lanes are not exercised",
             now % jam_types::epoch_period()
         ),
+    }
+}
+
+/// How much of its rotation the node is left to work in.
+///
+/// Sharing is given ~3 s by DESIGN §11 N3, and distributing the report
+/// follows it; two slots is twelve seconds, which clears both without
+/// pushing the submission so far into the rotation that a slow node runs out
+/// of room through no fault of its own.
+const SUBMISSION_MARGIN_SLOTS: u32 = 2;
+
+/// Build this run's CE 133 submission: one trivial work item, aimed at a slot
+/// the NUT guarantees a core in with room left to act.
+fn plan_package_for_this_run(
+    ref_chain: &RefChain,
+    nut_index: usize,
+) -> Result<m2_reference::reports::ScheduledSubmission, m2_reference::chain::ChainError> {
+    // From the next slot, not this one: planning into the slot the chain is
+    // already in leaves no time for the submission to go out before it ends.
+    let from = ref_chain.next_slot();
+    let plan = ref_chain
+        .submission_slot_for(nut_index as u16, from, SUBMISSION_MARGIN_SLOTS)
+        .ok_or_else(|| {
+            m2_reference::chain::ChainError::Chain(format!(
+                "no slot at or after {from} leaves {SUBMISSION_MARGIN_SLOTS} slots of its \
+                 rotation for the node to act in"
+            ))
+        })?;
+    let item = jam_node::hazmat::BuildItem::new(
+        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+        jam_types::WorkPayload(Vec::new()),
+        jam_types::max_refine_gas(),
+        jam_types::max_accumulate_gas(),
+        Vec::new(),
+        Vec::new(),
+        0,
+    );
+    let built = ref_chain.build_work_package(vec![item]);
+    Ok(m2_reference::reports::ScheduledSubmission {
+        slot: plan.slot,
+        core: plan.core,
+        package: jam_types::Encode::encode(&built.package),
+        package_hash: m2_reference::reports::package_hash(&built.package).0,
+        extrinsics: built.extrinsics,
+        co_guarantors: plan.co_guarantors,
+    })
+}
+
+/// Reported when the harness could not pose the CE 133 row at all.
+fn no_package_plan_finding(error: &m2_reference::chain::ChainError) -> Finding {
+    Finding {
+        severity: "soft".into(),
+        spec_citation: "simple.md :351-376".into(),
+        slot: None,
+        evidence: "work-package plan".into(),
+        message: format!("no work package submitted, so N3's CE 133 row is not exercised: {error}"),
     }
 }
 
