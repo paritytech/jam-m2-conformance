@@ -80,10 +80,28 @@ obvious harness-side explanations:
 1. A report may only be includable once its bundle is available, which is
    N4's erasure-coding path and something this harness does not do at all.
    If so the row is not reachable until availability exists, and it should
-   say so rather than fail.
+   say so rather than fail. **Untested, and the most likely of the three.**
 2. The guarantee is composed over the storage view of the assignment
    (finding 1), so its signers may not be the cohort the node expects for
-   that core, in which case the node is right to drop it.
-3. The guarantee's slot must fall within the including block's rotation or
-   the one before. The harness does not currently check that what it
-   distributes is still includable when it arrives.
+   that core, in which case the node is right to drop it. **Untested.**
+3. ~~The guarantee's slot must fall within the including block's rotation or
+   the one before.~~ **Tried and refuted, 2026-11-12.** The rule is real
+   (`exec/reports.rs`, `FutureReportSlot` / `ReportRotationBeforeLast`) and
+   the harness does compose a guarantee an epoch before it distributes it,
+   so the reasoning looked sound. Composing both the package and the report
+   at send time instead made things strictly worse: the node began refusing
+   the *submission* with `Unwanted` (`0x52e4a40fa8db`), and two runs
+   exercised nothing at all.
+
+   The inversion is the useful part. A package built roughly eleven slots
+   ahead is accepted; one built against the chain head at the moment of
+   sending is refused. `Unwanted` covers an anchor that is unknown as well as
+   one that is too old, so the likely reading is that the fresh anchor names
+   a reference block the node has not imported yet -- the anchor was too
+   *new*, not too old. A fix along these lines would have to build far enough
+   ahead for the node to have the anchor and recently enough to stay inside
+   recent history, and that window was not established.
+
+   The attempt is stashed as `n3-send-time-build: refuted, anchor too new
+   (Unwanted)` rather than thrown away, since the restructuring is reusable
+   if the anchor window is ever pinned down.
