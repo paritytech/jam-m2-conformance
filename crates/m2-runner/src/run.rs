@@ -743,6 +743,27 @@ fn plan_package_for_this_run(
             ))
         })?;
     let item = trivial_work_item();
+    let (cached_epoch, state_epoch) = ref_chain.epoch_views();
+    let (cached_entropy, entropy1, entropy2) = ref_chain.assignment_entropy();
+    eprintln!(
+        "[assignment] entropy: cached {cached_entropy}  best-block[1] {entropy1}  \
+         best-block[2] {entropy2}  -> cached matches {}",
+        if cached_entropy == entropy2 {
+            "entry 2 (the on-chain rule)"
+        } else if cached_entropy == entropy1 {
+            "entry 1 (one epoch ahead)"
+        } else {
+            "neither"
+        }
+    );
+    eprintln!(
+        "[assignment] cached epoch view {cached_epoch}, best-block state epoch {state_epoch}{}",
+        if cached_epoch == state_epoch {
+            ""
+        } else {
+            "  <-- CACHE LAGS THE STATE"
+        }
+    );
     eprintln!(
         "[assignment] reference head slot {} (epoch {}), submission slot {} (epoch {})",
         ref_chain.best_slot(),

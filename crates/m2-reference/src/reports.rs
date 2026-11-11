@@ -387,6 +387,42 @@ impl RefChain {
             .map(|vals| vals.to_vec())
     }
 
+    /// The epoch index the chain's cached epoch view currently names, and the
+    /// epoch its best block's state is in.
+    ///
+    /// The two can differ, and that is the whole of the storage-versus-epoch
+    /// disagreement: `EpochInfo` is a cache built from an epoch mark, while
+    /// `core_assignments_for` reads the state. When the cache lags, the
+    /// "current" epoch is the previous one and its shuffle is a different
+    /// shuffle.
+    pub fn epoch_views(&self) -> (u32, u32) {
+        let harness = self.harness();
+        let jam = harness.chain();
+        let (index, _current, _next) = jam.current_and_next_epochs();
+        let head = jam.best_block().1;
+        (index, head / jam_types::epoch_period())
+    }
+
+    /// The entropy each view would shuffle with: the cached epoch's, and
+    /// entries 1 and 2 of the best block's buffer.
+    ///
+    /// The on-chain rule shuffles with entry 2 (`exec/reports.rs`), so a
+    /// cached value equal to entry 1 is an epoch out, and one equal to
+    /// neither came from a state the chain has moved past.
+    pub fn assignment_entropy(&self) -> (String, String, String) {
+        let harness = self.harness();
+        let jam = harness.chain();
+        let (_index, current, _next) = jam.current_and_next_epochs();
+        let short =
+            |bytes: &[u8]| -> String { bytes[..8].iter().map(|b| format!("{b:02x}")).collect() };
+        let cached = short(&current.core_assignment_entropy.0);
+        let storage = harness.storage(None);
+        let buffer = storage
+            .entropy()
+            .expect("the best block has an entropy buffer");
+        (cached, short(&buffer[1].0), short(&buffer[2].0))
+    }
+
     /// The validators assigned to `core` at `slot`, as the *epoch view*
     /// computes it.
     ///
