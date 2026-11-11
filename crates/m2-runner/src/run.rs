@@ -303,6 +303,17 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         emu.set_ticket_plans(plans_by_peer(&ticket_plan));
         if cli.lanes.needs_package() {
             let t = std::time::Instant::now();
+            // Aiming into the next epoch can mean waiting most of one, so a
+            // window that closes first leaves the lane unexercised with
+            // nothing to say why.
+            let wait_secs = u64::from(
+                (ref_chain.next_slot() / jam_types::epoch_period() + 1) * jam_types::epoch_period()
+                    - ref_chain.next_slot(),
+            ) * m2_scenario::ctx::SLOT_PERIOD_MS
+                / 1000;
+            if wait_secs + MIN_SECS_AFTER_SUBMISSION > cli.observe_secs {
+                conn_findings.push(short_window_finding(wait_secs, cli.observe_secs));
+            }
             match plan_package_for_this_run(&ref_chain, nut_index) {
                 Ok((plan, answer)) => {
                     // The report to be included rides the same slot plan: it
@@ -731,9 +742,24 @@ fn plan_package_for_this_run(
     ),
     m2_reference::chain::ChainError,
 > {
-    // From the next slot, not this one: planning into the slot the chain is
-    // already in leaves no time for the submission to go out before it ends.
-    let from = ref_chain.next_slot();
+    // Into the *next* epoch, not the next slot.
+    //
+    // The two core assignments read different entries of the entropy buffer.
+    // `core_assignments_for` takes entry 2 for a slot in the head's own epoch
+    // and entry 1 for one in the next; the cached epoch view a guarantor
+    // shares by carries entry 1 either way. So they disagree for a slot in
+    // the head's epoch and agree for a slot in the next one -- which is the
+    // whole of why this lane passed every row in one run and failed the
+    // sharing row in the next, with the run's start time as the only
+    // variable.
+    //
+    // Aiming into the next epoch puts the submission where the node's
+    // sharing cohort and the on-chain rule provably read the same entropy,
+    // so the lane grades an assignment both sides agree on instead of
+    // picking a side. Which of the two is authoritative for a same-epoch
+    // slot is a separate question, recorded in findings.md.
+    let epoch = jam_types::epoch_period();
+    let from = (ref_chain.next_slot() / epoch + 1) * epoch;
     let plan = ref_chain
         .submission_slot_for(nut_index as u16, from, SUBMISSION_MARGIN_SLOTS)
         .ok_or_else(|| {
@@ -742,6 +768,13 @@ fn plan_package_for_this_run(
                  rotation for the node to act in"
             ))
         })?;
+    eprintln!(
+        "[assignment] aiming at slot {} (epoch {}), head is slot {} (epoch {})",
+        plan.slot,
+        plan.slot / epoch,
+        ref_chain.next_slot(),
+        ref_chain.next_slot() / epoch
+    );
     let item = trivial_work_item();
     let (cached_epoch, state_epoch) = ref_chain.epoch_views();
     let (cached_entropy, entropy1, entropy2) = ref_chain.assignment_entropy();
@@ -826,8 +859,25 @@ async fn submit_as_builder(
     shared: m2_emu::emu::EmuShared,
 ) {
     let Some(plan) = shared.take_submission_plan() else {
+        eprintln!("[builder] no submission plan to claim");
         return;
     };
+    // Wait for the slot *before* dialling, not after. A builder connection
+    // opened at plan time and then held idle until the slot is a connection
+    // QUIC closes under us: once the lane began aiming a whole epoch ahead
+    // the wait grew past the idle timeout, the connection was gone by the
+    // time the slot arrived, and the submission never left. A builder
+    // connects when it has something to submit.
+    let target_ms = m2_emu::emu::slot_start_ms(plan.slot);
+    loop {
+        let now = jamnp_s::trace::wall_ts();
+        if now >= target_ms {
+            break;
+        }
+        jamnp_s::clock::current()
+            .sleep(Duration::from_millis(target_ms - now))
+            .await;
+    }
     let mut seed = [0u8; 32];
     seed[0] = 0xB0;
     seed[1] = 0xD1;
@@ -843,9 +893,14 @@ async fn submit_as_builder(
             addr,
         )
         .await;
-    let Ok(connection) = connected else {
-        return;
+    let connection = match connected {
+        Ok(connection) => connection,
+        Err(e) => {
+            eprintln!("[builder] could not connect as a builder: {e}");
+            return;
+        }
     };
+    eprintln!("[builder] connected; submitting in slot {}", plan.slot);
     m2_emu::report_io::spawn_package_sender(
         connection.clone(),
         plan,
@@ -881,6 +936,27 @@ fn trivial_work_item() -> jam_node::hazmat::BuildItem {
         Vec::new(),
         0,
     )
+}
+
+/// Seconds the node needs after a submission to share, be answered, build a
+/// guarantee and distribute it. Measured at a few seconds in practice; this
+/// leaves room for a slow one.
+const MIN_SECS_AFTER_SUBMISSION: u64 = 30;
+
+/// Reported when the observation window closes before the submission slot.
+fn short_window_finding(wait_secs: u64, observe_secs: u64) -> Finding {
+    Finding {
+        severity: "soft".into(),
+        spec_citation: "simple.md :351-376".into(),
+        slot: None,
+        evidence: "work-package plan".into(),
+        message: format!(
+            "the submission slot is {wait_secs} s away and the window is {observe_secs} s, so \
+             N3 will not be exercised; the lane aims into the next epoch, so it needs at least \
+             {} s",
+            wait_secs + MIN_SECS_AFTER_SUBMISSION
+        ),
+    }
 }
 
 /// Reported when the harness could not pose the CE 133 row at all.
