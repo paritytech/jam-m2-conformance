@@ -1,4 +1,4 @@
-//! N1/N2 detail observations the emulator emits (DESIGN.md §11 N1/N2).
+//! N1/N2/N3 detail observations the emulator emits (DESIGN.md §11).
 //!
 //! Like the N0 codes (`scenarios/n0.rs`), these ride the
 //! [`dsl::ObsKind::Other`] extension slot. The runner wires the emulator to
@@ -13,6 +13,8 @@
 //! | 46 | emulator sent a ticket via CE 132 (broadcast incl. the NUT) |
 //! | 47 | emulator withheld a planned ticket: the NUT could not accept it |
 //! | 48 | NUT sent a CE 131/132 frame that would not decode |
+//! | 50 | NUT sent a CE 134 sharing stream that would not decode |
+//! | 51 | NUT sent a CE 135 frame that would not decode |
 //!
 //! Code 44 is retired. It meant two unrelated things -- the NUT refusing a
 //! ticket, and the NUT sending a frame the harness could not decode -- and
@@ -49,3 +51,13 @@ pub const TICKET_WITHHELD: u8 = 47;
 /// ticket -- and the CE 131 decoder defect closed on 2026-10-30 was a
 /// generator of exactly these.
 pub const NUT_SENT_UNDECODABLE: u8 = 48;
+
+/// The NUT sent a CE 134 sharing stream the harness could not read.
+///
+/// Separate from the CE 135 code below, and from N2's
+/// [`NUT_SENT_UNDECODABLE`], for the reason code 44 was retired: one code
+/// standing for two different defects lets a check about either be satisfied
+/// by the other.
+pub const NUT_SENT_BAD_SHARING: u8 = 50;
+/// The NUT sent a CE 135 frame the harness could not read.
+pub const NUT_SENT_BAD_REPORT: u8 = 51;
