@@ -105,15 +105,35 @@ pub struct SharingAnswer {
 }
 
 impl GuaranteedWork {
-    /// The CE 134 answer an emulated co-guarantor gives for this work.
-    pub fn sharing_answer(&self) -> SharingAnswer {
+    /// The CE 134 answer for `cohort`: the report's hash, and each listed
+    /// validator's own signature over it.
+    ///
+    /// Signed per validator rather than taken from `self.guarantee`. The
+    /// guarantee is composed over the storage view of the assignment, while a
+    /// node shares with the cohort its *epoch* view names, and the two
+    /// disagree -- so the guarantee holds no signature for the validators
+    /// that actually receive the share. Answering with nothing left the node
+    /// unable to assemble a guarantee at all, and no CE 135 was ever sent.
+    ///
+    /// The message is `jam_guarantee ++ hash`, which is the engine's own
+    /// [`ed25519::Message::Guarantee`], so the bytes are not reconstructed
+    /// here.
+    pub fn sharing_answer_for(&self, cohort: &[u16]) -> SharingAnswer {
+        let hash = self.report.hash();
         SharingAnswer {
-            report_hash: self.report.hash().0,
-            signatures: self
-                .guarantee
-                .signatures
+            report_hash: hash.0,
+            signatures: cohort
                 .iter()
-                .map(|signed| (signed.val_index, signed.signature.to_bytes()))
+                .map(|&validator| {
+                    let secret =
+                        jam_std_common::SecretKeyset::trivial(u32::from(validator)).ed25519;
+                    (
+                        validator,
+                        secret
+                            .sign(&jam_std_common::ed25519::Message::Guarantee(hash))
+                            .to_bytes(),
+                    )
+                })
                 .collect(),
         }
     }
@@ -215,16 +235,25 @@ impl RefChain {
             // straddles one is no safer than one that straddles a rotation.
             let left_in_epoch = epoch - in_epoch;
             if left_in_rotation.min(left_in_epoch) >= margin {
-                return self.core_for(nut, slot).map(|core| SubmissionPlan {
-                    slot,
-                    core,
-                    co_guarantors: self
-                        .guarantors_for(core, slot)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|v| *v != nut)
-                        .collect(),
-                });
+                // The epoch view, not the storage one. A guarantor picks who
+                // to share a package with from its epoch's own assignment,
+                // and the two disagree: measured against a real node in the
+                // same epoch as the reference head, storage said core 0 was
+                // [2, 3, 5] while the epoch said [0, 4, 5], and the node
+                // shared with 4. Aiming a submission by the storage view
+                // grades the node against an assignment it is not using.
+                return self
+                    .core_for_in_epoch(nut, slot)
+                    .map(|core| SubmissionPlan {
+                        slot,
+                        core,
+                        co_guarantors: self
+                            .guarantors_for_in_epoch(core, slot)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|v| *v != nut)
+                            .collect(),
+                    });
             }
         }
         None
@@ -247,7 +276,7 @@ impl RefChain {
         nut: u16,
         slot: u32,
     ) -> Result<Option<ScheduledReport>, ChainError> {
-        let Some(nut_core) = self.core_for(nut, slot) else {
+        let Some(nut_core) = self.core_for_in_epoch(nut, slot) else {
             return Ok(None);
         };
         let cores = jam_types::core_count();
@@ -329,6 +358,43 @@ impl RefChain {
             .ok()?
             .core_to_vals(core)
             .map(|vals| vals.to_vec())
+    }
+
+    /// The validators assigned to `core` at `slot`, as the *epoch view*
+    /// computes it.
+    ///
+    /// The other half of a disagreement worth keeping visible.
+    /// [`guarantors_for`](Self::guarantors_for) reads the storage, which
+    /// picks its entropy relative to the storage's own slot -- `Same` takes
+    /// entropy 2, `Prev` takes 3, `Next` takes 1. This reads the epoch's own
+    /// precomputed entropy instead, which is what a guarantor uses when it
+    /// chooses who to share a package with.
+    ///
+    /// They should agree whenever the reference's head and `slot` sit in the
+    /// same epoch. Where they do not, one of the two is being read from the
+    /// wrong state, and the lane needs to know which before it grades a node
+    /// against either.
+    pub fn guarantors_for_in_epoch(&self, core: CoreIndex, slot: u32) -> Option<Vec<u16>> {
+        let harness = self.harness();
+        let jam = harness.chain();
+        let (_index, epoch, _next) = jam.current_and_next_epochs();
+        epoch
+            .core_assignments(slot)
+            .core_to_vals(core)
+            .map(|vals| vals.to_vec())
+    }
+
+    /// The core validator `index` guarantees at `slot`, as the epoch view
+    /// computes it.
+    ///
+    /// The view that decides whether the node considers itself a guarantor
+    /// of the core a package is addressed to, so it is the one a submission
+    /// is aimed with.
+    pub fn core_for_in_epoch(&self, index: u16, slot: u32) -> Option<CoreIndex> {
+        let harness = self.harness();
+        let jam = harness.chain();
+        let (_index, epoch, _next) = jam.current_and_next_epochs();
+        epoch.core_assignments(slot).val_to_core(index)
     }
 
     /// The core validator `index` guarantees at `slot`.

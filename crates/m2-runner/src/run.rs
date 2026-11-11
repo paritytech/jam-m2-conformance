@@ -314,10 +314,20 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         nut_index as u16,
                         plan.slot,
                     ) {
-                        Ok(Some(report)) => emu.set_report_plan(report),
+                        Ok(Some(report)) => {
+                            eprintln!(
+                                "[assignment] distributing report on core {} in slot {}",
+                                report.core, report.slot
+                            );
+                            emu.set_report_plan(report)
+                        }
                         // One core, or no assignment: the inclusion row says
                         // it was not exercised rather than failing the node.
-                        Ok(None) => {}
+                        Ok(None) => eprintln!(
+                            "[assignment] no report to distribute: the NUT holds no core at \
+                             slot {} in the epoch view, or there is only one core",
+                            plan.slot
+                        ),
                         Err(e) => conn_findings.push(no_package_plan_finding(&e)),
                     }
                     phase("plan_package.report_to_distribute", t_dist);
@@ -733,14 +743,22 @@ fn plan_package_for_this_run(
             ))
         })?;
     let item = trivial_work_item();
+    eprintln!(
+        "[assignment] reference head slot {} (epoch {}), submission slot {} (epoch {})",
+        ref_chain.best_slot(),
+        ref_chain.best_slot() / jam_types::epoch_period(),
+        plan.slot,
+        plan.slot / jam_types::epoch_period()
+    );
     // The whole assignment at the submission slot, so a disagreement with the
     // node over who holds a core is visible in the run rather than inferred
     // from which peers it talked to.
     for core in 0..jam_types::core_count() {
         eprintln!(
-            "[assignment] slot {} core {core}: {:?}",
+            "[assignment] slot {} core {core}: storage {:?} epoch {:?}",
             plan.slot,
-            ref_chain.guarantors_for(core, plan.slot)
+            ref_chain.guarantors_for(core, plan.slot),
+            ref_chain.guarantors_for_in_epoch(core, plan.slot),
         );
     }
     // One computation, not two. The package the harness submits and the
@@ -756,9 +774,9 @@ fn plan_package_for_this_run(
             package: jam_types::Encode::encode(&work.package),
             package_hash: m2_reference::reports::package_hash(&work.package).0,
             extrinsics: work.extrinsics.clone(),
-            co_guarantors: plan.co_guarantors,
+            co_guarantors: plan.co_guarantors.clone(),
         },
-        work.sharing_answer(),
+        work.sharing_answer_for(&plan.co_guarantors),
     ))
 }
 
