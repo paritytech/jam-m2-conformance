@@ -297,7 +297,23 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         emu.set_ticket_plans(plans_by_peer(&ticket_plan));
         if cli.lanes.needs_package() {
             match plan_package_for_this_run(&ref_chain, nut_index) {
-                Ok((plan, answer)) => emu.set_submission_plan(plan, answer),
+                Ok((plan, answer)) => {
+                    // The report to be included rides the same slot plan: it
+                    // is guaranteed on a core the NUT does not hold, so the
+                    // two never collide.
+                    match ref_chain.report_to_distribute(
+                        vec![trivial_work_item()],
+                        nut_index as u16,
+                        plan.slot,
+                    ) {
+                        Ok(Some(report)) => emu.set_report_plan(report),
+                        // One core, or no assignment: the inclusion row says
+                        // it was not exercised rather than failing the node.
+                        Ok(None) => {}
+                        Err(e) => conn_findings.push(no_package_plan_finding(&e)),
+                    }
+                    emu.set_submission_plan(plan, answer)
+                }
                 // A run that cannot plan a submission still grades every
                 // other lane; N3 reports the rule as unexercised rather than
                 // failing the node for the harness's inability to ask.
@@ -306,6 +322,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         }
         let submissions = emu.submissions();
         let sharing_answer = emu.sharing_answer();
+        let distributed = emu.distributed();
         let sharing_seen = emu.sharing_seen();
         let reports_seen = emu.reports_seen();
         let ce128_probes = emu.ce128_probes();
@@ -324,6 +341,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             sharing_seen,
             reports_seen,
             sharing_answer,
+            distributed,
         };
         (
             ObsSource::Emulator {
@@ -686,15 +704,7 @@ fn plan_package_for_this_run(
                  rotation for the node to act in"
             ))
         })?;
-    let item = jam_node::hazmat::BuildItem::new(
-        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-        jam_types::WorkPayload(Vec::new()),
-        jam_types::max_refine_gas(),
-        jam_types::max_accumulate_gas(),
-        Vec::new(),
-        Vec::new(),
-        0,
-    );
+    let item = trivial_work_item();
     // One computation, not two. The package the harness submits and the
     // report its co-guarantors sign for have to be the same package, and
     // building it twice would re-read the chain head in between.
@@ -710,6 +720,21 @@ fn plan_package_for_this_run(
         },
         work.sharing_answer(),
     ))
+}
+
+/// The smallest work item that refines: no payload, no imports, no
+/// extrinsics. The lane grades the protocol around a package, not the work
+/// inside it, and a trivial item keeps the refinement off the slot budget.
+fn trivial_work_item() -> jam_node::hazmat::BuildItem {
+    jam_node::hazmat::BuildItem::new(
+        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+        jam_types::WorkPayload(Vec::new()),
+        jam_types::max_refine_gas(),
+        jam_types::max_accumulate_gas(),
+        Vec::new(),
+        Vec::new(),
+        0,
+    )
 }
 
 /// Reported when the harness could not pose the CE 133 row at all.

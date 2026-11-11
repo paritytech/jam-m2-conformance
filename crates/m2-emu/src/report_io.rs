@@ -14,15 +14,16 @@ use jamnp_s::{
     codec::ce131_136::{
         GuaranteedWorkReport, SharingBundle, SharingContext, SharingReply, WorkPackageSubmission,
     },
-    framing::{frame, frame_message, CE133},
+    framing::{frame, frame_message, CE133, CE135},
     trace::{wall_ts, Direction as TraceDir, Trace},
     transport::{Conn, ReadError, SendHalf},
 };
-use m2_reference::reports::{ScheduledSubmission, SharingAnswer};
+use m2_reference::reports::{ScheduledReport, ScheduledSubmission, SharingAnswer};
 use m2_scenario::dsl::{ObsKind, ObsLog};
-use m2_scenario::scenarios::n3::{ReportSeen, SharingSeen, SubmittedPackage};
+use m2_scenario::scenarios::n3::{DistributedReport, ReportSeen, SharingSeen, SubmittedPackage};
 use m2_scenario::scenarios::obs::{
-    EMU_ANSWERED_134, EMU_SENT_133, NUT_SENT_BAD_REPORT, NUT_SENT_BAD_SHARING, PACKAGE_REFUSED,
+    EMU_ANSWERED_134, EMU_SENT_133, EMU_SENT_135, NUT_SENT_BAD_REPORT, NUT_SENT_BAD_SHARING,
+    PACKAGE_REFUSED,
 };
 
 use crate::emu::{record, slot_start_ms, StreamReader};
@@ -210,6 +211,41 @@ pub async fn spawn_package_sender(
         crate::emu::lock(&submissions)[index].refused = true;
         record(&obs, peer, ObsKind::Other(PACKAGE_REFUSED));
     }
+}
+
+/// Distribute a reference-guaranteed work-report to the NUT over CE 135
+/// (`simple.md:460-485`), so the node can be graded on including it.
+///
+/// One message, then FIN. Unlike CE 133 there is no judgement to read back:
+/// the spec's answer is a bare FIN, and whether the node accepted the report
+/// shows up in its next block, not on this stream.
+pub async fn spawn_report_sender(
+    connection: Conn,
+    plan: ScheduledReport,
+    trace: Arc<Mutex<Trace>>,
+    obs: Arc<Mutex<ObsLog>>,
+    distributed: Arc<Mutex<Vec<DistributedReport>>>,
+    peer: u16,
+) {
+    sleep_until_slot(plan.slot).await;
+
+    let Ok((mut send, _recv)) = connection.open_bi().await else {
+        return;
+    };
+    let wire = frame(CE135, &plan.wire);
+    crate::emu::trace_record(peer, CE135, send.id(), &wire, &trace, TraceDir::Rx);
+    record(&obs, peer, ObsKind::Other(EMU_SENT_135));
+    if send.write_all(&wire).await.is_err() {
+        return;
+    }
+    crate::emu::lock(&distributed).push(DistributedReport {
+        peer,
+        core: plan.core,
+        report_hash: plan.report_hash,
+        sent_in_slot: plan.slot,
+        sent_at_wall_ms: wall_ts(),
+    });
+    send.finish();
 }
 
 /// Wait until `slot` begins.

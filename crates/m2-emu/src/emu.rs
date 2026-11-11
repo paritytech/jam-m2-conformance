@@ -25,13 +25,13 @@ use jamnp_s::{
     transport::{quic::QuicTransport, Conn, Listener, RecvHalf, SendHalf, Transport},
 };
 use m2_reference::chain::RefChain;
-use m2_reference::reports::{ScheduledSubmission, SharingAnswer};
+use m2_reference::reports::{ScheduledReport, ScheduledSubmission, SharingAnswer};
 use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::{DeliveredTicket, NutBlock};
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
 use m2_scenario::scenarios::n0;
 use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
-use m2_scenario::scenarios::n3::{ReportSeen, SharingSeen, SubmittedPackage};
+use m2_scenario::scenarios::n3::{DistributedReport, ReportSeen, SharingSeen, SubmittedPackage};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
@@ -96,6 +96,10 @@ pub struct Emulator {
     /// What an emulated co-guarantor answers a CE 134 share with, once the
     /// submission it belongs to has been planned.
     sharing_answer: Arc<Mutex<Option<SharingAnswer>>>,
+    /// The reference-guaranteed report this run distributes to the NUT.
+    report_plan: Arc<Mutex<Option<ScheduledReport>>>,
+    /// Reports the emulator distributed, for the inclusion rows.
+    distributed: Arc<Mutex<Vec<DistributedReport>>>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
     ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
@@ -154,6 +158,10 @@ pub struct EmuShared {
     pub submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
     /// The CE 134 answer for this run's submission, if one was planned.
     pub sharing_answer: Arc<Mutex<Option<SharingAnswer>>>,
+    /// The reference-guaranteed report this run distributes to the NUT.
+    pub report_plan: Arc<Mutex<Option<ScheduledReport>>>,
+    /// Reports the emulator distributed.
+    pub distributed: Arc<Mutex<Vec<DistributedReport>>>,
     /// Tickets actually put on the wire, with the wall-clock time they were
     /// sent. The sender knows each ticket's id, so the N1 lane reads this
     /// rather than re-deriving ids from the observation log.
@@ -197,6 +205,15 @@ impl EmuShared {
         lock(&self.ticket_plans)
             .remove(&peer)
             .filter(|p| !p.is_empty())
+    }
+
+    /// Take this run's CE 135 distribution, leaving nothing behind.
+    ///
+    /// Claimed once, like the submission: the same report sent twice is a
+    /// duplicate the node is right to drop, which would read as a failure to
+    /// include it.
+    pub fn take_report_plan(&self) -> Option<ScheduledReport> {
+        lock(&self.report_plan).take()
     }
 
     /// Take this run's CE 133 submission, leaving nothing behind.
@@ -290,6 +307,8 @@ impl Emulator {
             submission_plan: Arc::new(Mutex::new(None)),
             submissions: Arc::new(Mutex::new(Vec::new())),
             sharing_answer: Arc::new(Mutex::new(None)),
+            report_plan: Arc::new(Mutex::new(None)),
+            distributed: Arc::new(Mutex::new(Vec::new())),
             deliveries: Arc::new(Mutex::new(Vec::new())),
             ce128_probes: Arc::new(Mutex::new(Vec::new())),
             ce129_probes: Arc::new(Mutex::new(Vec::new())),
@@ -338,6 +357,20 @@ impl Emulator {
         Arc::clone(&self.sharing_answer)
     }
 
+    /// Set the reference-guaranteed report this run distributes to the NUT.
+    ///
+    /// Behind the same gate as the other plans: a report distributed while
+    /// the node is still importing names a slot it will not act in.
+    pub fn set_report_plan(&self, plan: ScheduledReport) {
+        *lock(&self.report_plan) = Some(plan);
+        self.plans_set.send_replace(true);
+    }
+
+    /// Reports the emulator distributed, for the inclusion rows.
+    pub fn distributed(&self) -> Arc<Mutex<Vec<DistributedReport>>> {
+        Arc::clone(&self.distributed)
+    }
+
     /// The tickets the emulator put on the wire, with their send times.
     pub fn deliveries(&self) -> Arc<Mutex<Vec<DeliveredTicket>>> {
         Arc::clone(&self.deliveries)
@@ -377,6 +410,8 @@ impl Emulator {
             submission_plan: Arc::clone(&self.submission_plan),
             submissions: Arc::clone(&self.submissions),
             sharing_answer: Arc::clone(&self.sharing_answer),
+            report_plan: Arc::clone(&self.report_plan),
+            distributed: Arc::clone(&self.distributed),
             deliveries: Arc::clone(&self.deliveries),
             ce128_probes: Arc::clone(&self.ce128_probes),
             ce129_probes: Arc::clone(&self.ce129_probes),
@@ -630,6 +665,7 @@ async fn endpoint_task(
         // whole ticket plan.
         start_ticket_delivery(&connection, peer_index, &shared);
         start_package_submission(&connection, peer_index, &shared);
+        start_report_distribution(&connection, peer_index, &shared);
         start_sync_probe(&connection, peer_index, &shared);
         // One task per connection: with UP 0 persistent the handler runs for
         // the lifetime of the connection, so awaiting it here would stall the
@@ -639,6 +675,33 @@ async fn endpoint_task(
             handle_connection(connection, peer_index, genesis_hash, shared).await;
         });
     }
+}
+
+/// Spawn the CE 135 distributor on this connection, if it claims this run's
+/// report.
+fn start_report_distribution(connection: &Conn, peer: u16, shared: &EmuShared) {
+    let connection = connection.clone();
+    let mut plans_set = shared.plans_set.clone();
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        while !*plans_set.borrow_and_update() {
+            if plans_set.changed().await.is_err() {
+                return;
+            }
+        }
+        let Some(plan) = shared.take_report_plan() else {
+            return;
+        };
+        crate::report_io::spawn_report_sender(
+            connection,
+            plan,
+            Arc::clone(&shared.trace),
+            Arc::clone(&shared.obs),
+            Arc::clone(&shared.distributed),
+            peer,
+        )
+        .await;
+    });
 }
 
 /// Spawn the CE 133 submitter on this connection, if it is the one that

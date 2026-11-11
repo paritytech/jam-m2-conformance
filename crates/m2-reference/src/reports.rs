@@ -68,6 +68,20 @@ pub struct ScheduledSubmission {
     pub co_guarantors: Vec<u16>,
 }
 
+/// A guaranteed work-report the harness distributes over CE 135, so the node
+/// can be graded on including it.
+#[derive(Debug, Clone)]
+pub struct ScheduledReport {
+    /// Slot to distribute in.
+    pub slot: u32,
+    /// Core the report is guaranteed on.
+    pub core: u16,
+    /// Hash of the report, which is what a block's guarantees are read by.
+    pub report_hash: [u8; 32],
+    /// The encoded `Guaranteed Work-Report` (`simple.md:478`).
+    pub wire: Vec<u8>,
+}
+
 /// What an emulated co-guarantor answers a CE 134 share with
 /// (`simple.md:456`): the hash of the refined work-report, and a signature
 /// over it that can go into a guaranteed work-report.
@@ -214,6 +228,50 @@ impl RefChain {
             }
         }
         None
+    }
+
+    /// A fully reference-guaranteed report for a core the NUT does *not*
+    /// hold at `slot`, ready to distribute over CE 135.
+    ///
+    /// A different core on purpose. The node is already guaranteeing the
+    /// package the harness submitted on its own core, and a second report for
+    /// the same core would be a duplicate the node is right to drop -- which
+    /// would read as a failure to include. On a core it does not hold, every
+    /// signature is the reference's and the node's only job is to include it.
+    ///
+    /// `None` when the NUT holds every core, which cannot happen while there
+    /// is more than one.
+    pub fn report_to_distribute(
+        &self,
+        items: Vec<jam_node::hazmat::BuildItem>,
+        nut: u16,
+        slot: u32,
+    ) -> Result<Option<ScheduledReport>, ChainError> {
+        let Some(nut_core) = self.core_for(nut, slot) else {
+            return Ok(None);
+        };
+        let cores = jam_types::core_count();
+        if cores < 2 {
+            return Ok(None);
+        }
+        let core = (nut_core + 1) % cores;
+        let work = self.guarantee_work(items, core)?;
+        let distribution = jamnp_s::codec::ce131_136::GuaranteedWorkReport {
+            report: work.report.clone(),
+            slot: work.guarantee.slot,
+            signatures: work
+                .guarantee
+                .signatures
+                .iter()
+                .map(|signed| (signed.val_index, signed.signature.to_bytes()))
+                .collect(),
+        };
+        Ok(Some(ScheduledReport {
+            slot,
+            core,
+            report_hash: work.report.hash().0,
+            wire: jam_types::Encode::encode(&distribution),
+        }))
     }
 
     /// Build `items` into a package, refine it on `core`, and sign the

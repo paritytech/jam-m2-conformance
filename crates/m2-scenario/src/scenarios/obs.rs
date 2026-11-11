@@ -18,6 +18,7 @@
 //! | 52 | emulator submitted a work package over CE 133 |
 //! | 53 | NUT refused a CE 133 submission: it reset the stream |
 //! | 54 | emulator answered a CE 134 share with a hash and signature |
+//! | 55 | emulator distributed a guaranteed work-report over CE 135 |
 //!
 //! Code 44 is retired. It meant two unrelated things -- the NUT refusing a
 //! ticket, and the NUT sending a frame the harness could not decode -- and
@@ -81,3 +82,6 @@ pub const PACKAGE_REFUSED: u8 = 53;
 /// give -- no package of ours was in flight -- not that the node went
 /// unanswered through any fault of its own.
 pub const EMU_ANSWERED_134: u8 = 54;
+
+/// The emulator distributed a reference-guaranteed work-report over CE 135.
+pub const EMU_SENT_135: u8 = 55;

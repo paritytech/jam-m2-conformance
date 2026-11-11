@@ -19,7 +19,9 @@ use m2_scenario::ctx::{
     NutTicketFacts, TicketDelivery as CtxDelivery, TicketFault as CtxFault, SLOT_PERIOD_MS,
 };
 
-use m2_scenario::scenarios::n3::{N3Ctx, ReportSeen, SharingSeen, SubmittedPackage};
+use m2_scenario::scenarios::n3::{
+    DistributedReport, N3Ctx, ReportSeen, SharingSeen, SubmittedPackage,
+};
 
 use crate::scenario::RunCtx;
 
@@ -44,6 +46,8 @@ pub(crate) struct RealRunData {
     /// The CE 134 answer planned for this run; its report hash is what the
     /// node's own report is compared against.
     pub(crate) sharing_answer: Arc<Mutex<Option<m2_reference::reports::SharingAnswer>>>,
+    /// Reports the emulator distributed to the NUT, for the inclusion rows.
+    pub(crate) distributed: Arc<Mutex<Vec<DistributedReport>>>,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
@@ -183,6 +187,23 @@ pub(crate) fn build_real_run_ctx(
             .as_ref()
             .map(|answer| answer.report_hash),
         emulated_peers: data.emu_indices.iter().map(|i| *i as u16).collect(),
+        distributed: lock(&data.distributed).clone(),
+        // Report hashes the node put on chain, with the slot of the block
+        // that carried them. Read off the blocks it announced: a report it
+        // included is one it actually authored into a block, not one it
+        // merely acknowledged on the wire.
+        included: nut_blocks
+            .iter()
+            .flat_map(|nut| {
+                let slot = nut.block.header.slot;
+                nut.block
+                    .extrinsic
+                    .guarantees_prehashed()
+                    .into_iter()
+                    .map(move |(hash, _, _)| (hash.0, slot))
+            })
+            .collect(),
+        authored_slots: nut_blocks.iter().map(|n| n.block.header.slot).collect(),
     };
     RunCtx {
         n0,

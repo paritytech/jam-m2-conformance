@@ -89,6 +89,22 @@ pub struct SubmittedPackage {
     pub co_guarantors: Vec<u16>,
 }
 
+/// A reference-guaranteed work-report the harness distributed to the NUT,
+/// for grading whether it was then included on chain.
+#[derive(Debug, Clone)]
+pub struct DistributedReport {
+    /// The emulated validator that distributed it.
+    pub peer: u16,
+    /// Core it is guaranteed on: one the NUT does not hold, so every
+    /// signature on it is the reference's.
+    pub core: u16,
+    /// Hash of the report, which is what a block's guarantees are read by.
+    pub report_hash: [u8; 32],
+    /// Slot it went out in. A block before this one owed nothing.
+    pub sent_in_slot: u32,
+    pub sent_at_wall_ms: u64,
+}
+
 /// How long the node has to open CE 134 after a package reaches it.
 ///
 /// DESIGN §11 N3 gives "~3 s". The tilde is why the row that reads this is
@@ -126,6 +142,17 @@ pub struct N3Ctx {
     /// Only the emulated ones: the NUT does not distribute to itself, and a
     /// validator the harness is not playing cannot be observed either way.
     pub emulated_peers: Vec<u16>,
+    /// Reference-guaranteed reports the harness distributed to the NUT.
+    pub distributed: Vec<DistributedReport>,
+    /// Report hashes the NUT's own blocks carried in their guarantees, with
+    /// the slot of the block that carried each.
+    ///
+    /// Read out of the blocks the node announced, so a report the node
+    /// included is one it actually put on chain rather than one it merely
+    /// acknowledged.
+    pub included: Vec<([u8; 32], u32)>,
+    /// Slots the NUT authored a block in.
+    pub authored_slots: Vec<u32>,
 }
 
 /// Fewest signatures a guaranteed work-report may carry (`simple.md:464-467`):
@@ -354,9 +381,85 @@ pub fn n3_ce135_distribution(ctx: &N3Ctx) -> Check {
     })
 }
 
+/// N3 — CE 135 receive: a reference-guaranteed report the harness
+/// distributed is included in the NUT's next block (DESIGN §11 N3).
+///
+/// Gated twice. On a report having been distributed, and on the node having
+/// authored a block after it went out: a node that authored nothing has not
+/// failed to include anything, it has failed to author, which is N1's
+/// finding and not this lane's to report a second time.
+pub fn n3_ce135_inclusion(ctx: &N3Ctx) -> Check {
+    let ctx = ctx.clone();
+    check("n3_ce135_inclusion", Severity::Hard, move |_obs| {
+        let control = Control::new(
+            "n3_ce135_inclusion_not_exercised",
+            "a guaranteed work-report distributed to the NUT",
+            !ctx.distributed.is_empty(),
+        );
+        if !control.present() {
+            return vec![control.absent("n3_ce135_inclusion_not_exercised")];
+        }
+
+        let mut results = Vec::new();
+        for report in &ctx.distributed {
+            // Only blocks the node authored *after* the report went out could
+            // have carried it. Without this a run whose only block predates
+            // the distribution would fail the node for a report it had not
+            // yet been given.
+            if !ctx.authored_after(report.sent_in_slot) {
+                results.push(
+                    Control::new(
+                        "n3_ce135_inclusion_not_exercised",
+                        "a NUT block authored after the report was distributed",
+                        false,
+                    )
+                    .absent("n3_ce135_inclusion_not_exercised"),
+                );
+                continue;
+            }
+            results.push(log::check_detail(
+                "n3_ce135_report_included",
+                ctx.included
+                    .iter()
+                    .any(|(hash, slot)| *hash == report.report_hash && *slot > report.sent_in_slot),
+                Severity::Hard,
+                || {
+                    format!(
+                        "the report {} guaranteed on core {} and distributed in slot {} was \
+                         never included; the NUT's blocks carried {:?}",
+                        short(&report.report_hash),
+                        report.core,
+                        report.sent_in_slot,
+                        ctx.included
+                            .iter()
+                            .map(|(hash, _)| short(hash))
+                            .collect::<Vec<_>>()
+                    )
+                },
+            ));
+        }
+        results
+    })
+}
+
 /// Every N3 check, in the order the lane reports them.
 pub fn all(ctx: &N3Ctx) -> Vec<Check> {
-    vec![n3_ce133_submission(ctx), n3_ce135_distribution(ctx)]
+    vec![
+        n3_ce133_submission(ctx),
+        n3_ce135_distribution(ctx),
+        n3_ce135_inclusion(ctx),
+    ]
+}
+
+impl N3Ctx {
+    /// Whether the NUT authored any block after `slot`.
+    ///
+    /// Separate from the included hashes because a block with an empty
+    /// guarantees extrinsic contributes no hashes at all, and that is exactly
+    /// the block a failure to include looks like.
+    pub fn authored_after(&self, slot: u32) -> bool {
+        self.authored_slots.iter().any(|authored| *authored > slot)
+    }
 }
 
 /// First eight bytes of a hash, for finding details.
@@ -424,6 +527,9 @@ mod tests {
             answers_sharing: true,
             expected_report_hash: None,
             emulated_peers: CO.to_vec(),
+            distributed: Vec::new(),
+            included: Vec::new(),
+            authored_slots: Vec::new(),
         }
     }
 
@@ -574,6 +680,92 @@ mod tests {
             "n3_ce135_reaches_every_validator",
             Severity::Hard
         ));
+    }
+
+    fn distributed(hash: [u8; 32], slot: u32) -> DistributedReport {
+        DistributedReport {
+            peer: CO[0],
+            core: 1,
+            report_hash: hash,
+            sent_in_slot: slot,
+            sent_at_wall_ms: SENT_AT,
+        }
+    }
+
+    /// A context whose harness distributed one report in slot 100.
+    fn incl_ctx(included: Vec<([u8; 32], u32)>, authored: Vec<u32>) -> N3Ctx {
+        N3Ctx {
+            distributed: vec![distributed(REPORT, 100)],
+            included,
+            authored_slots: authored,
+            ..ctx(vec![submission(false)], Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_distributed_report_carried_in_a_later_block_passes() {
+        let results = run(&n3_ce135_inclusion(&incl_ctx(
+            vec![(REPORT, 101)],
+            vec![101],
+        )));
+        assert!(
+            results.iter().all(|r| r.outcome == Outcome::Pass),
+            "got {:?}",
+            results
+                .iter()
+                .filter(|r| r.outcome != Outcome::Pass)
+                .map(|r| r.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_report_the_node_never_included_fails() {
+        let results = run(&n3_ce135_inclusion(&incl_ctx(Vec::new(), vec![101, 102])));
+        assert!(failed(&results, "n3_ce135_report_included", Severity::Hard));
+    }
+
+    /// A block authored *before* the report went out could not have carried
+    /// it, so it does not count as the node's chance to include it.
+    #[test]
+    fn a_block_from_before_the_distribution_is_not_a_chance_to_include() {
+        let results = run(&n3_ce135_inclusion(&incl_ctx(Vec::new(), vec![99])));
+        assert_eq!(names(&results), vec!["n3_ce135_inclusion_not_exercised"]);
+        assert!(results.iter().all(|r| r.outcome != Outcome::Pass));
+    }
+
+    /// A node that authored nothing has not failed to include; it has failed
+    /// to author, which is N1's finding and not reported twice here.
+    #[test]
+    fn a_node_that_authored_nothing_is_not_graded_for_inclusion() {
+        let results = run(&n3_ce135_inclusion(&incl_ctx(Vec::new(), Vec::new())));
+        assert!(!failed(
+            &results,
+            "n3_ce135_report_included",
+            Severity::Hard
+        ));
+    }
+
+    /// Including the hash in a block that predates the distribution is not
+    /// inclusion of our report: it would have to be a different report with
+    /// the same hash, which is the node echoing something it was not given.
+    #[test]
+    fn inclusion_must_come_after_the_distribution() {
+        let results = run(&n3_ce135_inclusion(&incl_ctx(
+            vec![(REPORT, 99)],
+            vec![99, 101],
+        )));
+        assert!(failed(&results, "n3_ce135_report_included", Severity::Hard));
+    }
+
+    #[test]
+    fn a_run_that_distributed_nothing_proves_nothing() {
+        let ctx = N3Ctx {
+            distributed: Vec::new(),
+            ..incl_ctx(Vec::new(), vec![101])
+        };
+        let results = run(&n3_ce135_inclusion(&ctx));
+        assert_eq!(names(&results), vec!["n3_ce135_inclusion_not_exercised"]);
     }
 
     /// The happy path: accepted, shared with both, in time.
