@@ -321,7 +321,19 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         Err(e) => conn_findings.push(no_package_plan_finding(&e)),
                     }
                     phase("plan_package.report_to_distribute", t_dist);
-                    emu.set_submission_plan(plan, answer)
+                    emu.set_submission_plan(plan, answer);
+                    // CE 133 is builder -> guarantor, so it goes out over a
+                    // builder connection of its own rather than riding an
+                    // emulated validator's. polkajam hands out direct
+                    // submission slots by peer role, and a validator gets
+                    // none: the first real run was refused with `TooMany`,
+                    // the per-peer concurrency limit, having never been
+                    // offered a slot at all.
+                    let shared_for_builder = shared.clone();
+                    let san = nut_san.clone();
+                    dial_tasks.push(tokio::spawn(async move {
+                        submit_as_builder(nut_addr, san, genesis_hash, shared_for_builder).await;
+                    }));
                 }
                 // A run that cannot plan a submission still grades every
                 // other lane; N3 reports the rule as unexercised rather than
@@ -721,6 +733,16 @@ fn plan_package_for_this_run(
             ))
         })?;
     let item = trivial_work_item();
+    // The whole assignment at the submission slot, so a disagreement with the
+    // node over who holds a core is visible in the run rather than inferred
+    // from which peers it talked to.
+    for core in 0..jam_types::core_count() {
+        eprintln!(
+            "[assignment] slot {} core {core}: {:?}",
+            plan.slot,
+            ref_chain.guarantors_for(core, plan.slot)
+        );
+    }
     // One computation, not two. The package the harness submits and the
     // report its co-guarantors sign for have to be the same package, and
     // building it twice would re-read the chain head in between.
@@ -738,6 +760,63 @@ fn plan_package_for_this_run(
         },
         work.sharing_answer(),
     ))
+}
+
+/// Peer index the CE 133 builder is recorded under.
+///
+/// Outside the validator range on purpose: a builder is not a validator, and
+/// the lanes iterate the emulated validator indices. Attributing the
+/// submission to one of those would make it look like a validator had
+/// submitted, and an N0 row keyed on that peer could read the builder's
+/// traffic as its own.
+pub(crate) const BUILDER_PEER: u16 = 0xB0;
+
+/// Open a builder connection to the NUT and submit this run's work package.
+///
+/// A distinct identity from any emulated validator, as `probe_builder_slots`
+/// uses: the node is entitled to collapse repeated connections from one key,
+/// and the builder must not be mistaken for a validator it already has.
+///
+/// The connection is held for the whole submission. Dropping it after the
+/// write would reset the stream from our side, and the node's answer -- FIN
+/// or reset, which is the row -- would never arrive.
+async fn submit_as_builder(
+    addr: SocketAddr,
+    expected_san: String,
+    genesis_hash: [u8; 32],
+    shared: m2_emu::emu::EmuShared,
+) {
+    let Some(plan) = shared.take_submission_plan() else {
+        return;
+    };
+    let mut seed = [0u8; 32];
+    seed[0] = 0xB0;
+    seed[1] = 0xD1;
+    use jamnp_s::transport::Transport as _;
+    let connected = jamnp_s::transport::quic::QuicTransport
+        .connect(
+            jamnp_s::endpoint::EndpointConfig {
+                genesis_hash,
+                builder: true,
+            },
+            ed25519_consensus::SigningKey::from(seed),
+            expected_san,
+            addr,
+        )
+        .await;
+    let Ok(connection) = connected else {
+        return;
+    };
+    m2_emu::report_io::spawn_package_sender(
+        connection.clone(),
+        plan,
+        Arc::clone(&shared.trace),
+        Arc::clone(&shared.obs),
+        Arc::clone(&shared.submissions),
+        BUILDER_PEER,
+    )
+    .await;
+    drop(connection);
 }
 
 /// Stderr phase marker, so a run that stalls says which phase it stalled in.

@@ -66,7 +66,12 @@ pub struct ReportSeen {
 /// package was refused is a fact only the sender holds.
 #[derive(Debug, Clone)]
 pub struct SubmittedPackage {
-    /// The emulated validator that submitted, acting as a builder.
+    /// Peer index the submission was recorded under.
+    ///
+    /// A builder, not a validator: CE 133 is builder-to-guarantor, and the
+    /// node hands out submission slots by peer role. The index sits outside
+    /// the validator range so no lane reads the builder's traffic as a
+    /// validator's.
     pub peer: u16,
     /// Core the submission was addressed to.
     pub core: u16,
