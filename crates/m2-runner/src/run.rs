@@ -1048,6 +1048,62 @@ mod tests {
         Ok(())
     }
 
+    /// CE 133's extrinsic message is the bodies concatenated, and the only
+    /// thing that says where one ends is the package's own declared lengths.
+    ///
+    /// Against a real package, not a hand-made one: `extrinsic_lens` reads a
+    /// nested field of the engine's `WorkPackage`, and a hand-made package
+    /// would only prove that my own two sides agree.
+    #[test]
+    fn the_extrinsic_message_is_split_by_the_packages_declared_lengths(
+    ) -> Result<(), m2_reference::chain::ChainError> {
+        use jamnp_s::codec::ce131_136::{extrinsic_lens, WorkPackageSubmission};
+
+        let chain = anchored_chain(46000)?;
+        let bodies = vec![vec![1u8, 2, 3], vec![4u8, 5]];
+        let item = jam_node::hazmat::BuildItem::new(
+            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+            jam_types::WorkPayload(Vec::new()),
+            jam_types::max_refine_gas(),
+            jam_types::max_accumulate_gas(),
+            bodies.clone(),
+            Vec::new(),
+            0,
+        );
+        let built = chain.build_work_package(vec![item]);
+
+        assert_eq!(
+            built.extrinsics, bodies,
+            "the builder hands back the bodies it was given"
+        );
+        let lens = extrinsic_lens(&built.package);
+        assert_eq!(
+            lens,
+            vec![3u32, 2],
+            "the package declares each body's length, in wire order"
+        );
+        assert_eq!(
+            lens.iter().sum::<u32>(),
+            built.package.saturated_extrinsic_size(),
+            "and they sum to the size the message must have"
+        );
+
+        let submission =
+            WorkPackageSubmission::from_package(0, &built.package, built.extrinsics.clone());
+        let wire = submission.encode_extrinsics();
+        assert_eq!(
+            wire,
+            vec![1u8, 2, 3, 4, 5],
+            "the message is the bodies and nothing else"
+        );
+        assert_eq!(
+            WorkPackageSubmission::decode_extrinsics(&wire, &lens).unwrap(),
+            bodies,
+            "and the declared lengths cut it back apart"
+        );
+        Ok(())
+    }
+
     /// The builder-side package is submittable: it fits under the CE 133 cap,
     /// and the unauthorized variant differs from it *only* in the authorizer.
     ///

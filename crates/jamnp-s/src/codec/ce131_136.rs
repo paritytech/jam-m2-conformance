@@ -155,14 +155,45 @@ impl WorkPackageSubmission {
         Ok((core_index, work_package))
     }
 
-    /// Message 2: `[Extrinsic]` (`simple.md:373`).
+    /// Message 2: `[Extrinsic]`, the extrinsic bodies concatenated
+    /// (`simple.md:373`).
+    ///
+    /// No count and no per-item length. `simple.md:373` says the message size
+    /// should equal the sum of the extrinsic data lengths, which only holds
+    /// for a plain concatenation, and the bodies are cut back apart using the
+    /// lengths the work-package already declares in its `ExtrinsicSpec`s.
+    ///
+    /// A derived `Vec<Vec<u8>>` codec would write a compact count and a
+    /// compact length per body. Against a conforming node that is not a
+    /// slightly larger message, it is a corrupt one: the node reads exactly
+    /// the declared number of bytes, so it would take the count and the first
+    /// length as extrinsic content and the whole split would be off.
     pub fn encode_extrinsics(&self) -> Vec<u8> {
-        self.extrinsics.encode()
+        self.extrinsics.concat()
     }
 
-    /// Decode message 2 into the extrinsic sequence.
-    pub fn decode_extrinsics(input: &mut &[u8]) -> Result<Vec<Vec<u8>>, codec::Error> {
-        Vec::<Vec<u8>>::decode(input)
+    /// Cut message 2 back into bodies using the lengths the package declares.
+    ///
+    /// `lens` comes from the work-package's `ExtrinsicSpec`s -- see
+    /// [`extrinsic_lens`] -- because the message itself carries no structure
+    /// to recover them from.
+    ///
+    /// The size equality is enforced rather than assumed: a message that is
+    /// not exactly the sum of `lens` is the "extrinsic size mismatch" fault of
+    /// DESIGN §11 N3, and this is where it is detected.
+    pub fn decode_extrinsics(input: &[u8], lens: &[u32]) -> Result<Vec<Vec<u8>>, codec::Error> {
+        let total: u64 = lens.iter().map(|l| *l as u64).sum();
+        if total != input.len() as u64 {
+            return Err("extrinsic message size does not equal the declared lengths".into());
+        }
+        let mut out = Vec::with_capacity(lens.len());
+        let mut rest = input;
+        for len in lens {
+            let (body, tail) = rest.split_at(*len as usize);
+            out.push(body.to_vec());
+            rest = tail;
+        }
+        Ok(out)
     }
 
     /// Whether message 1 (`Core Index ++ Work-Package`) is within
@@ -170,6 +201,18 @@ impl WorkPackageSubmission {
     pub fn validate_initial_size(&self) -> bool {
         self.work_package.len() + 2 <= WORK_PACKAGE_INITIAL_MAX as usize
     }
+}
+
+/// The extrinsic body lengths a work-package declares, in wire order.
+///
+/// The CE 133 and CE 146 extrinsic messages carry no lengths of their own, so
+/// this is the only thing that says where one body ends and the next begins.
+pub fn extrinsic_lens(package: &jam_types::WorkPackage) -> Vec<u32> {
+    package
+        .items
+        .iter()
+        .flat_map(|item| item.extrinsics.iter().map(|xt| xt.len))
+        .collect()
 }
 
 /// CE 134: Work-package sharing (`simple.md:406-458`).
@@ -187,10 +230,41 @@ pub struct SharingContext {
 }
 
 /// CE 134 second message: `Work-Package Bundle` (`simple.md:454`).
-#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
+///
+/// The message *is* the bundle. `simple.md:447-454` gives message 2 as
+/// `Work-Package Bundle` with no length of its own, and the frame's `u32`
+/// already delimits it -- the same shape as CE 133's work-package, which also
+/// runs to the end of its message.
+///
+/// So `Encode`/`Decode` are written out rather than derived. A derived pair
+/// would put a compact length in front of `bundle`, which is a second length
+/// inside a frame that already has one: a conforming node would read the
+/// first bytes of the prefix as bundle content and the bundle would be
+/// mis-parsed by however many bytes the prefix took.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SharingBundle {
     /// The encoded work-package bundle.
     pub bundle: Vec<u8>,
+}
+
+impl Encode for SharingBundle {
+    fn encode_to<T: Output + ?Sized>(&self, dest: &mut T) {
+        dest.write(&self.bundle);
+    }
+}
+
+impl Decode for SharingBundle {
+    fn decode<I: Input>(input: &mut I) -> Result<Self, codec::Error> {
+        // The bundle runs to the end of the message, so decoding needs to know
+        // where that is. Every caller decodes from a frame payload, which is a
+        // slice and always answers.
+        let remaining = input
+            .remaining_len()?
+            .ok_or("a work-package bundle needs a bounded input to read to the end of")?;
+        let mut bundle = vec![0u8; remaining];
+        input.read(&mut bundle)?;
+        Ok(Self { bundle })
+    }
 }
 
 /// CE 134 reply: `Work-Report Hash ++ Ed25519 Signature` (`simple.md:456`).
@@ -414,11 +488,10 @@ mod tests {
             work_package: vec![],
             extrinsics: vec![vec![0xde, 0xad], vec![], vec![0x01, 0x02, 0x03]],
         };
-        // `--> [Extrinsic]` (simple.md:373): compact(3) ++ each compact(len) ++ bytes.
-        assert_eq!(
-            sub.encode_extrinsics(),
-            vec![0x03, 0x02, 0xde, 0xad, 0x00, 0x03, 0x01, 0x02, 0x03]
-        );
+        // `--> [Extrinsic]` (simple.md:373): the bodies, concatenated. The
+        // message size equals the sum of their lengths, so there is no room
+        // in it for a count or per-body lengths.
+        assert_eq!(sub.encode_extrinsics(), vec![0xde, 0xad, 0x01, 0x02, 0x03]);
     }
 
     #[test]
@@ -432,12 +505,48 @@ mod tests {
 
     #[test]
     fn ce133_decode_extrinsics() {
-        let mut input: &[u8] = &[0x03, 0x02, 0xde, 0xad, 0x00, 0x03, 0x01, 0x02, 0x03];
-        let extrinsics = WorkPackageSubmission::decode_extrinsics(&mut input).unwrap();
-        assert!(input.is_empty());
+        let input: &[u8] = &[0xde, 0xad, 0x01, 0x02, 0x03];
+        let lens = [2u32, 0, 3];
+        let extrinsics = WorkPackageSubmission::decode_extrinsics(input, &lens).unwrap();
         assert_eq!(
             extrinsics,
             vec![vec![0xde, 0xad], vec![], vec![0x01, 0x02, 0x03]]
+        );
+    }
+
+    /// The size equality is the "extrinsic size mismatch" fault, so it has to
+    /// be enforced rather than assumed -- in both directions.
+    #[test]
+    fn ce133_extrinsic_size_mismatch_is_rejected() {
+        let lens = [2u32, 3];
+        assert!(
+            WorkPackageSubmission::decode_extrinsics(&[0xde, 0xad, 0x01, 0x02], &lens).is_err(),
+            "a message shorter than the declared lengths"
+        );
+        assert!(
+            WorkPackageSubmission::decode_extrinsics(&[0u8; 6], &lens).is_err(),
+            "a message longer than the declared lengths"
+        );
+        assert!(
+            WorkPackageSubmission::decode_extrinsics(&[0u8; 5], &lens).is_ok(),
+            "and exactly the declared lengths is accepted"
+        );
+    }
+
+    /// Round-trip through the lengths a real package would declare.
+    #[test]
+    fn ce133_extrinsics_round_trip_through_their_lengths() {
+        let bodies = vec![vec![0xde, 0xad], vec![], vec![0x01, 0x02, 0x03]];
+        let sub = WorkPackageSubmission {
+            core_index: 0,
+            work_package: Vec::new(),
+            extrinsics: bodies.clone(),
+        };
+        let wire = sub.encode_extrinsics();
+        let lens: Vec<u32> = bodies.iter().map(|b| b.len() as u32).collect();
+        assert_eq!(
+            WorkPackageSubmission::decode_extrinsics(&wire, &lens).unwrap(),
+            bodies
         );
     }
 
@@ -465,9 +574,9 @@ mod tests {
         // Only one byte: not enough for the u16 core index.
         let mut input: &[u8] = &[0x02];
         assert!(WorkPackageSubmission::decode_initial(&mut input).is_err());
-        // Extrinsics message promises 2 items but carries none.
-        let mut input: &[u8] = &[0x08];
-        assert!(WorkPackageSubmission::decode_extrinsics(&mut input).is_err());
+        // The extrinsics message no longer promises anything about itself, so
+        // a truncated one is only detectable against the declared lengths --
+        // that is `ce133_extrinsic_size_mismatch_is_rejected`.
     }
 
     // --- CE 134: Work-package sharing ---------------------------------------
@@ -506,12 +615,39 @@ mod tests {
         assert_eq!(decoded, ctx);
     }
 
+    /// Message 2 is the bundle and nothing else: no length of its own, because
+    /// the frame already carries one (`simple.md:447-454`).
     #[test]
     fn ce134_sharing_bundle_vector() {
         let b = SharingBundle {
             bundle: vec![0xaa; 4],
         };
-        assert_eq!(b.encode(), vec![0x04, 0xaa, 0xaa, 0xaa, 0xaa]);
+        assert_eq!(b.encode(), vec![0xaa, 0xaa, 0xaa, 0xaa]);
+    }
+
+    #[test]
+    fn ce134_sharing_bundle_roundtrip_consumes_the_whole_message() {
+        let b = SharingBundle {
+            bundle: (0..300u16).map(|i| i as u8).collect(),
+        };
+        let bytes = b.encode();
+        assert_eq!(bytes.len(), 300, "no length prefix of its own");
+        let mut input: &[u8] = &bytes[..];
+        let decoded = SharingBundle::decode(&mut input).unwrap();
+        assert!(
+            input.is_empty(),
+            "the bundle runs to the end of the message"
+        );
+        assert_eq!(decoded, b);
+    }
+
+    /// An empty bundle is a zero-length message, not a one-byte one.
+    #[test]
+    fn ce134_empty_sharing_bundle_is_empty() {
+        let b = SharingBundle { bundle: Vec::new() };
+        assert!(b.encode().is_empty());
+        let mut input: &[u8] = &[];
+        assert_eq!(SharingBundle::decode(&mut input).unwrap(), b);
     }
 
     #[test]
