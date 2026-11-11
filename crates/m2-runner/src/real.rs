@@ -147,9 +147,15 @@ pub(crate) fn build_real_run_ctx(
     n0: m2_scenario::scenarios::n0::N0Ctx,
 ) -> RunCtx {
     let nut_blocks = lock(&data.nut_blocks);
+    let t = std::time::Instant::now();
     let contexts = ticket_contexts(data);
+    crate::run::phase("ctx.ticket_contexts", t);
+    let t = std::time::Instant::now();
     let nut_tickets = collect_nut_tickets(trace, &contexts);
+    crate::run::phase("ctx.collect_nut_tickets", t);
+    let t = std::time::Instant::now();
     let nut_finals = collect_nut_finals(trace);
+    crate::run::phase("ctx.collect_nut_finals", t);
     // Every ticket the node announced is one it legitimately held, whether it
     // ran the lottery for it or is forwarding it as proxy. Both lanes need
     // this to tell "the node invented a ticket" from "the node is a validator".
@@ -157,12 +163,15 @@ pub(crate) fn build_real_run_ctx(
         .iter()
         .map(|f| m2_reference::tickets::ticket_id(&f.ticket.proof))
         .collect();
+    let t = std::time::Instant::now();
     let n1 = build_n1_ctx(
         &data.ref_chain,
         &nut_blocks,
         &lock(&data.deliveries),
         own_ticket_ids.clone(),
     );
+    crate::run::phase("ctx.build_n1", t);
+    let t = std::time::Instant::now();
     let n2 = build_n2_ctx(
         &contexts,
         data,
@@ -171,18 +180,27 @@ pub(crate) fn build_real_run_ctx(
         &nut_blocks,
         own_ticket_ids,
     );
+    crate::run::phase("ctx.build_n2", t);
+    let t = std::time::Instant::now();
     // Always built, never gated on the lane: when N3 was not selected no
     // package was planned, so the records are empty and the lane is not
     // evaluated. When it was selected and nothing was submitted anyway, the
     // lane says the rule was not exercised, which is the truth and not a pass.
+    // Taken before the literal, not inside it. A guard created in a struct
+    // literal is a temporary that lives until the end of the whole `let`
+    // statement, so reading `data.submissions` twice in one literal takes a
+    // non-reentrant lock it is still holding -- which deadlocks, and did:
+    // every phase of a real run finished in milliseconds and this one never
+    // returned.
+    let submissions = lock(&data.submissions).clone();
     let n3 = N3Ctx {
         nut_index: data.nut_index as u16,
-        submissions: lock(&data.submissions).clone(),
-        shares: lock(&data.sharing_seen).clone(),
-        reports: lock(&data.reports_seen).clone(),
         // The harness answers CE 134 whenever it planned a submission, which
         // is exactly when it has a report hash and signatures to answer with.
-        answers_sharing: !lock(&data.submissions).is_empty(),
+        answers_sharing: !submissions.is_empty(),
+        submissions,
+        shares: lock(&data.sharing_seen).clone(),
+        reports: lock(&data.reports_seen).clone(),
         expected_report_hash: lock(&data.sharing_answer)
             .as_ref()
             .map(|answer| answer.report_hash),
@@ -205,6 +223,7 @@ pub(crate) fn build_real_run_ctx(
             .collect(),
         authored_slots: nut_blocks.iter().map(|n| n.block.header.slot).collect(),
     };
+    crate::run::phase("ctx.build_n3", t);
     RunCtx {
         n0,
         n1: Some(n1),

@@ -207,7 +207,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // between genesis and now has to be filled for the chain to be
         // current, and the entropy the tickets are later proved against is
         // read from its head.
+        let t = std::time::Instant::now();
         seed_past_slots(&ref_chain).map_err(internal)?;
+        phase("seed_past_slots", t);
         let epoch_contexts: EpochContexts = Arc::new(Mutex::new(Vec::new()));
         let emu = Emulator::n0(emu_indices.clone(), genesis_hash, cli.base_port)
             .await
@@ -271,8 +273,11 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // either, and a submission aimed at a slot it spends catching up in
         // would grade it for work it was never in a position to do.
         if cli.lanes.needs_package() && !cli.lanes.needs_tickets() {
+            let t = std::time::Instant::now();
             wait_until_the_node_can_accept_tickets(&shared, cli.observe_secs).await;
+            phase("readiness_gate", t);
         }
+        let t_tickets = std::time::Instant::now();
         let (ticket_ctx, ticket_plan, target_epoch) = if cli.lanes.needs_tickets() {
             wait_until_the_node_can_accept_tickets(&shared, cli.observe_secs).await;
             plan_tickets_for_this_run(&ref_chain, nut_index)
@@ -284,6 +289,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             // for the node to be able to accept tickets costs more still.
             (ref_chain.ticket_ctx().map_err(internal)?, Vec::new(), 0)
         };
+        phase("ticket_plan", t_tickets);
         // Counted from the chain rather than from the seeding: by now
         // `drive_slots` has added blocks of its own, and the N0 lane compares
         // this against the reference chain the contexts are built from, which
@@ -296,11 +302,13 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // whichever side opened it; the senders pick the plan up from here.
         emu.set_ticket_plans(plans_by_peer(&ticket_plan));
         if cli.lanes.needs_package() {
+            let t = std::time::Instant::now();
             match plan_package_for_this_run(&ref_chain, nut_index) {
                 Ok((plan, answer)) => {
                     // The report to be included rides the same slot plan: it
                     // is guaranteed on a core the NUT does not hold, so the
                     // two never collide.
+                    let t_dist = std::time::Instant::now();
                     match ref_chain.report_to_distribute(
                         vec![trivial_work_item()],
                         nut_index as u16,
@@ -312,6 +320,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         Ok(None) => {}
                         Err(e) => conn_findings.push(no_package_plan_finding(&e)),
                     }
+                    phase("plan_package.report_to_distribute", t_dist);
                     emu.set_submission_plan(plan, answer)
                 }
                 // A run that cannot plan a submission still grades every
@@ -319,6 +328,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                 // failing the node for the harness's inability to ask.
                 Err(e) => conn_findings.push(no_package_plan_finding(&e)),
             }
+            phase("plan_package", t);
         }
         let submissions = emu.submissions();
         let sharing_answer = emu.sharing_answer();
@@ -358,9 +368,11 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     };
 
     if !dial_tasks.is_empty() {
+        let t = std::time::Instant::now();
         jamnp_s::clock::current()
             .sleep(Duration::from_secs(cli.observe_secs))
             .await;
+        phase("observation_window", t);
     }
     // Abort rather than drop: dropping a `JoinHandle` detaches the task, so the
     // slot driver would keep authoring into the reference chain while the
@@ -370,6 +382,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     }
     drop(dial_tasks);
 
+    let t_ctx = std::time::Instant::now();
     let run_ctx = match &source {
         ObsSource::Emulator {
             trace,
@@ -411,11 +424,14 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         }
     };
 
+    phase("build_run_ctx", t_ctx);
+    let t_eval = std::time::Instant::now();
     let evaluation = match &source {
         ObsSource::Emulator { obs, .. } => evaluate(&lock(obs), &run_ctx, cli.lanes),
         ObsSource::Fabricated { log, .. } => evaluate(log, &run_ctx, cli.lanes),
     };
 
+    phase("evaluate", t_eval);
     // §4.6 teardown: kill the NUT (stdout/stderr already collected by `spawn`).
     if let Some(nut) = nut.take() {
         launch::kill(nut).await.map_err(internal)?;
@@ -708,7 +724,9 @@ fn plan_package_for_this_run(
     // One computation, not two. The package the harness submits and the
     // report its co-guarantors sign for have to be the same package, and
     // building it twice would re-read the chain head in between.
+    let t = std::time::Instant::now();
     let work = ref_chain.guarantee_work(vec![item], plan.core)?;
+    phase("plan_package.guarantee_work", t);
     Ok((
         m2_reference::reports::ScheduledSubmission {
             slot: plan.slot,
@@ -720,6 +738,16 @@ fn plan_package_for_this_run(
         },
         work.sharing_answer(),
     ))
+}
+
+/// Stderr phase marker, so a run that stalls says which phase it stalled in.
+///
+/// A conformance run is minutes of mostly-silent waiting, and when one hangs
+/// the node's own log is the only clock -- it shows the symptom (peers
+/// dropping, finality drifting) and never the phase. These lines are the
+/// harness's own clock.
+pub(crate) fn phase(label: &str, started: std::time::Instant) {
+    eprintln!("[phase] {label}: {:?}", started.elapsed());
 }
 
 /// The smallest work item that refines: no payload, no imports, no

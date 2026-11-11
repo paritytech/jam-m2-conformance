@@ -197,6 +197,7 @@ pub async fn spawn_package_sender(
             sent_at_wall_ms: wall_ts(),
             // Not known until the node answers, below.
             refused: false,
+            reset_code: None,
             co_guarantors: plan.co_guarantors.clone(),
         });
         recorded.len() - 1
@@ -207,8 +208,12 @@ pub async fn spawn_package_sender(
     // reasons also fails this read, and recording that as a refusal would
     // credit the node with a judgement it never made.
     let mut buf = [0u8; 1024];
-    if let Err(ReadError::Reset(_)) = recv.read(&mut buf).await {
-        crate::emu::lock(&submissions)[index].refused = true;
+    if let Err(ReadError::Reset(code)) = recv.read(&mut buf).await {
+        {
+            let mut recorded = crate::emu::lock(&submissions);
+            recorded[index].refused = true;
+            recorded[index].reset_code = Some(code);
+        }
         record(&obs, peer, ObsKind::Other(PACKAGE_REFUSED));
     }
 }

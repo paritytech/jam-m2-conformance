@@ -79,6 +79,14 @@ pub struct SubmittedPackage {
     pub sent_at_wall_ms: u64,
     /// The NUT reset the stream rather than FIN'ing it (`simple.md:374-375`).
     pub refused: bool,
+    /// The application error code the reset carried, when it did.
+    ///
+    /// A reset is the protocol's way of saying no, and the reason lives in
+    /// the code. Without it every refusal reads alike, and the difference
+    /// between a package the node calls invalid and one it simply will not
+    /// take right now is the difference between the node's defect and the
+    /// harness aiming badly.
+    pub reset_code: Option<u64>,
     /// The validators holding `core` at `slot` alongside the NUT: who the
     /// node is expected to open CE 134 to.
     ///
@@ -185,9 +193,14 @@ pub fn n3_ce133_submission(ctx: &N3Ctx) -> Check {
                 Severity::Hard,
                 || {
                     format!(
-                        "the NUT reset the CE 133 stream for the package {} on core {}",
+                        "the NUT reset the CE 133 stream for the package {} on core {} \
+                         with code {}",
                         short(&submitted.package_hash),
-                        submitted.core
+                        submitted.core,
+                        submitted
+                            .reset_code
+                            .map(|code| format!("{code:#x}"))
+                            .unwrap_or_else(|| "none".into())
                     )
                 },
             ));
@@ -499,6 +512,7 @@ mod tests {
             package_hash: PACKAGE,
             sent_at_wall_ms: SENT_AT,
             refused,
+            reset_code: refused.then_some(0x0103),
             co_guarantors: CO.to_vec(),
         }
     }
