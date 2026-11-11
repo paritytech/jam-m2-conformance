@@ -934,6 +934,9 @@ mod tests {
     /// `RefChain` forces because the compiler backend needs a userfaultfd
     /// sandbox. N3 schedules work packages into slots, so the figure decides
     /// whether that calendar is realistic.
+    /// The NUT's validator index in the anchored test chain.
+    const TEST_NUT_INDEX: u16 = 5;
+
     /// A reference chain anchored to the current epoch, seeded to the present.
     ///
     /// Everything about guaranteeing needs one: assignments come from the
@@ -948,7 +951,7 @@ mod tests {
         let anchor = m2_reference::chain::current_epoch_start_slot();
         let spec = spec::tiny_spec(&loopback_ips(), &ports, anchor)
             .map_err(|e| m2_reference::chain::ChainError::Chain(e.to_string()))?;
-        let chain = RefChain::with_spec(5, spec)?;
+        let chain = RefChain::with_spec(TEST_NUT_INDEX as usize, spec)?;
         seed_past_slots(&chain)?;
         Ok(chain)
     }
@@ -957,8 +960,8 @@ mod tests {
     /// assignment agree. A harness that read them apart would grade a node
     /// against a split the engine never made.
     #[test]
-    fn the_assignment_is_a_partition_and_both_directions_agree()
-    -> Result<(), m2_reference::chain::ChainError> {
+    fn the_assignment_is_a_partition_and_both_directions_agree(
+    ) -> Result<(), m2_reference::chain::ChainError> {
         let chain = anchored_chain(42000)?;
         let slot = chain.best_slot();
         let mut seen = Vec::new();
@@ -982,7 +985,9 @@ mod tests {
             "every validator holds exactly one core"
         );
         assert!(
-            chain.guarantors_for(jam_types::core_count(), slot).is_none(),
+            chain
+                .guarantors_for(jam_types::core_count(), slot)
+                .is_none(),
             "a core outside the active set has no holders"
         );
         Ok(())
@@ -1043,6 +1048,69 @@ mod tests {
         Ok(())
     }
 
+    /// The builder-side package is submittable: it fits under the CE 133 cap,
+    /// and the unauthorized variant differs from it *only* in the authorizer.
+    ///
+    /// That last part is the whole value of the fault. If the two packages
+    /// differed anywhere else, a node refusing the unauthorized one would
+    /// prove nothing about authorization -- it could be rejecting the
+    /// difference instead.
+    #[test]
+    fn the_unauthorized_package_differs_only_in_its_authorizer(
+    ) -> Result<(), m2_reference::chain::ChainError> {
+        use jamnp_s::codec::ce131_136::WorkPackageSubmission;
+
+        let chain = anchored_chain(45000)?;
+        let item = || {
+            jam_node::hazmat::BuildItem::new(
+                jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+                jam_types::WorkPayload(Vec::new()),
+                jam_types::max_refine_gas(),
+                jam_types::max_accumulate_gas(),
+                Vec::new(),
+                Vec::new(),
+                0,
+            )
+        };
+        let good = chain.build_work_package(vec![item()]);
+        let bad = chain.build_unauthorized_package(vec![item()]);
+
+        let submission = WorkPackageSubmission::from_package(0, &good.package, Vec::new());
+        assert!(
+            submission.validate_initial_size(),
+            "a one-item package must fit the CE 133 initial message"
+        );
+        assert_eq!(
+            good.extrinsics, bad.extrinsics,
+            "the two packages carry the same extrinsic bodies"
+        );
+
+        assert_ne!(
+            good.package.authorizer.code_hash, bad.package.authorizer.code_hash,
+            "the unauthorized package must name an authorizer the core does not have"
+        );
+        assert_eq!(
+            codec::Encode::encode(&good.package.items),
+            codec::Encode::encode(&bad.package.items),
+            "the work items must be identical, or the fault proves nothing"
+        );
+        assert_eq!(
+            codec::Encode::encode(&good.package.context),
+            codec::Encode::encode(&bad.package.context),
+            "the refine context must be identical too"
+        );
+
+        // CE 133 addresses a core, so the lane needs the NUT to hold one at
+        // the slot it submits in. Without this the submission has nowhere to
+        // go and the lane's first row is unreachable.
+        let slot = chain.best_slot();
+        assert!(
+            chain.core_for(TEST_NUT_INDEX, slot).is_some(),
+            "the NUT must guarantee some core at the slot a package is submitted in"
+        );
+        Ok(())
+    }
+
     /// A CE 133 submission carries the real package, and `package()` is the
     /// exact inverse of `from_package`.
     ///
@@ -1050,8 +1118,8 @@ mod tests {
     /// engine actually built: a hand-made one would agree with a codec that
     /// got the field order wrong, because both sides would be mine.
     #[test]
-    fn a_submission_round_trips_the_real_work_package()
-    -> Result<(), m2_reference::chain::ChainError> {
+    fn a_submission_round_trips_the_real_work_package(
+    ) -> Result<(), m2_reference::chain::ChainError> {
         use jamnp_s::codec::ce131_136::WorkPackageSubmission;
 
         let chain = anchored_chain(44000)?;

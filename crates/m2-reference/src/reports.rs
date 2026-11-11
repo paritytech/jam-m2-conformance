@@ -24,7 +24,52 @@ pub struct GuaranteedWork {
     pub guarantee: jam_std_common::ReportGuarantee,
 }
 
+/// A package as a builder would put it on CE 133, with the extrinsic bodies
+/// that go with it as message 2.
+///
+/// Separate from [`GuaranteedWork`] because CE 133 is the builder-to-guarantor
+/// hop, where the *node* does the refining. Refining here would be wasted
+/// work, and worse, it would assert that the reference holds the core --
+/// which on a CE 133 submission is exactly the validator the package is being
+/// sent to, not us.
+pub struct BuiltPackage {
+    pub package: jam_types::WorkPackage,
+    pub extrinsics: Vec<Vec<u8>>,
+}
+
 impl RefChain {
+    /// Build `items` into an authorized package for a builder to submit.
+    pub fn build_work_package(&self, items: Vec<jam_node::hazmat::BuildItem>) -> BuiltPackage {
+        let (package, extrinsics) = self.harness().build_package(items);
+        BuiltPackage {
+            package,
+            extrinsics,
+        }
+    }
+
+    /// The same package, against an authorizer no core will accept.
+    ///
+    /// `Authorizer::any()`'s code hash is zero, so nothing on the core
+    /// authorizes it. This is the "unauthorized package -> no sharing" fault
+    /// of DESIGN §11 N3: the package is otherwise well-formed, so a node that
+    /// shares it has skipped the authorization check rather than failed to
+    /// parse anything.
+    pub fn build_unauthorized_package(
+        &self,
+        items: Vec<jam_node::hazmat::BuildItem>,
+    ) -> BuiltPackage {
+        let (package, extrinsics) = self.harness().build_package_with_auth(
+            items,
+            jam_types::Authorizer::any(),
+            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+            jam_types::Authorization::new(),
+        );
+        BuiltPackage {
+            package,
+            extrinsics,
+        }
+    }
+
     /// Build `items` into a package, refine it on `core`, and sign the
     /// guarantee.
     ///
@@ -89,4 +134,3 @@ impl RefChain {
             .val_to_core(index)
     }
 }
-

@@ -116,7 +116,11 @@ impl WorkPackageSubmission {
         package: &jam_types::WorkPackage,
         extrinsics: Vec<Vec<u8>>,
     ) -> Self {
-        Self { core_index, work_package: package.encode(), extrinsics }
+        Self {
+            core_index,
+            work_package: package.encode(),
+            extrinsics,
+        }
     }
 
     /// Decodes [`work_package`](Self::work_package) as a GP work-package.
