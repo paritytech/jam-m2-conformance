@@ -68,6 +68,33 @@ pub struct ScheduledSubmission {
     pub co_guarantors: Vec<u16>,
 }
 
+/// The epoch info `slot` belongs to, out of the two the chain holds.
+///
+/// `EpochInfo::core_assignments` requires the slot to be in that epoch, and
+/// the chain only ever holds the current one and the next. Asking the current
+/// epoch about a slot in the next gives an assignment for neither: a run
+/// whose reference head sat in epoch 815091 while the submission slot had
+/// crossed into 815092 graded the node against exactly that, and the sharing
+/// row failed for a split the node never made.
+///
+/// `None` for anything outside those two, which is the honest answer rather
+/// than a shuffle computed from the wrong entropy.
+fn epoch_info_for<'a, E>(
+    slot: u32,
+    current_index: u32,
+    current: &'a E,
+    next: &'a E,
+) -> Option<&'a E> {
+    let slot_epoch = slot / jam_types::epoch_period();
+    if slot_epoch == current_index {
+        Some(current)
+    } else if slot_epoch == current_index + 1 {
+        Some(next)
+    } else {
+        None
+    }
+}
+
 /// A guaranteed work-report the harness distributes over CE 135, so the node
 /// can be graded on including it.
 #[derive(Debug, Clone)]
@@ -377,8 +404,8 @@ impl RefChain {
     pub fn guarantors_for_in_epoch(&self, core: CoreIndex, slot: u32) -> Option<Vec<u16>> {
         let harness = self.harness();
         let jam = harness.chain();
-        let (_index, epoch, _next) = jam.current_and_next_epochs();
-        epoch
+        let (index, current, next) = jam.current_and_next_epochs();
+        epoch_info_for(slot, index, &current, &next)?
             .core_assignments(slot)
             .core_to_vals(core)
             .map(|vals| vals.to_vec())
@@ -390,11 +417,13 @@ impl RefChain {
     /// The view that decides whether the node considers itself a guarantor
     /// of the core a package is addressed to, so it is the one a submission
     /// is aimed with.
-    pub fn core_for_in_epoch(&self, index: u16, slot: u32) -> Option<CoreIndex> {
+    pub fn core_for_in_epoch(&self, validator: u16, slot: u32) -> Option<CoreIndex> {
         let harness = self.harness();
         let jam = harness.chain();
-        let (_index, epoch, _next) = jam.current_and_next_epochs();
-        epoch.core_assignments(slot).val_to_core(index)
+        let (index, current, next) = jam.current_and_next_epochs();
+        epoch_info_for(slot, index, &current, &next)?
+            .core_assignments(slot)
+            .val_to_core(validator)
     }
 
     /// The core validator `index` guarantees at `slot`.
