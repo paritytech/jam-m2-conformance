@@ -495,6 +495,7 @@ pub(crate) fn fabricated_run_ctx(
     // same as a lane nobody asked for.
     let submitted_at = slot_start(fab_block_slot);
     let fab_co_guarantors = vec![n0::PEER_1, n0::PEER_1 + 1];
+    const FAB_REPORT_HASH: [u8; 32] = [0x77; 32];
     let n3 = N3Ctx {
         nut_index: FAB_NUT_INDEX,
         submissions: vec![m2_scenario::scenarios::n3::SubmittedPackage {
@@ -520,8 +521,22 @@ pub(crate) fn fabricated_run_ctx(
                 at_wall_ms: submitted_at + 200 * (i as u64 + 1),
             })
             .collect(),
-        reports: Vec::new(),
-        answers_sharing: false,
+        // A guaranteed report distributed to both emulated validators, with
+        // two signatures from holders of the core, matching the reference.
+        reports: fab_co_guarantors
+            .iter()
+            .map(|peer| m2_scenario::scenarios::n3::ReportSeen {
+                peer: *peer,
+                report_hash: FAB_REPORT_HASH,
+                slot: fab_block_slot,
+                signatures: vec![(FAB_NUT_INDEX, [0u8; 64]), (n0::PEER_1, [0u8; 64])],
+                encoded_report: vec![0xaa; 32],
+                at_wall_ms: submitted_at + 2_000,
+            })
+            .collect(),
+        answers_sharing: true,
+        expected_report_hash: Some(FAB_REPORT_HASH),
+        emulated_peers: fab_co_guarantors.clone(),
     };
 
     Ok(RunCtx {

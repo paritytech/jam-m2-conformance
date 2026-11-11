@@ -115,7 +115,22 @@ pub struct N3Ctx {
     /// guarantee, so the rows that depend on one say so instead of failing
     /// the node for the harness's omission.
     pub answers_sharing: bool,
+    /// Hash of the report the reference refined from the submitted package.
+    ///
+    /// What the node's own report is compared against. `None` when no package
+    /// was submitted, in which case there is nothing to compare and the row
+    /// is not reported.
+    pub expected_report_hash: Option<[u8; 32]>,
+    /// The emulated validators a distribution should reach.
+    ///
+    /// Only the emulated ones: the NUT does not distribute to itself, and a
+    /// validator the harness is not playing cannot be observed either way.
+    pub emulated_peers: Vec<u16>,
 }
+
+/// Fewest signatures a guaranteed work-report may carry (`simple.md:464-467`):
+/// the guarantor's own and at least one co-guarantor's.
+pub const MIN_GUARANTEE_SIGNATURES: usize = 2;
 
 /// N3 — CE 133: a submitted package is accepted and shared with both
 /// co-guarantors (`simple.md:351-376`, DESIGN §11 N3).
@@ -229,9 +244,119 @@ pub fn n3_ce133_submission(ctx: &N3Ctx) -> Check {
     })
 }
 
+/// N3 — CE 135: the guaranteed work-report the node distributes
+/// (`simple.md:460-485`, DESIGN §11 N3).
+///
+/// Gated on a distribution having been seen. A node that never distributed
+/// anything fails the CE 133 rows, which is where that finding belongs; it
+/// must not also collect passes here for a message it never sent.
+pub fn n3_ce135_distribution(ctx: &N3Ctx) -> Check {
+    let ctx = ctx.clone();
+    check("n3_ce135_distribution", Severity::Hard, move |_obs| {
+        let control = Control::new(
+            "n3_ce135_not_exercised",
+            "a guaranteed work-report the NUT distributed",
+            !ctx.reports.is_empty(),
+        );
+        if !control.present() {
+            return vec![control.absent("n3_ce135_not_exercised")];
+        }
+
+        // Who may sign: the validators holding the core, which is the NUT
+        // and the co-guarantors the harness was told to expect. Read off the
+        // submission rather than recomputed, for the reason on `N3Ctx`.
+        let mut may_sign: HashSet<u16> = ctx
+            .submissions
+            .iter()
+            .flat_map(|s| s.co_guarantors.iter().copied())
+            .collect();
+        may_sign.insert(ctx.nut_index);
+
+        let mut results = Vec::new();
+        for report in &ctx.reports {
+            let signers: Vec<u16> = report.signatures.iter().map(|(index, _)| *index).collect();
+
+            results.push(log::check_detail(
+                "n3_ce135_has_enough_signatures",
+                signers.len() >= MIN_GUARANTEE_SIGNATURES
+                    && signers.len() <= jam_types::VALS_PER_CORE,
+                Severity::Hard,
+                || {
+                    format!(
+                        "the report carries {} signatures; a guarantee needs between {} and {}",
+                        signers.len(),
+                        MIN_GUARANTEE_SIGNATURES,
+                        jam_types::VALS_PER_CORE
+                    )
+                },
+            ));
+
+            // Strictly ascending, which is both the stated order and the
+            // absence of a validator signing twice.
+            results.push(log::check_detail(
+                "n3_ce135_signatures_sorted",
+                signers.windows(2).all(|pair| pair[0] < pair[1]),
+                Severity::Hard,
+                || format!("signer indices {signers:?} are not strictly ascending"),
+            ));
+
+            // Only where the harness knows who holds the core. With no
+            // submission there is no assignment to judge against, and a row
+            // that passes an empty set would be true whatever the node did.
+            if !may_sign.is_empty() && !ctx.submissions.is_empty() {
+                let strangers: Vec<u16> = signers
+                    .iter()
+                    .copied()
+                    .filter(|index| !may_sign.contains(index))
+                    .collect();
+                results.push(log::check_detail(
+                    "n3_ce135_signers_hold_the_core",
+                    strangers.is_empty(),
+                    Severity::Hard,
+                    || format!("validators {strangers:?} signed for a core they do not hold"),
+                ));
+            }
+
+            if let Some(expected) = ctx.expected_report_hash {
+                results.push(log::check_detail(
+                    "n3_ce135_report_matches_the_reference",
+                    report.report_hash == expected,
+                    Severity::Hard,
+                    || {
+                        format!(
+                            "the NUT distributed report {}, the reference refined {} from the \
+                             same package",
+                            short(&report.report_hash),
+                            short(&expected)
+                        )
+                    },
+                ));
+            }
+        }
+
+        // Distribution reaches every validator the harness is playing
+        // (`simple.md:469-471`). One row, not one per report: a node that
+        // sent two reports to one peer and none to another has one defect.
+        let reached: HashSet<u16> = ctx.reports.iter().map(|r| r.peer).collect();
+        for peer in &ctx.emulated_peers {
+            results.push(log::check_detail(
+                "n3_ce135_reaches_every_validator",
+                reached.contains(peer),
+                Severity::Hard,
+                || {
+                    format!(
+                        "validator {peer} was never sent the guaranteed report; {reached:?} were"
+                    )
+                },
+            ));
+        }
+        results
+    })
+}
+
 /// Every N3 check, in the order the lane reports them.
 pub fn all(ctx: &N3Ctx) -> Vec<Check> {
-    vec![n3_ce133_submission(ctx)]
+    vec![n3_ce133_submission(ctx), n3_ce135_distribution(ctx)]
 }
 
 /// First eight bytes of a hash, for finding details.
@@ -296,8 +421,159 @@ mod tests {
             submissions,
             shares,
             reports: Vec::new(),
-            answers_sharing: false,
+            answers_sharing: true,
+            expected_report_hash: None,
+            emulated_peers: CO.to_vec(),
         }
+    }
+
+    const REPORT: [u8; 32] = [0x77; 32];
+
+    fn distribution(peer: u16, signers: Vec<u16>, report_hash: [u8; 32]) -> ReportSeen {
+        ReportSeen {
+            peer,
+            report_hash,
+            slot: 100,
+            signatures: signers.into_iter().map(|i| (i, [0u8; 64])).collect(),
+            encoded_report: vec![0xaa; 16],
+            at_wall_ms: SENT_AT + 2_000,
+        }
+    }
+
+    /// A context whose node distributed `reports`, against one submission.
+    fn dist_ctx(reports: Vec<ReportSeen>) -> N3Ctx {
+        N3Ctx {
+            reports,
+            expected_report_hash: Some(REPORT),
+            ..ctx(vec![submission(false)], Vec::new())
+        }
+    }
+
+    /// Two signatures from holders of the core, sorted, matching the
+    /// reference, to both emulated validators.
+    #[test]
+    fn a_well_formed_distribution_passes() {
+        let results = run(&n3_ce135_distribution(&dist_ctx(vec![
+            distribution(CO[0], vec![CO[0], NUT], REPORT),
+            distribution(CO[1], vec![CO[0], NUT], REPORT),
+        ])));
+        assert!(
+            results.iter().all(|r| r.outcome == Outcome::Pass),
+            "expected all passes, got {:?}",
+            results
+                .iter()
+                .filter(|r| r.outcome != Outcome::Pass)
+                .map(|r| r.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_distribution_proves_nothing() {
+        let results = run(&n3_ce135_distribution(&dist_ctx(Vec::new())));
+        assert_eq!(names(&results), vec!["n3_ce135_not_exercised"]);
+        assert!(results.iter().all(|r| r.outcome != Outcome::Pass));
+    }
+
+    /// One signature is not a guarantee: it is the guarantor attesting alone.
+    #[test]
+    fn a_single_signature_fails() {
+        let results = run(&n3_ce135_distribution(&dist_ctx(vec![
+            distribution(CO[0], vec![NUT], REPORT),
+            distribution(CO[1], vec![NUT], REPORT),
+        ])));
+        assert!(failed(
+            &results,
+            "n3_ce135_has_enough_signatures",
+            Severity::Hard
+        ));
+    }
+
+    /// Descending order, and the duplicate that the same test catches.
+    #[test]
+    fn unsorted_or_repeated_signers_fail() {
+        let results = run(&n3_ce135_distribution(&dist_ctx(vec![distribution(
+            CO[0],
+            vec![NUT, CO[0]],
+            REPORT,
+        )])));
+        assert!(failed(
+            &results,
+            "n3_ce135_signatures_sorted",
+            Severity::Hard
+        ));
+
+        let repeated = run(&n3_ce135_distribution(&dist_ctx(vec![distribution(
+            CO[0],
+            vec![CO[0], CO[0]],
+            REPORT,
+        )])));
+        assert!(
+            failed(&repeated, "n3_ce135_signatures_sorted", Severity::Hard),
+            "a validator signing twice is not ascending either"
+        );
+    }
+
+    #[test]
+    fn a_signer_that_does_not_hold_the_core_fails() {
+        let stranger = 9u16;
+        let results = run(&n3_ce135_distribution(&dist_ctx(vec![distribution(
+            CO[0],
+            vec![CO[0], stranger],
+            REPORT,
+        )])));
+        assert!(failed(
+            &results,
+            "n3_ce135_signers_hold_the_core",
+            Severity::Hard
+        ));
+    }
+
+    /// The node refined something other than what the reference did.
+    #[test]
+    fn a_report_that_differs_from_the_reference_fails() {
+        let results = run(&n3_ce135_distribution(&dist_ctx(vec![distribution(
+            CO[0],
+            vec![CO[0], NUT],
+            [0x33; 32],
+        )])));
+        assert!(failed(
+            &results,
+            "n3_ce135_report_matches_the_reference",
+            Severity::Hard
+        ));
+    }
+
+    /// With no reference report there is nothing to compare, and the row is
+    /// absent rather than passing on a comparison never made.
+    #[test]
+    fn no_reference_report_means_no_comparison_row() {
+        let ctx = N3Ctx {
+            expected_report_hash: None,
+            ..dist_ctx(vec![distribution(CO[0], vec![CO[0], NUT], REPORT)])
+        };
+        let results = run(&n3_ce135_distribution(&ctx));
+        assert!(
+            !names(&results).contains(&"n3_ce135_report_matches_the_reference"),
+            "got {:?}",
+            names(&results)
+        );
+    }
+
+    /// Distribution must reach every validator, not just the one that
+    /// answered the share.
+    #[test]
+    fn a_distribution_to_only_one_validator_fails() {
+        let results = run(&n3_ce135_distribution(&dist_ctx(vec![distribution(
+            CO[0],
+            vec![CO[0], NUT],
+            REPORT,
+        )])));
+        assert!(failed(
+            &results,
+            "n3_ce135_reaches_every_validator",
+            Severity::Hard
+        ));
     }
 
     /// The happy path: accepted, shared with both, in time.

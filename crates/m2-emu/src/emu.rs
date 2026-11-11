@@ -332,6 +332,12 @@ impl Emulator {
         Arc::clone(&self.submissions)
     }
 
+    /// The CE 134 answer planned for this run, if any. The lane reads the
+    /// report hash out of it to compare the node's own against.
+    pub fn sharing_answer(&self) -> Arc<Mutex<Option<SharingAnswer>>> {
+        Arc::clone(&self.sharing_answer)
+    }
+
     /// The tickets the emulator put on the wire, with their send times.
     pub fn deliveries(&self) -> Arc<Mutex<Vec<DeliveredTicket>>> {
         Arc::clone(&self.deliveries)

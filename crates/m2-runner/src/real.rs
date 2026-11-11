@@ -41,6 +41,9 @@ pub(crate) struct RealRunData {
     pub(crate) sharing_seen: Arc<Mutex<Vec<SharingSeen>>>,
     /// CE 135 distributions the node sent.
     pub(crate) reports_seen: Arc<Mutex<Vec<ReportSeen>>>,
+    /// The CE 134 answer planned for this run; its report hash is what the
+    /// node's own report is compared against.
+    pub(crate) sharing_answer: Arc<Mutex<Option<m2_reference::reports::SharingAnswer>>>,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
@@ -176,6 +179,10 @@ pub(crate) fn build_real_run_ctx(
         // The harness answers CE 134 whenever it planned a submission, which
         // is exactly when it has a report hash and signatures to answer with.
         answers_sharing: !lock(&data.submissions).is_empty(),
+        expected_report_hash: lock(&data.sharing_answer)
+            .as_ref()
+            .map(|answer| answer.report_hash),
+        emulated_peers: data.emu_indices.iter().map(|i| *i as u16).collect(),
     };
     RunCtx {
         n0,

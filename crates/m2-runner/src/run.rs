@@ -305,6 +305,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             }
         }
         let submissions = emu.submissions();
+        let sharing_answer = emu.sharing_answer();
         let sharing_seen = emu.sharing_seen();
         let reports_seen = emu.reports_seen();
         let ce128_probes = emu.ce128_probes();
@@ -322,6 +323,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             submissions,
             sharing_seen,
             reports_seen,
+            sharing_answer,
         };
         (
             ObsSource::Emulator {
