@@ -65,43 +65,56 @@ The diagnostics that produced this are `RefChain::epoch_views` and
 
 ---
 
-## 2. A distributed report is never included
+## 2. A distributed report is never included — CLOSED 2026-11-12
 
-**Status:** open, not investigated. Opened 2026-11-11.
+**Status:** closed. Every cause was the harness's; the node was right each
+time, and said so in its own words once asked at debug level.
 
-With everything else in N3 passing, `n3_ce135_report_included` fails in every
-run: the harness distributes a fully reference-guaranteed work-report over CE
-135, on a core the NUT does not hold, and the node's blocks carry no
-guarantees at all.
+Hypothesis 1, that a report needs its bundle available first, is **wrong**.
+`receive_guarantee` calls `distribution.prefetch_shard(&guarantee)` with the
+comment "optimistically start downloading our availability shard before the
+report is seen on chain", and then notes the guarantee into the table.
+Availability is fetched after inclusion, never required before it.
 
-Before treating this as a node defect, a follow-up should rule out the
-obvious harness-side explanations:
+What was actually wrong was four things, each hidden behind the one in front
+of it. Running the node with
+`RUST_LOG=jam_node::chain::guarantors=debug` is what made them visible: the
+discard paths in `receive_guarantee` return `Ok(())`, so a rejected report
+looks like a clean stream on the wire and says nothing at INFO.
 
-1. A report may only be includable once its bundle is available, which is
-   N4's erasure-coding path and something this harness does not do at all.
-   If so the row is not reachable until availability exists, and it should
-   say so rather than fail. **Untested, and the most likely of the three.**
-2. The guarantee is composed over the storage view of the assignment
-   (finding 1), so its signers may not be the cohort the node expects for
-   that core, in which case the node is right to drop it. **Untested.**
-3. ~~The guarantee's slot must fall within the including block's rotation or
-   the one before.~~ **Tried and refuted, 2026-11-12.** The rule is real
-   (`exec/reports.rs`, `FutureReportSlot` / `ReportRotationBeforeLast`) and
-   the harness does compose a guarantee an epoch before it distributes it,
-   so the reasoning looked sound. Composing both the package and the report
-   at send time instead made things strictly worse: the node began refusing
-   the *submission* with `Unwanted` (`0x52e4a40fa8db`), and two runs
-   exercised nothing at all.
+1. **`Invalid guarantee: Wrong core assignment`.** The guarantee was composed
+   by `try_compose_guarantee`, which signs over the storage view of the
+   assignment, while the node checks the signers against its own. The same
+   split as finding 1, and the same fix as the CE 134 answer: sign per
+   validator over the epoch view's cohort.
+2. **`Invalid guarantee: No signature from peer …`.** A node validates a
+   received guarantee against the peer that sent it, so the sender has to be
+   one of the signers. The distribution went out on whichever connection
+   claimed the plan. It now goes out on the connection to a validator that
+   signed.
+3. **`Wrong core assignment` again.** The guarantee declared the slot it was
+   composed in while being signed by the cohort of the slot it was aimed at.
+   A node derives the expected signers from the declared slot, so both halves
+   being individually right is not enough -- they have to name one slot.
+4. **The submission refused with `Unwanted`.** The submitted package and the
+   distributed report were built from the same empty work item, so they were
+   the same package. While the guarantee was still being rejected this was
+   invisible; once it was accepted the node noted the report and refused the
+   CE 133 submission of that package as already reported. `Unwanted` covers a
+   duplicate as well as a bad anchor, which is why it read like an anchor
+   problem. The distributed report now carries a distinguishing payload.
 
-   The inversion is the useful part. A package built roughly eleven slots
-   ahead is accepted; one built against the chain head at the moment of
-   sending is refused. `Unwanted` covers an anchor that is unknown as well as
-   one that is too old, so the likely reading is that the fresh anchor names
-   a reference block the node has not imported yet -- the anchor was too
-   *new*, not too old. A fix along these lines would have to build far enough
-   ahead for the node to have the anchor and recently enough to stay inside
-   recent history, and that window was not established.
+With those four fixed, a run reached all 30 rows and exit 0 -- the first time
+the inclusion row has ever passed.
 
-   The attempt is stashed as `n3-send-time-build: refuted, anchor too new
-   (Unwanted)` rather than thrown away, since the restructuring is reusable
-   if the anchor window is ever pinned down.
+**It is not yet reproducible.** The very next run scored 14, the node having
+opened CE 134 to one co-guarantor instead of two. That is finding 1's
+signature, not this one's: the submission had landed on the *first slot* of
+the new epoch, one slot after the head, and the node's cached epoch view
+rotates on finalization, which trails. At the boundary itself it is still
+shuffling by the old epoch's entropy however much the two views agree on
+paper. The lane now aims a few slots into the epoch rather than at its edge,
+which should widen the margin but does not remove the underlying split.
+
+So finding 2's chain is closed and finding 1 is what remains between this
+lane and a deterministic pass.

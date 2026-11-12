@@ -103,6 +103,13 @@ pub struct ScheduledReport {
     pub slot: u32,
     /// Core the report is guaranteed on.
     pub core: u16,
+    /// The emulated validator that must put this on the wire.
+    ///
+    /// A node validates a received guarantee against the peer that sent it
+    /// and refuses one carrying `No signature from peer` -- in those words.
+    /// So the sender has to be one of the signers, which is a property of
+    /// the cohort and not of whichever connection happened to claim the plan.
+    pub sender: u16,
     /// Hash of the report, which is what a block's guarantees are read by.
     pub report_hash: [u8; 32],
     /// The encoded `Guaranteed Work-Report` (`simple.md:478`).
@@ -312,19 +319,33 @@ impl RefChain {
         }
         let core = (nut_core + 1) % cores;
         let work = self.guarantee_work(items, core)?;
+        // Signed by the cohort the *epoch* view names, not the one
+        // `try_compose_guarantee` used. That composes over the storage view,
+        // and a node checks a received guarantee's signers against its own
+        // assignment: with the two views apart it answered every distributed
+        // report with `Invalid guarantee: Wrong core assignment`, in those
+        // words. The same split, and the same fix, as the CE 134 answer.
+        let mut cohort = self.guarantors_for_in_epoch(core, slot).unwrap_or_default();
+        // Strictly ascending, which is what a guarantee's signatures must be.
+        cohort.sort_unstable();
+        cohort.dedup();
+        let signed = work.sharing_answer_for(&cohort);
         let distribution = jamnp_s::codec::ce131_136::GuaranteedWorkReport {
             report: work.report.clone(),
-            slot: work.guarantee.slot,
-            signatures: work
-                .guarantee
-                .signatures
-                .iter()
-                .map(|signed| (signed.val_index, signed.signature.to_bytes()))
-                .collect(),
+            // The slot the cohort was signed for, not the one the guarantee
+            // was composed in. A node derives the expected signers from the
+            // slot the guarantee declares, so a guarantee signed by the
+            // cohort of one slot and stamped with another is rejected as a
+            // wrong core assignment however right both halves are.
+            slot,
+            signatures: signed.signatures,
         };
         Ok(Some(ScheduledReport {
             slot,
             core,
+            sender: *cohort.first().ok_or_else(|| {
+                ChainError::Chain(format!("core {core} has no holders at slot {slot}"))
+            })?,
             report_hash: work.report.hash().0,
             wire: jam_types::Encode::encode(&distribution),
         }))

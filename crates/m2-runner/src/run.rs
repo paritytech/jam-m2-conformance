@@ -321,7 +321,10 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     // two never collide.
                     let t_dist = std::time::Instant::now();
                     match ref_chain.report_to_distribute(
-                        vec![trivial_work_item()],
+                        // A different payload from the submission's, or the
+                        // two are the same package and the node refuses the
+                        // second as a duplicate.
+                        vec![work_item_with_payload(b"n3-distributed".to_vec())],
                         nut_index as u16,
                         plan.slot,
                     ) {
@@ -758,8 +761,15 @@ fn plan_package_for_this_run(
     // so the lane grades an assignment both sides agree on instead of
     // picking a side. Which of the two is authoritative for a same-epoch
     // slot is a separate question, recorded in findings.md.
+    //
+    // A few slots *into* that epoch, not its first slot. The node's cached
+    // epoch view rotates on finalization, which trails the head, so at the
+    // boundary itself it is still shuffling by the old epoch's entropy and
+    // shares with the old cohort -- a run that aimed at the first slot of an
+    // epoch saw the node open CE 134 to one co-guarantor instead of two even
+    // though both views agreed on paper.
     let epoch = jam_types::epoch_period();
-    let from = (ref_chain.next_slot() / epoch + 1) * epoch;
+    let from = (ref_chain.next_slot() / epoch + 1) * epoch + EPOCH_SETTLE_SLOTS;
     let plan = ref_chain
         .submission_slot_for(nut_index as u16, from, SUBMISSION_MARGIN_SLOTS)
         .ok_or_else(|| {
@@ -927,9 +937,22 @@ pub(crate) fn phase(label: &str, started: std::time::Instant) {
 /// extrinsics. The lane grades the protocol around a package, not the work
 /// inside it, and a trivial item keeps the refinement off the slot budget.
 fn trivial_work_item() -> jam_node::hazmat::BuildItem {
+    work_item_with_payload(Vec::new())
+}
+
+/// The same item with a distinguishing payload, so two packages built in one
+/// run are two packages.
+///
+/// The submission and the distributed report were both built from the empty
+/// item, which makes them byte-identical and so the same package hash. While
+/// the distributed guarantee was being rejected that went unnoticed; once it
+/// was accepted the node noted the report and then refused the CE 133
+/// submission of the same package as already reported -- `Unwanted`, which
+/// covers a duplicate as well as a bad anchor.
+fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
     jam_node::hazmat::BuildItem::new(
         jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-        jam_types::WorkPayload(Vec::new()),
+        jam_types::WorkPayload(payload),
         jam_types::max_refine_gas(),
         jam_types::max_accumulate_gas(),
         Vec::new(),
@@ -937,6 +960,10 @@ fn trivial_work_item() -> jam_node::hazmat::BuildItem {
         0,
     )
 }
+
+/// Slots to let an epoch settle before submitting into it, so the node's
+/// cached epoch view has rotated.
+const EPOCH_SETTLE_SLOTS: u32 = 3;
 
 /// Seconds the node needs after a submission to share, be answered, build a
 /// guarantee and distribute it. Measured at a few seconds in practice; this

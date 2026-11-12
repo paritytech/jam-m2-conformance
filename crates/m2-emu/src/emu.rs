@@ -216,6 +216,21 @@ impl EmuShared {
         lock(&self.report_plan).take()
     }
 
+    /// Take this run's CE 135 distribution, but only on the connection to the
+    /// validator that must send it.
+    ///
+    /// Checked before taking, not after: a peer that took a plan it may not
+    /// send would have to put it back, and another connection could claim it
+    /// in between.
+    pub fn claim_report_plan(&self, peer: u16) -> Option<ScheduledReport> {
+        let mut plan = lock(&self.report_plan);
+        if plan.as_ref().is_some_and(|p| p.sender == peer) {
+            plan.take()
+        } else {
+            None
+        }
+    }
+
     /// Take this run's CE 133 submission, leaving nothing behind.
     ///
     /// `None` once taken, so a second connection does not submit the same
@@ -688,7 +703,7 @@ fn start_report_distribution(connection: &Conn, peer: u16, shared: &EmuShared) {
                 return;
             }
         }
-        let Some(plan) = shared.take_report_plan() else {
+        let Some(plan) = shared.claim_report_plan(peer) else {
             return;
         };
         crate::report_io::spawn_report_sender(
