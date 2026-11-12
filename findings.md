@@ -113,8 +113,22 @@ signature, not this one's: the submission had landed on the *first slot* of
 the new epoch, one slot after the head, and the node's cached epoch view
 rotates on finalization, which trails. At the boundary itself it is still
 shuffling by the old epoch's entropy however much the two views agree on
-paper. The lane now aims a few slots into the epoch rather than at its edge,
-which should widen the margin but does not remove the underlying split.
+paper. Aiming a few slots into the epoch rather than at its edge was tried as a
+widening of that margin. **Measured over five consecutive runs, it is a
+regression:** every one scored zero passes, in two distinct ways.
+
+- Two runs produced no plan at all -- "no slot at or after N leaves 2 slots
+  of its rotation". Aiming `epoch + 3` puts the target beyond what the cached
+  epoch view can answer for: it holds only the current epoch and the next,
+  and when finality lags the cached index trails the head, so the slot lands
+  two epochs out and resolves to nothing.
+- Three runs had the submission refused with `Unwanted`. The aim was about
+  fourteen slots past the head and the package is built at plan time, so its
+  anchor had aged out of recent history.
+
+That second result does put a bound on the anchor window this file has twice
+said was unestablished: about eleven slots ahead is accepted, about fourteen
+is not. The settle is back to zero.
 
 So finding 2's chain is closed and finding 1 is what remains between this
 lane and a deterministic pass.

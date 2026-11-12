@@ -961,9 +961,14 @@ fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
     )
 }
 
-/// Slots to let an epoch settle before submitting into it, so the node's
-/// cached epoch view has rotated.
-const EPOCH_SETTLE_SLOTS: u32 = 3;
+/// Slots to let an epoch settle before submitting into it.
+///
+/// Zero, measured. Three was tried and made the lane strictly worse: five
+/// consecutive runs scored no passes at all. Aiming that far out puts the
+/// slot beyond the cached epoch view, which knows only the current epoch and
+/// the next, and the submitted package's anchor ages out of recent history
+/// over the longer wait. See findings.md 2.
+const EPOCH_SETTLE_SLOTS: u32 = 0;
 
 /// Seconds the node needs after a submission to share, be answered, build a
 /// guarantee and distribute it. Measured at a few seconds in practice; this
