@@ -156,43 +156,55 @@ lane and a deterministic pass.
 
 ---
 
-## 3. N3 passes about two runs in three, for reasons not yet isolated
+## 3. The inclusion row fails when the submission waits a long time
 
-**Status:** open, narrowed. Opened 2026-11-12.
+**Status:** open, cause located, fix not found. Opened 2026-11-12.
 
-The lane reaches 30 of 30 against a real node, but not every run. Two
-distinct failure modes remain, and neither is the log level.
+The lane reaches 30 of 30 against a real node, but not every run, and the
+outcome is now predictable from one number: the chain's phase within the
+epoch when the run plans.
 
-**The logging hypothesis is refuted.** It came from two batches over one tree
-that differed only in `RUST_LOG` and scored 4/4 against 1/4. An interleaved
-A/B -- four pairs, logged and unlogged runs alternating so machine state and
-epoch drift hit both arms equally -- gives:
+Ten consecutive runs, one row each, on the committed tree:
 
-| pair | logged | unlogged |
-|------|--------|----------|
-| 1 | inclusion FAIL | inclusion FAIL |
-| 2 | not exercised | 30 of 30 |
-| 3 | 30 of 30 | 30 of 30 |
-| 4 | 30 of 30 | 30 of 30 |
+| epoch phase at plan | slots waited | outcome |
+|---------------------|--------------|---------|
+| 5, 3, 3, 2, 1 | 7 to 11 | inclusion row FAILS, all five |
+| 10, 9, 8, 7 | 2 to 5 | clean 30 of 30, all four |
 
-Five of eight clean, with the failures split across both arms. The earlier
-split was variance, which matters beyond this entry: it is why a one-line
-fix was nearly discarded on a bad batch and a regression was once committed
-on a good one.
+The separation is total. The lane aims at the next epoch, so a run planning
+early in an epoch waits most of one before submitting, and a run planning
+late waits a few slots. **Long waits fail, short waits pass.**
 
-**What the data does point at.** Pair 1 failed in *both* arms. Failures
-cluster by pair -- by when the run happened -- which suggests the chain's
-position within the epoch at launch drives both modes, the same variable
-behind findings 1 and 2.
+The likely mechanism is staleness: the distributed report is composed when
+the run is planned, and a guarantee carries its compose-time slot while a
+block accepts one only from its own rotation or the one before.
 
-The two modes, told apart by whether a CE 135 left the harness:
+**Two fixes were tried and both are refuted.**
 
-- `ce135_sent=1` and the row fails: the report went out and the node, having
-  authored a block afterwards, did not carry it.
-- `ce135_sent=0`: no plan was made at all and the lane reports itself
-  unexercised.
+| where the report is composed | phases 1-5 | phases 7-11 |
+|------------------------------|-----------|-------------|
+| plan time (what is committed) | fail | **pass** |
+| send time, no lead | -- | fail |
+| send time, two slots early | fail | fail |
 
-**To close it:** correlate run outcome against the epoch phase at launch over
-enough runs to see the shape, rather than against anything in the harness.
-If the failures fall in a particular part of the epoch, that is the answer
-and it is the same root as finding 1.
+Composing at send time is strictly worse. Against the very head the
+guarantee names a slot the reference has reached and the node has not, so it
+is premature rather than stale; a two-slot lead, which is what makes the
+*package* work, does not rescue it either. Both attempts are stashed as
+`n3-report-send-time-compose`.
+
+So the mechanism above is a guess that survives the correlation and not the
+fixes. Something else about a long wait breaks inclusion.
+
+**To close it:** take one failing run at a low phase and read the node's
+debug log around the block it authors after the distribution -- whether it
+received the guarantee, noted it, and what `select_viable_guarantees` did
+with it. That is a single instrumented run, not another batch, and it would
+replace the guess with the node's own account.
+
+**A caution this entry has earned twice.** Six runs cannot tell a fix from
+variance here. A one-line fix was nearly discarded on a bad batch and a
+regression was committed on a good one, and the logging hypothesis that
+once occupied this entry was itself refuted by a controlled A/B. Prefer
+correlation over batch scores: the phase table above was worth more than
+twenty runs of pass counts.
