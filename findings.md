@@ -156,36 +156,43 @@ lane and a deterministic pass.
 
 ---
 
-## 3. The inclusion row is timing-sensitive in a way that is not understood
+## 3. N3 passes about two runs in three, for reasons not yet isolated
 
-**Status:** open. Opened 2026-11-12.
+**Status:** open, narrowed. Opened 2026-11-12.
 
-The CE 135 inclusion row has now been the last failing row across several
-rounds, each time for a different and genuine reason, each fixed. What
-remains is that its outcome is not stable across batches of runs.
+The lane reaches 30 of 30 against a real node, but not every run. Two
+distinct failure modes remain, and neither is the log level.
 
-Concretely, with one identical working tree:
+**The logging hypothesis is refuted.** It came from two batches over one tree
+that differed only in `RUST_LOG` and scored 4/4 against 1/4. An interleaved
+A/B -- four pairs, logged and unlogged runs alternating so machine state and
+epoch drift hit both arms equally -- gives:
 
-- Four runs with the node at default log level: three failed the inclusion
-  row, one exercised nothing.
-- Four runs with `RUST_LOG=jam_node::chain::guarantors=debug`: all four
-  scored 30 of 30, each having put a CE 135 on the wire with no receive
-  failure logged.
+| pair | logged | unlogged |
+|------|--------|----------|
+| 1 | inclusion FAIL | inclusion FAIL |
+| 2 | not exercised | 30 of 30 |
+| 3 | 30 of 30 | 30 of 30 |
+| 4 | 30 of 30 | 30 of 30 |
 
-Debug logging slows the node slightly, so the difference is most likely
-timing rather than anything the logging reveals. That is a guess, not a
-finding. It matters because it means a clean batch does not prove a fix and
-a dirty one does not disprove it, which has already cost one wrong call in
-both directions.
+Five of eight clean, with the failures split across both arms. The earlier
+split was variance, which matters beyond this entry: it is why a one-line
+fix was nearly discarded on a bad batch and a regression was once committed
+on a good one.
 
-Worth establishing before trusting any future N3 result:
+**What the data does point at.** Pair 1 failed in *both* arms. Failures
+cluster by pair -- by when the run happened -- which suggests the chain's
+position within the epoch at launch drives both modes, the same variable
+behind findings 1 and 2.
 
-1. Whether the swing reproduces -- the same tree, several batches, logging
-   on and off, enough runs to tell 50% from 100%.
-2. What the node is actually doing in the window between receiving a
-   guarantee and authoring the block that should carry it. The row only
-   fires when a block was authored after the distribution, so the node had
-   an opportunity and did not take it.
-3. Whether the observation window is simply too tight for the whole
-   submit -> share -> distribute -> include chain, in which case the row
-   should say so rather than fail.
+The two modes, told apart by whether a CE 135 left the harness:
+
+- `ce135_sent=1` and the row fails: the report went out and the node, having
+  authored a block afterwards, did not carry it.
+- `ce135_sent=0`: no plan was made at all and the lane reports itself
+  unexercised.
+
+**To close it:** correlate run outcome against the epoch phase at launch over
+enough runs to see the shape, rather than against anything in the harness.
+If the failures fall in a particular part of the epoch, that is the answer
+and it is the same root as finding 1.
