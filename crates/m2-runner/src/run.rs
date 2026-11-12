@@ -303,6 +303,16 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         emu.set_ticket_plans(plans_by_peer(&ticket_plan));
         if cli.lanes.needs_package() {
             let t = std::time::Instant::now();
+            // The lane aims one epoch ahead, and the epoch view can only
+            // answer for the cached epoch and the one after it. While the
+            // cache trails the head by more than an epoch the target
+            // resolves to nothing and the run exercises nothing at all --
+            // which is what a third of runs did.
+            //
+            // The cache advances on finalization, so this waits for it to
+            // catch up rather than planning against a view that cannot see
+            // where the submission is going.
+            wait_for_the_epoch_view_to_catch_up(&ref_chain, cli.observe_secs).await;
             // Aiming into the next epoch can mean waiting most of one, so a
             // window that closes first leaves the lane unexercised with
             // nothing to say why.
@@ -840,6 +850,35 @@ fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
         Vec::new(),
         0,
     )
+}
+
+/// Wait until the chain's cached epoch view names the epoch its own head is
+/// in.
+///
+/// `EpochInfo` is refreshed when a block is finalized, so it trails the head
+/// by however far finality is behind. The lane plans one epoch ahead of the
+/// head and the view resolves only the cached epoch and the next, so a cache
+/// two or more epochs behind cannot answer for the slot the submission is
+/// aimed at and no plan is made.
+///
+/// Bounded, and silent on expiry: a cache that never catches up leaves the
+/// plan to fail on its own and report the rule unexercised, which is the
+/// truth. Budgeted in protocol time against the same clock the slots come
+/// from, so a virtual clock does not wait forever.
+async fn wait_for_the_epoch_view_to_catch_up(ref_chain: &RefChain, budget_secs: u64) {
+    let clock = jamnp_s::clock::current();
+    let deadline = clock
+        .mono_ms()
+        .saturating_add((budget_secs / 2).saturating_mul(1000));
+    while clock.mono_ms() < deadline {
+        let (cached, state) = ref_chain.epoch_views();
+        if cached >= state {
+            return;
+        }
+        clock
+            .sleep(Duration::from_millis(NODE_READINESS_POLL_MS))
+            .await;
+    }
 }
 
 /// Stderr phase marker, so a run that stalls says which phase it stalled in.

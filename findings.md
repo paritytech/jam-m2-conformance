@@ -43,8 +43,19 @@ block. An earlier hypothesis that the cache lags finalization was tested and
 refuted.
 
 **Current workaround.** `plan_package_for_this_run` aims the submission into
-the next epoch, where both sides provably read the same entropy. This makes
-the lane deterministic without choosing a side.
+the next epoch, where both sides provably read the same entropy, and waits
+for the chain's cached epoch view to reach its own head epoch before
+planning. The second half matters because the view resolves only the cached
+epoch and the next, so a cache more than one epoch behind cannot answer for
+a slot an epoch ahead and no plan is made at all.
+
+Measured over four consecutive runs after that wait was added: **every run
+exercised the lane**, where before roughly one in three had planned nothing.
+Three scored 30 of 30; the fourth failed only the inclusion row, with both
+views agreeing, which is a separate residual and not this one.
+
+This is a workaround, not a resolution. It removes the lane's dependence on
+a lagging cache without settling which view is authoritative.
 
 **To close it, a follow-up session should establish:**
 

@@ -331,18 +331,23 @@ impl RefChain {
                 // [2, 3, 5] while the epoch said [0, 4, 5], and the node
                 // shared with 4. Aiming a submission by the storage view
                 // grades the node against an assignment it is not using.
-                return self
-                    .core_for_in_epoch(nut, slot)
-                    .map(|core| SubmissionPlan {
-                        slot,
-                        core,
-                        co_guarantors: self
-                            .guarantors_for_in_epoch(core, slot)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter(|v| *v != nut)
-                            .collect(),
-                    });
+                // `continue`, not an early return: a slot the epoch view
+                // cannot answer for is not a reason to give up on the later
+                // ones. Returning here made one unanswerable slot look like
+                // a rotation with no usable slot in it at all.
+                let Some(core) = self.core_for_in_epoch(nut, slot) else {
+                    continue;
+                };
+                return Some(SubmissionPlan {
+                    slot,
+                    core,
+                    co_guarantors: self
+                        .guarantors_for_in_epoch(core, slot)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|v| *v != nut)
+                        .collect(),
+                });
             }
         }
         None
