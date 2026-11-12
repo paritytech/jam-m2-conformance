@@ -193,14 +193,35 @@ is premature rather than stale; a two-slot lead, which is what makes the
 *package* work, does not rescue it either. Both attempts are stashed as
 `n3-report-send-time-compose`.
 
-So the mechanism above is a guess that survives the correlation and not the
-fixes. Something else about a long wait breaks inclusion.
+**The node names it.** One instrumented run at phase 3:
 
-**To close it:** take one failing run at a low phase and read the node's
-debug log around the block it authors after the distribution -- whether it
-received the guarantee, noted it, and what `select_viable_guarantees` did
-with it. That is a single instrumented run, not another batch, and it would
-replace the guess with the node's own account.
+```
+Discarded guarantee: Invalid guarantee: anchor is not recent
+```
+
+So the stale thing is the report's *refine-context anchor*, not the
+guarantee's compose-time slot. The report is built when the run is planned
+and distributed seven to eleven slots later, by which time its anchor has
+aged out of the node's recent history. That is why both fixes above missed:
+each moved the slot the guarantee declares and neither moved the anchor the
+report was built against.
+
+It also explains their shape. Composing at send time does refresh the anchor,
+which is why it was the right instinct -- but it simultaneously pushes the
+guarantee's slot to a slot the reference has reached and the node has not,
+trading `anchor is not recent` for a premature guarantee. The two constraints
+pull in opposite directions and the fix has to satisfy both at once, which
+nothing tried so far does.
+
+Note that the discard path returns `Ok(())` and logs at debug, so a run that
+hits this looks like a clean stream on the wire and says nothing at INFO.
+Reading it required `RUST_LOG=jam_node::chain::guarantors=debug`.
+
+**To close it:** compose the distributed report so that its anchor is recent
+*and* its guarantee slot is one the node has reached. The reference leads the
+node by a block or so, so the likely shape is to build the report against a
+head the node already holds rather than against the reference's own next
+slot -- which is the distinction neither stashed attempt drew.
 
 **A caution this entry has earned twice.** Six runs cannot tell a fix from
 variance here. A one-line fix was nearly discarded on a bad batch and a
