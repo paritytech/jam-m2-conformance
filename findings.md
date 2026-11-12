@@ -153,3 +153,39 @@ finding 1 setting the ceiling on how often this lane can run at all.
 
 So finding 2's chain is closed and finding 1 is what remains between this
 lane and a deterministic pass.
+
+---
+
+## 3. The inclusion row is timing-sensitive in a way that is not understood
+
+**Status:** open. Opened 2026-11-12.
+
+The CE 135 inclusion row has now been the last failing row across several
+rounds, each time for a different and genuine reason, each fixed. What
+remains is that its outcome is not stable across batches of runs.
+
+Concretely, with one identical working tree:
+
+- Four runs with the node at default log level: three failed the inclusion
+  row, one exercised nothing.
+- Four runs with `RUST_LOG=jam_node::chain::guarantors=debug`: all four
+  scored 30 of 30, each having put a CE 135 on the wire with no receive
+  failure logged.
+
+Debug logging slows the node slightly, so the difference is most likely
+timing rather than anything the logging reveals. That is a guess, not a
+finding. It matters because it means a clean batch does not prove a fix and
+a dirty one does not disprove it, which has already cost one wrong call in
+both directions.
+
+Worth establishing before trusting any future N3 result:
+
+1. Whether the swing reproduces -- the same tree, several batches, logging
+   on and off, enough runs to tell 50% from 100%.
+2. What the node is actually doing in the window between receiving a
+   guarantee and authoring the block that should carry it. The row only
+   fires when a block was authored after the distribution, so the node had
+   an opportunity and did not take it.
+3. Whether the observation window is simply too tight for the whole
+   submit -> share -> distribute -> include chain, in which case the row
+   should say so rather than fail.

@@ -607,6 +607,13 @@ pub async fn dial_nut(
     // Deliver the peer's N2 tickets on their own streams, concurrently with
     // the handler — unless the accept side already took the plan.
     start_ticket_delivery(&connection, peer, &shared);
+    // And the N3 report, for the same reason the tickets are here: a plan is
+    // claimed on the first connection to its peer, whichever side opened it.
+    // This was missing, so a run whose designated sender was a peer the
+    // emulator dialled had no distributor at all and sent nothing -- the
+    // node never saw a CE 135 and the inclusion row failed with no trace of
+    // why, in half the runs.
+    start_report_distribution(&connection, peer, &shared);
     start_sync_probe(&connection, peer, &shared);
 
     // Serve the NUT's CE 128 / CE 129 requests on the dialed connection.
