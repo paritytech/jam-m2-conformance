@@ -18,7 +18,7 @@ use jamnp_s::{
     trace::{wall_ts, Direction as TraceDir, Trace},
     transport::{Conn, ReadError, SendHalf},
 };
-use m2_reference::reports::{ScheduledReport, ScheduledSubmission, SharingAnswer};
+use m2_reference::reports::{ScheduledSubmission, SharingAnswer};
 use m2_scenario::dsl::{ObsKind, ObsLog};
 use m2_scenario::scenarios::n3::{DistributedReport, ReportSeen, SharingSeen, SubmittedPackage};
 use m2_scenario::scenarios::obs::{
@@ -224,15 +224,50 @@ pub async fn spawn_package_sender(
 /// One message, then FIN. Unlike CE 133 there is no judgement to read back:
 /// the spec's answer is a bare FIN, and whether the node accepted the report
 /// shows up in its next block, not on this stream.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_report_sender(
     connection: Conn,
-    plan: ScheduledReport,
+    slot: u32,
+    nut: u16,
+    ref_chain: Arc<m2_reference::chain::RefChain>,
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
     distributed: Arc<Mutex<Vec<DistributedReport>>>,
     peer: u16,
 ) {
-    sleep_until_slot(plan.slot).await;
+    // Composed a short lead before its distribution, and told the slot it
+    // will be distributed in rather than the one it is composed in.
+    //
+    // Two constraints that pull opposite ways, both in the node's own words.
+    // Composed when the run is planned, the report's refine-context anchor
+    // has aged out by the time it goes out seven to eleven slots later:
+    // `Invalid guarantee: anchor is not recent`. Composed against the very
+    // head, the guarantee names a slot the reference has reached and the
+    // node has not. A short lead keeps the anchor fresh; passing the
+    // distribution slot keeps the cohort and the declared slot on the right
+    // side of the epoch boundary the lane aims at, which a lead alone does
+    // not -- two slots before a phase-0 target is the *previous* epoch, with
+    // a different cohort entirely.
+    sleep_until_slot(slot.saturating_sub(REPORT_COMPOSE_LEAD_SLOTS)).await;
+    let plan = match ref_chain.report_to_distribute(
+        // A payload of its own: built moments after the submission from the
+        // same template, an identical one would be the same package and the
+        // node would refuse whichever arrived second.
+        vec![m2_reference::reports::work_item_with_payload(
+            b"n3-distributed".to_vec(),
+        )],
+        nut,
+        slot,
+    ) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("[distributor] could not compose the report: {e}");
+            return;
+        }
+    };
+
+    sleep_until_slot(slot).await;
 
     let Ok((mut send, _recv)) = connection.open_bi().await else {
         return;
@@ -252,6 +287,9 @@ pub async fn spawn_report_sender(
     });
     send.finish();
 }
+
+/// Slots before its distribution at which the report is composed.
+const REPORT_COMPOSE_LEAD_SLOTS: u32 = 2;
 
 /// Wait until `slot` begins.
 async fn sleep_until_slot(slot: u32) {

@@ -98,9 +98,20 @@ fn epoch_info_for<'a, E>(
 /// The smallest work item that refines: no payload, no imports, no
 /// extrinsics.
 pub fn trivial_work_item() -> jam_node::hazmat::BuildItem {
+    work_item_with_payload(Vec::new())
+}
+
+/// The same item with a distinguishing payload, so two packages built in one
+/// run are two packages.
+///
+/// The submission and the distributed report are built moments apart from
+/// the same template. Given the same payload they are byte-identical, and a
+/// node that has noted one refuses the other as already reported -- which
+/// reads as the submission being rejected, not as a duplicate.
+pub fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
     jam_node::hazmat::BuildItem::new(
         jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-        jam_types::WorkPayload(Vec::new()),
+        jam_types::WorkPayload(payload),
         jam_types::max_refine_gas(),
         jam_types::max_accumulate_gas(),
         Vec::new(),
@@ -134,6 +145,9 @@ pub struct ScheduledReport {
     pub slot: u32,
     /// Core the report is guaranteed on.
     pub core: u16,
+    /// The node under test, carried so the sender can recompose near the
+    /// slot without re-deriving which core to avoid.
+    pub nut: u16,
     /// The emulated validator that must put this on the wire.
     ///
     /// A node validates a received guarantee against the peer that sent it
@@ -403,6 +417,7 @@ impl RefChain {
         Ok(Some(ScheduledReport {
             slot,
             core,
+            nut,
             sender: *cohort.first().ok_or_else(|| {
                 ChainError::Chain(format!("core {core} has no holders at slot {slot}"))
             })?,

@@ -156,76 +156,52 @@ lane and a deterministic pass.
 
 ---
 
-## 3. The inclusion row fails when the submission waits a long time
+## 3. The inclusion row fails when the submission waits a long time — CLOSED 2026-11-12
 
-**Status:** open, cause located, fix not found. Opened 2026-11-12.
+**Status:** closed. The node named the cause and the fix follows from it.
 
-The lane reaches 30 of 30 against a real node, but not every run, and the
-outcome is now predictable from one number: the chain's phase within the
-epoch when the run plans.
-
-Ten consecutive runs, one row each, on the committed tree:
+The outcome used to be predictable from the chain's phase within the epoch at
+plan time. Ten consecutive runs separated totally:
 
 | epoch phase at plan | slots waited | outcome |
 |---------------------|--------------|---------|
 | 5, 3, 3, 2, 1 | 7 to 11 | inclusion row FAILS, all five |
 | 10, 9, 8, 7 | 2 to 5 | clean 30 of 30, all four |
 
-The separation is total. The lane aims at the next epoch, so a run planning
-early in an epoch waits most of one before submitting, and a run planning
-late waits a few slots. **Long waits fail, short waits pass.**
+The lane aims at the next epoch, so planning early in an epoch means waiting
+most of one. Long waits failed.
 
-The likely mechanism is staleness: the distributed report is composed when
-the run is planned, and a guarantee carries its compose-time slot while a
-block accepts one only from its own rotation or the one before.
-
-**Two fixes were tried and both are refuted.**
-
-| where the report is composed | phases 1-5 | phases 7-11 |
-|------------------------------|-----------|-------------|
-| plan time (what is committed) | fail | **pass** |
-| send time, no lead | -- | fail |
-| send time, two slots early | fail | fail |
-
-Composing at send time is strictly worse. Against the very head the
-guarantee names a slot the reference has reached and the node has not, so it
-is premature rather than stale; a two-slot lead, which is what makes the
-*package* work, does not rescue it either. Both attempts are stashed as
-`n3-report-send-time-compose`.
-
-**The node names it.** One instrumented run at phase 3:
+**The node's words, from one instrumented run at phase 3:**
 
 ```
 Discarded guarantee: Invalid guarantee: anchor is not recent
 ```
 
-So the stale thing is the report's *refine-context anchor*, not the
-guarantee's compose-time slot. The report is built when the run is planned
-and distributed seven to eleven slots later, by which time its anchor has
-aged out of the node's recent history. That is why both fixes above missed:
-each moved the slot the guarantee declares and neither moved the anchor the
-report was built against.
+The stale thing is the report's *refine-context anchor*, not the guarantee's
+slot. The report was composed when the run was planned and distributed seven
+to eleven slots later, by which time its anchor had aged out of the node's
+recent history.
 
-It also explains their shape. Composing at send time does refresh the anchor,
-which is why it was the right instinct -- but it simultaneously pushes the
-guarantee's slot to a slot the reference has reached and the node has not,
-trading `anchor is not recent` for a premature guarantee. The two constraints
-pull in opposite directions and the fix has to satisfy both at once, which
-nothing tried so far does.
+**The fix is two constraints held at once**, which is why three earlier
+attempts failed:
 
-Note that the discard path returns `Ok(())` and logs at debug, so a run that
-hits this looks like a clean stream on the wire and says nothing at INFO.
-Reading it required `RUST_LOG=jam_node::chain::guarantors=debug`.
+- Compose a short lead before the distribution, so the anchor is fresh.
+  Composing at plan time leaves it stale; composing against the very head
+  makes the guarantee name a slot the reference has reached and the node has
+  not.
+- Pass the *distribution* slot for the cohort and the declared slot, not the
+  compose slot. The lane aims at phase 0, so two slots before the target is
+  the previous epoch with a different cohort entirely -- a lead alone
+  silently swaps one rejection for another.
 
-**To close it:** compose the distributed report so that its anchor is recent
-*and* its guarantee slot is one the node has reached. The reference leads the
-node by a block or so, so the likely shape is to build the report against a
-head the node already holds rather than against the reference's own next
-slot -- which is the distinction neither stashed attempt drew.
+Earlier attempts moved the declared slot and never the anchor, or moved both
+together. They are stashed as `n3-send-time-build` and
+`n3-report-send-time-compose`.
 
-**A caution this entry has earned twice.** Six runs cannot tell a fix from
-variance here. A one-line fix was nearly discarded on a bad batch and a
-regression was committed on a good one, and the logging hypothesis that
-once occupied this entry was itself refuted by a controlled A/B. Prefer
-correlation over batch scores: the phase table above was worth more than
-twenty runs of pass counts.
+**Measured after the fix:** four consecutive runs clean at phases 8, 7, 5 and
+5. Phase 5 is inside the old failing band, where every run had failed.
+
+**Not yet sampled:** phases 1 to 3, the deepest part of that band. The
+mechanism says they should pass, since the anchor is now built two slots
+before distribution whatever the phase, but that is reasoning rather than
+measurement.

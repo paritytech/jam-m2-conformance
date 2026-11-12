@@ -713,7 +713,9 @@ fn start_report_distribution(connection: &Conn, peer: u16, shared: &EmuShared) {
         };
         crate::report_io::spawn_report_sender(
             connection,
-            plan,
+            plan.slot,
+            plan.nut,
+            Arc::clone(&shared.ref_chain),
             Arc::clone(&shared.trace),
             Arc::clone(&shared.obs),
             Arc::clone(&shared.distributed),
