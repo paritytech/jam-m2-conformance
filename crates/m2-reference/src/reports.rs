@@ -95,6 +95,37 @@ fn epoch_info_for<'a, E>(
     }
 }
 
+/// The smallest work item that refines: no payload, no imports, no
+/// extrinsics.
+pub fn trivial_work_item() -> jam_node::hazmat::BuildItem {
+    jam_node::hazmat::BuildItem::new(
+        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+        jam_types::WorkPayload(Vec::new()),
+        jam_types::max_refine_gas(),
+        jam_types::max_accumulate_gas(),
+        Vec::new(),
+        Vec::new(),
+        0,
+    )
+}
+
+/// When and where to submit, with no package attached.
+///
+/// The package is built a few slots before the slot, not when the run is
+/// planned. Its refine context is anchored to the chain head at build time,
+/// and the anchor has to satisfy two opposing bounds: recent enough to still
+/// be in the node's recent history, old enough that the node has imported
+/// it. Measured against a live node, about eleven slots ahead is accepted
+/// and about fourteen is not, while building against the very head is
+/// refused outright.
+#[derive(Debug, Clone)]
+pub struct SubmissionSchedule {
+    pub slot: u32,
+    pub core: u16,
+    /// Validators holding `core` at `slot` besides the NUT.
+    pub co_guarantors: Vec<u16>,
+}
+
 /// A guaranteed work-report the harness distributes over CE 135, so the node
 /// can be graded on including it.
 #[derive(Debug, Clone)]
@@ -208,6 +239,30 @@ pub struct BuiltPackage {
 }
 
 impl RefChain {
+    /// Build this run's package against the current chain head, with the
+    /// CE 134 answer its co-guarantors will give.
+    ///
+    /// Called a few slots before the submission so the anchor lands inside
+    /// the window on [`SubmissionSchedule`].
+    pub fn submission_now(
+        &self,
+        schedule: &SubmissionSchedule,
+    ) -> Result<(ScheduledSubmission, SharingAnswer), ChainError> {
+        let work = self.guarantee_work(vec![trivial_work_item()], schedule.core)?;
+        let answer = work.sharing_answer_for(&schedule.co_guarantors);
+        Ok((
+            ScheduledSubmission {
+                slot: schedule.slot,
+                core: schedule.core,
+                package: jam_types::Encode::encode(&work.package),
+                package_hash: package_hash(&work.package).0,
+                extrinsics: work.extrinsics,
+                co_guarantors: schedule.co_guarantors.clone(),
+            },
+            answer,
+        ))
+    }
+
     /// Build `items` into an authorized package for a builder to submit.
     pub fn build_work_package(&self, items: Vec<jam_node::hazmat::BuildItem>) -> BuiltPackage {
         let (package, extrinsics) = self.harness().build_package(items);

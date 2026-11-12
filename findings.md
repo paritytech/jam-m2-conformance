@@ -128,7 +128,17 @@ regression:** every one scored zero passes, in two distinct ways.
 
 That second result does put a bound on the anchor window this file has twice
 said was unestablished: about eleven slots ahead is accepted, about fourteen
-is not. The settle is back to zero.
+is not. The settle is back to zero, and the bound was the useful part: the package is
+now built two slots before its submission rather than when the run is
+planned, which puts the anchor inside both limits.
+
+**Measured over three consecutive runs: two scored 30 of 30 with exit 0, and
+the third exercised nothing.** That third is finding 1 again -- the cached
+epoch view had fallen more than one epoch behind the head, so the submission
+slot resolved to neither the cached epoch nor the next and no plan was made.
+It reported the rule unexercised rather than failing the node, which is the
+right outcome for a question the harness could not pose, but it is still
+finding 1 setting the ceiling on how often this lane can run at all.
 
 So finding 2's chain is closed and finding 1 is what remains between this
 lane and a deterministic pass.

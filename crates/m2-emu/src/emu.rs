@@ -25,7 +25,7 @@ use jamnp_s::{
     transport::{quic::QuicTransport, Conn, Listener, RecvHalf, SendHalf, Transport},
 };
 use m2_reference::chain::RefChain;
-use m2_reference::reports::{ScheduledReport, ScheduledSubmission, SharingAnswer};
+use m2_reference::reports::{ScheduledReport, SharingAnswer, SubmissionSchedule};
 use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::{DeliveredTicket, NutBlock};
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
@@ -90,7 +90,7 @@ pub struct Emulator {
     /// The CE 133 submission for this run, claimed by the first connection
     /// to the NUT. One per run, not one per peer: a work package is submitted
     /// by a builder, and one builder is enough to pose the row.
-    submission_plan: Arc<Mutex<Option<ScheduledSubmission>>>,
+    submission_plan: Arc<Mutex<Option<SubmissionSchedule>>>,
     /// CE 133 submissions the emulator made, with what the node did with them.
     submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
     /// What an emulated co-guarantor answers a CE 134 share with, once the
@@ -153,7 +153,7 @@ pub struct EmuShared {
     /// empty map at connect time means "not yet", not "nothing to send".
     pub plans_set: watch::Receiver<bool>,
     /// The CE 133 submission for this run; see [`Emulator::set_submission_plan`].
-    pub submission_plan: Arc<Mutex<Option<ScheduledSubmission>>>,
+    pub submission_plan: Arc<Mutex<Option<SubmissionSchedule>>>,
     /// CE 133 submissions the emulator made.
     pub submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
     /// The CE 134 answer for this run's submission, if one was planned.
@@ -235,7 +235,7 @@ impl EmuShared {
     ///
     /// `None` once taken, so a second connection does not submit the same
     /// package twice -- which a node would be right to treat as a duplicate.
-    pub fn take_submission_plan(&self) -> Option<ScheduledSubmission> {
+    pub fn take_submission_plan(&self) -> Option<SubmissionSchedule> {
         lock(&self.submission_plan).take()
     }
 
@@ -352,11 +352,9 @@ impl Emulator {
     /// Gated behind the same flag as the ticket plans and for the same
     /// reason: a plan written while the node is still importing the seeded
     /// chain names a slot the submission will not arrive in.
-    pub fn set_submission_plan(&self, plan: ScheduledSubmission, answer: SharingAnswer) {
-        // The answer first: the node can open CE 134 the moment the
-        // submission lands, and a responder that found no answer would FIN
-        // empty and the node would rightly proceed without us.
-        *lock(&self.sharing_answer) = Some(answer);
+    pub fn set_submission_plan(&self, plan: SubmissionSchedule) {
+        // No answer yet: it is signed over the report the package refines
+        // to, and the package is not built until shortly before its slot.
         *lock(&self.submission_plan) = Some(plan);
         self.plans_set.send_replace(true);
     }

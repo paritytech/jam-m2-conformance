@@ -315,7 +315,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                 conn_findings.push(short_window_finding(wait_secs, cli.observe_secs));
             }
             match plan_package_for_this_run(&ref_chain, nut_index) {
-                Ok((plan, answer)) => {
+                Ok(plan) => {
                     // The report to be included rides the same slot plan: it
                     // is guaranteed on a core the NUT does not hold, so the
                     // two never collide.
@@ -345,7 +345,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         Err(e) => conn_findings.push(no_package_plan_finding(&e)),
                     }
                     phase("plan_package.report_to_distribute", t_dist);
-                    emu.set_submission_plan(plan, answer);
+                    emu.set_submission_plan(plan);
                     // CE 133 is builder -> guarantor, so it goes out over a
                     // builder connection of its own rather than riding an
                     // emulated validator's. polkajam hands out direct
@@ -734,17 +734,10 @@ const SUBMISSION_MARGIN_SLOTS: u32 = 2;
 
 /// Build this run's CE 133 submission: one trivial work item, aimed at a slot
 /// the NUT guarantees a core in with room left to act.
-#[allow(clippy::type_complexity)]
 fn plan_package_for_this_run(
     ref_chain: &RefChain,
     nut_index: usize,
-) -> Result<
-    (
-        m2_reference::reports::ScheduledSubmission,
-        m2_reference::reports::SharingAnswer,
-    ),
-    m2_reference::chain::ChainError,
-> {
+) -> Result<m2_reference::reports::SubmissionSchedule, m2_reference::chain::ChainError> {
     // Into the *next* epoch, not the next slot.
     //
     // The two core assignments read different entries of the entropy buffer.
@@ -785,7 +778,6 @@ fn plan_package_for_this_run(
         ref_chain.next_slot(),
         ref_chain.next_slot() / epoch
     );
-    let item = trivial_work_item();
     let (cached_epoch, state_epoch) = ref_chain.epoch_views();
     let (cached_entropy, entropy1, entropy2) = ref_chain.assignment_entropy();
     eprintln!(
@@ -825,69 +817,93 @@ fn plan_package_for_this_run(
             ref_chain.guarantors_for_in_epoch(core, plan.slot),
         );
     }
-    // One computation, not two. The package the harness submits and the
-    // report its co-guarantors sign for have to be the same package, and
-    // building it twice would re-read the chain head in between.
-    let t = std::time::Instant::now();
-    let work = ref_chain.guarantee_work(vec![item], plan.core)?;
-    phase("plan_package.guarantee_work", t);
-    Ok((
-        m2_reference::reports::ScheduledSubmission {
-            slot: plan.slot,
-            core: plan.core,
-            package: jam_types::Encode::encode(&work.package),
-            package_hash: m2_reference::reports::package_hash(&work.package).0,
-            extrinsics: work.extrinsics.clone(),
-            co_guarantors: plan.co_guarantors.clone(),
-        },
-        work.sharing_answer_for(&plan.co_guarantors),
-    ))
+    Ok(m2_reference::reports::SubmissionSchedule {
+        slot: plan.slot,
+        core: plan.core,
+        co_guarantors: plan.co_guarantors,
+    })
+}
+
+/// A work item with a distinguishing payload, so two packages built in one
+/// run are two packages.
+///
+/// The submission and the distributed report were once both built from the
+/// empty item, which made them one package: the node noted the report and
+/// then refused the submission as already reported.
+fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
+    jam_node::hazmat::BuildItem::new(
+        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+        jam_types::WorkPayload(payload),
+        jam_types::max_refine_gas(),
+        jam_types::max_accumulate_gas(),
+        Vec::new(),
+        Vec::new(),
+        0,
+    )
+}
+
+/// Stderr phase marker, so a run that stalls says which phase it stalled in.
+///
+/// A conformance run is minutes of mostly-silent waiting, and when one hangs
+/// the node's own log is the only clock -- it shows the symptom and never the
+/// phase. These lines are the harness's own clock.
+pub(crate) fn phase(label: &str, started: std::time::Instant) {
+    eprintln!("[phase] {label}: {:?}", started.elapsed());
 }
 
 /// Peer index the CE 133 builder is recorded under.
 ///
 /// Outside the validator range on purpose: a builder is not a validator, and
-/// the lanes iterate the emulated validator indices. Attributing the
-/// submission to one of those would make it look like a validator had
-/// submitted, and an N0 row keyed on that peer could read the builder's
+/// an N0 row keyed on a validator peer could otherwise read the builder's
 /// traffic as its own.
 pub(crate) const BUILDER_PEER: u16 = 0xB0;
 
+/// Slots before the submission at which its package is built.
+///
+/// Two opposing bounds, both measured against a live node. Build against the
+/// very head and the node refuses the submission: it has not imported that
+/// block yet, so the anchor is unknown. Build far enough back and the anchor
+/// ages out of recent history -- about eleven slots ahead is accepted and
+/// about fourteen is not. A couple of slots sits inside both.
+const PACKAGE_BUILD_LEAD_SLOTS: u32 = 2;
+
 /// Open a builder connection to the NUT and submit this run's work package.
 ///
-/// A distinct identity from any emulated validator, as `probe_builder_slots`
-/// uses: the node is entitled to collapse repeated connections from one key,
-/// and the builder must not be mistaken for a validator it already has.
-///
-/// The connection is held for the whole submission. Dropping it after the
-/// write would reset the stream from our side, and the node's answer -- FIN
-/// or reset, which is the row -- would never arrive.
+/// The package is built `PACKAGE_BUILD_LEAD_SLOTS` before the slot and the
+/// connection dialled at it. Both are timing, not ceremony: the anchor has a
+/// window, and a connection opened early and held idle is one QUIC closes
+/// under us.
 async fn submit_as_builder(
     addr: SocketAddr,
     expected_san: String,
     genesis_hash: [u8; 32],
     shared: m2_emu::emu::EmuShared,
 ) {
-    let Some(plan) = shared.take_submission_plan() else {
+    let Some(schedule) = shared.take_submission_plan() else {
         eprintln!("[builder] no submission plan to claim");
         return;
     };
-    // Wait for the slot *before* dialling, not after. A builder connection
-    // opened at plan time and then held idle until the slot is a connection
-    // QUIC closes under us: once the lane began aiming a whole epoch ahead
-    // the wait grew past the idle timeout, the connection was gone by the
-    // time the slot arrived, and the submission never left. A builder
-    // connects when it has something to submit.
-    let target_ms = m2_emu::emu::slot_start_ms(plan.slot);
-    loop {
-        let now = jamnp_s::trace::wall_ts();
-        if now >= target_ms {
-            break;
+    sleep_until_slot(schedule.slot.saturating_sub(PACKAGE_BUILD_LEAD_SLOTS)).await;
+    let (plan, answer) = match shared.ref_chain.submission_now(&schedule) {
+        Ok(built) => built,
+        Err(e) => {
+            eprintln!("[builder] could not build the package: {e}");
+            return;
         }
-        jamnp_s::clock::current()
-            .sleep(Duration::from_millis(target_ms - now))
-            .await;
-    }
+    };
+    // In place before the node can share, which it does within milliseconds
+    // of accepting.
+    *shared
+        .sharing_answer
+        .lock()
+        .expect("the sharing answer lock is never poisoned") = Some(answer);
+    eprintln!(
+        "[builder] built for slot {} against head {}",
+        schedule.slot,
+        shared.ref_chain.next_slot()
+    );
+
+    sleep_until_slot(schedule.slot).await;
     let mut seed = [0u8; 32];
     seed[0] = 0xB0;
     seed[1] = 0xD1;
@@ -910,7 +926,6 @@ async fn submit_as_builder(
             return;
         }
     };
-    eprintln!("[builder] connected; submitting in slot {}", plan.slot);
     m2_emu::report_io::spawn_package_sender(
         connection.clone(),
         plan,
@@ -923,42 +938,18 @@ async fn submit_as_builder(
     drop(connection);
 }
 
-/// Stderr phase marker, so a run that stalls says which phase it stalled in.
-///
-/// A conformance run is minutes of mostly-silent waiting, and when one hangs
-/// the node's own log is the only clock -- it shows the symptom (peers
-/// dropping, finality drifting) and never the phase. These lines are the
-/// harness's own clock.
-pub(crate) fn phase(label: &str, started: std::time::Instant) {
-    eprintln!("[phase] {label}: {:?}", started.elapsed());
-}
-
-/// The smallest work item that refines: no payload, no imports, no
-/// extrinsics. The lane grades the protocol around a package, not the work
-/// inside it, and a trivial item keeps the refinement off the slot budget.
-fn trivial_work_item() -> jam_node::hazmat::BuildItem {
-    work_item_with_payload(Vec::new())
-}
-
-/// The same item with a distinguishing payload, so two packages built in one
-/// run are two packages.
-///
-/// The submission and the distributed report were both built from the empty
-/// item, which makes them byte-identical and so the same package hash. While
-/// the distributed guarantee was being rejected that went unnoticed; once it
-/// was accepted the node noted the report and then refused the CE 133
-/// submission of the same package as already reported -- `Unwanted`, which
-/// covers a duplicate as well as a bad anchor.
-fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
-    jam_node::hazmat::BuildItem::new(
-        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-        jam_types::WorkPayload(payload),
-        jam_types::max_refine_gas(),
-        jam_types::max_accumulate_gas(),
-        Vec::new(),
-        Vec::new(),
-        0,
-    )
+/// Wait until `slot` begins.
+async fn sleep_until_slot(slot: u32) {
+    let target_ms = m2_emu::emu::slot_start_ms(slot);
+    loop {
+        let now = jamnp_s::trace::wall_ts();
+        if now >= target_ms {
+            return;
+        }
+        jamnp_s::clock::current()
+            .sleep(Duration::from_millis(target_ms - now))
+            .await;
+    }
 }
 
 /// Slots to let an epoch settle before submitting into it.
