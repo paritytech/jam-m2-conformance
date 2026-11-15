@@ -1,4 +1,4 @@
-//! N1/N2 detail observations the emulator emits (DESIGN.md §11 N1/N2).
+//! N1/N2/N3 detail observations the emulator emits (DESIGN.md §11).
 //!
 //! Like the N0 codes (`scenarios/n0.rs`), these ride the
 //! [`dsl::ObsKind::Other`] extension slot. The runner wires the emulator to
@@ -13,6 +13,12 @@
 //! | 46 | emulator sent a ticket via CE 132 (broadcast incl. the NUT) |
 //! | 47 | emulator withheld a planned ticket: the NUT could not accept it |
 //! | 48 | NUT sent a CE 131/132 frame that would not decode |
+//! | 50 | NUT sent a CE 134 sharing stream that would not decode |
+//! | 51 | NUT sent a CE 135 frame that would not decode |
+//! | 52 | emulator submitted a work package over CE 133 |
+//! | 53 | NUT refused a CE 133 submission: it reset the stream |
+//! | 54 | emulator answered a CE 134 share with a hash and signature |
+//! | 55 | emulator distributed a guaranteed work-report over CE 135 |
 //!
 //! Code 44 is retired. It meant two unrelated things -- the NUT refusing a
 //! ticket, and the NUT sending a frame the harness could not decode -- and
@@ -49,3 +55,33 @@ pub const TICKET_WITHHELD: u8 = 47;
 /// ticket -- and the CE 131 decoder defect closed on 2026-10-30 was a
 /// generator of exactly these.
 pub const NUT_SENT_UNDECODABLE: u8 = 48;
+
+/// The NUT sent a CE 134 sharing stream the harness could not read.
+///
+/// Separate from the CE 135 code below, and from N2's
+/// [`NUT_SENT_UNDECODABLE`], for the reason code 44 was retired: one code
+/// standing for two different defects lets a check about either be satisfied
+/// by the other.
+pub const NUT_SENT_BAD_SHARING: u8 = 50;
+/// The NUT sent a CE 135 frame the harness could not read.
+pub const NUT_SENT_BAD_REPORT: u8 = 51;
+
+/// The emulator submitted a work package to the NUT over CE 133.
+pub const EMU_SENT_133: u8 = 52;
+/// The NUT refused a CE 133 submission, by resetting its stream.
+///
+/// As with N2's ticket refusals, why it refused is not inferred here: a reset
+/// carries no reason, and the cause is whatever the harness deliberately put
+/// in that submission. Which package was refused is recorded on
+/// `scenarios::n3::SubmittedPackage`; this code only says one happened.
+pub const PACKAGE_REFUSED: u8 = 53;
+
+/// An emulated co-guarantor answered a CE 134 share (`simple.md:456`).
+///
+/// Its absence where a share was seen means the harness had no answer to
+/// give -- no package of ours was in flight -- not that the node went
+/// unanswered through any fault of its own.
+pub const EMU_ANSWERED_134: u8 = 54;
+
+/// The emulator distributed a reference-guaranteed work-report over CE 135.
+pub const EMU_SENT_135: u8 = 55;

@@ -14,10 +14,11 @@ use m2_scenario::ctx::{
 };
 use m2_scenario::dsl::{Check, Obs, ObsKind, ObsLog, Outcome, Scheduler, Severity};
 use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
+use m2_scenario::scenarios::n3::N3Ctx;
 use m2_scenario::scenarios::obs::{
     EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, TICKET_REFUSED,
 };
-use m2_scenario::scenarios::{n0, n1, n2};
+use m2_scenario::scenarios::{n0, n1, n2, n3};
 
 use crate::cli::LaneSet;
 use crate::report::{CheckOutcome, Finding};
@@ -27,6 +28,7 @@ pub(crate) struct RunCtx {
     pub n0: n0::N0Ctx,
     pub n1: Option<N1Ctx>,
     pub n2: Option<N2Ctx>,
+    pub n3: Option<N3Ctx>,
 }
 
 /// The outcome of a run's scenario evaluation.
@@ -39,12 +41,16 @@ pub(crate) struct Evaluation {
 /// Where a run's checks read observations from.
 pub(crate) enum ObsSource {
     /// Live emulator log (real run); `_emu` keeps its runtime alive.
+    ///
+    /// Boxed only for its size: the emulator is much larger than the
+    /// fabricated variant and grows with every record the lanes collect, so
+    /// an unboxed one makes every `ObsSource` that size, dry runs included.
     Emulator {
         obs: Arc<Mutex<ObsLog>>,
         trace: Arc<Mutex<Trace>>,
         ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
         ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
-        _emu: Emulator,
+        _emu: Box<Emulator>,
     },
     /// Deterministic fabricated log + empty trace (dry-run).
     Fabricated { log: ObsLog, trace: Trace },
@@ -70,6 +76,9 @@ pub(crate) fn evaluate(obs: &ObsLog, run_ctx: &RunCtx, selected: LaneSet) -> Eva
     }
     if let (true, Some(ctx)) = (selected.n2, &run_ctx.n2) {
         lanes.push(("N2", n2::all(ctx)));
+    }
+    if let (true, Some(ctx)) = (selected.n3, &run_ctx.n3) {
+        lanes.push(("N3", n3::all(ctx)));
     }
     for (lane, checks) in lanes {
         let (out, finds, hard) = run_lane(lane, &checks, obs);
@@ -479,6 +488,70 @@ pub(crate) fn fabricated_run_ctx(
         max_tickets_per_block: jam_types::max_tickets_per_block(),
     };
 
+    // A conforming N3: the package was accepted and shared with both
+    // co-guarantors well inside the window. Fabricated like the rest, so a
+    // dry run renders the lane instead of dropping it -- a lane that was
+    // asked for and has no context is absent from the report, which reads the
+    // same as a lane nobody asked for.
+    let submitted_at = slot_start(fab_block_slot);
+    let fab_co_guarantors = vec![n0::PEER_1, n0::PEER_1 + 1];
+    const FAB_REPORT_HASH: [u8; 32] = [0x77; 32];
+    const FAB_INCLUDED_HASH: [u8; 32] = [0x88; 32];
+    let n3 = N3Ctx {
+        nut_index: FAB_NUT_INDEX,
+        submissions: vec![m2_scenario::scenarios::n3::SubmittedPackage {
+            peer: n0::PEER_1,
+            core: 0,
+            slot: fab_block_slot,
+            package_hash: [0x5a; 32],
+            sent_at_wall_ms: submitted_at,
+            refused: false,
+            reset_code: None,
+            co_guarantors: fab_co_guarantors.clone(),
+        }],
+        shares: fab_co_guarantors
+            .iter()
+            .enumerate()
+            .map(|(i, peer)| m2_scenario::scenarios::n3::SharingSeen {
+                peer: *peer,
+                core_index: 0,
+                shard_count: 6,
+                // No imported segments, so no mappings: the mapping row is
+                // absent rather than passing on a condition it cannot fail.
+                mappings: Vec::new(),
+                bundle: Some(vec![0xab; 32]),
+                at_wall_ms: submitted_at + 200 * (i as u64 + 1),
+            })
+            .collect(),
+        // A guaranteed report distributed to both emulated validators, with
+        // two signatures from holders of the core, matching the reference.
+        reports: fab_co_guarantors
+            .iter()
+            .map(|peer| m2_scenario::scenarios::n3::ReportSeen {
+                peer: *peer,
+                report_hash: FAB_REPORT_HASH,
+                slot: fab_block_slot,
+                signatures: vec![(FAB_NUT_INDEX, [0u8; 64]), (n0::PEER_1, [0u8; 64])],
+                encoded_report: vec![0xaa; 32],
+                at_wall_ms: submitted_at + 2_000,
+            })
+            .collect(),
+        answers_sharing: true,
+        expected_report_hash: Some(FAB_REPORT_HASH),
+        emulated_peers: fab_co_guarantors.clone(),
+        // A reference-guaranteed report distributed before the node's block,
+        // and carried in it.
+        distributed: vec![m2_scenario::scenarios::n3::DistributedReport {
+            peer: n0::PEER_1,
+            core: 1,
+            report_hash: FAB_INCLUDED_HASH,
+            sent_in_slot: fab_block_slot - 1,
+            sent_at_wall_ms: submitted_at,
+        }],
+        included: vec![(FAB_INCLUDED_HASH, fab_block_slot)],
+        authored_slots: vec![fab_block_slot],
+    };
+
     Ok(RunCtx {
         // The fabricated log is written for a NUT at index 0, which initiates
         // to every emulated peer and so never needs a fallback dial.
@@ -522,6 +595,7 @@ pub(crate) fn fabricated_run_ctx(
         },
         n1: Some(n1),
         n2: Some(n2),
+        n3: Some(n3),
     })
 }
 
@@ -536,6 +610,7 @@ mod tests {
         n0: true,
         n1: true,
         n2: true,
+        n3: true,
     };
 
     #[test]
@@ -554,7 +629,7 @@ mod tests {
             eval.all_hard_passed,
             "fabricated log must pass all lanes; failed: {hard_failures:?}"
         );
-        for lane in ["N0", "N1", "N2"] {
+        for lane in ["N0", "N1", "N2", "N3"] {
             let outcomes: Vec<&CheckOutcome> =
                 eval.outcomes.iter().filter(|o| o.lane == lane).collect();
             assert!(!outcomes.is_empty(), "lane {lane} must produce outcomes");

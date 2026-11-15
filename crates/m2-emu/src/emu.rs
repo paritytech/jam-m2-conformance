@@ -20,16 +20,18 @@ use jamnp_s::{
     codec::ce128_129::{BlockRequest, BlockResponse, Direction, StateRequest, StateResponse},
     codec::up0::{Announcement, Final, Handshake},
     endpoint::{EndpointConfig, EndpointError},
-    framing::{frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, UP},
+    framing::{frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE134, CE135, UP},
     trace::{mono_ts, wall_ts, Direction as TraceDir, Trace, TraceRecord},
     transport::{quic::QuicTransport, Conn, Listener, RecvHalf, SendHalf, Transport},
 };
 use m2_reference::chain::RefChain;
+use m2_reference::reports::{ScheduledReport, SharingAnswer, SubmissionSchedule};
 use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::{DeliveredTicket, NutBlock};
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
 use m2_scenario::scenarios::n0;
 use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
+use m2_scenario::scenarios::n3::{DistributedReport, ReportSeen, SharingSeen, SubmittedPackage};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
@@ -82,11 +84,29 @@ pub struct Emulator {
     obs: Arc<Mutex<ObsLog>>,
     nut_blocks: Arc<Mutex<Vec<NutBlock>>>,
     ticket_plans: Arc<Mutex<HashMap<u16, Vec<ScheduledTicket>>>>,
-    /// Published to [`EmuShared::ticket_plans_set`] by `set_ticket_plans`.
-    ticket_plans_set: watch::Sender<bool>,
+    /// Published to [`EmuShared::plans_set`] by `set_ticket_plans` and
+    /// `set_submission_plan`.
+    plans_set: watch::Sender<bool>,
+    /// The CE 133 submission for this run, claimed by the first connection
+    /// to the NUT. One per run, not one per peer: a work package is submitted
+    /// by a builder, and one builder is enough to pose the row.
+    submission_plan: Arc<Mutex<Option<SubmissionSchedule>>>,
+    /// CE 133 submissions the emulator made, with what the node did with them.
+    submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
+    /// What an emulated co-guarantor answers a CE 134 share with, once the
+    /// submission it belongs to has been planned.
+    sharing_answer: Arc<Mutex<Option<SharingAnswer>>>,
+    /// The reference-guaranteed report this run distributes to the NUT.
+    report_plan: Arc<Mutex<Option<ScheduledReport>>>,
+    /// Reports the emulator distributed, for the inclusion rows.
+    distributed: Arc<Mutex<Vec<DistributedReport>>>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
     ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
+    /// CE 134 sharing streams the NUT opened to an emulated co-guarantor.
+    sharing_seen: Arc<Mutex<Vec<SharingSeen>>>,
+    /// CE 135 report distributions the NUT sent.
+    reports_seen: Arc<Mutex<Vec<ReportSeen>>>,
     sync_probe_pending: Arc<AtomicBool>,
     /// Highest finalized slot the NUT has advertised over UP 0; see
     /// [`EmuShared::nut_final_slot`].
@@ -131,7 +151,17 @@ pub struct EmuShared {
     /// names slots the tickets will not arrive in. So a sender cannot read
     /// its plan at connect time -- it has to wait for one to exist, and an
     /// empty map at connect time means "not yet", not "nothing to send".
-    pub ticket_plans_set: watch::Receiver<bool>,
+    pub plans_set: watch::Receiver<bool>,
+    /// The CE 133 submission for this run; see [`Emulator::set_submission_plan`].
+    pub submission_plan: Arc<Mutex<Option<SubmissionSchedule>>>,
+    /// CE 133 submissions the emulator made.
+    pub submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
+    /// The CE 134 answer for this run's submission, if one was planned.
+    pub sharing_answer: Arc<Mutex<Option<SharingAnswer>>>,
+    /// The reference-guaranteed report this run distributes to the NUT.
+    pub report_plan: Arc<Mutex<Option<ScheduledReport>>>,
+    /// Reports the emulator distributed.
+    pub distributed: Arc<Mutex<Vec<DistributedReport>>>,
     /// Tickets actually put on the wire, with the wall-clock time they were
     /// sent. The sender knows each ticket's id, so the N1 lane reads this
     /// rather than re-deriving ids from the observation log.
@@ -140,6 +170,11 @@ pub struct EmuShared {
     pub ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
     /// CE 129 replies the node under test gave the emulator.
     pub ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
+    /// CE 134 sharing streams the NUT opened to an emulated co-guarantor
+    /// (`simple.md:406-458`).
+    pub sharing_seen: Arc<Mutex<Vec<SharingSeen>>>,
+    /// CE 135 report distributions the NUT sent (`simple.md:460-485`).
+    pub reports_seen: Arc<Mutex<Vec<ReportSeen>>>,
     /// Cleared by whichever connection runs the sync probes, so they run once
     /// per run rather than once per peer.
     pub sync_probe_pending: Arc<AtomicBool>,
@@ -170,6 +205,38 @@ impl EmuShared {
         lock(&self.ticket_plans)
             .remove(&peer)
             .filter(|p| !p.is_empty())
+    }
+
+    /// Take this run's CE 135 distribution, leaving nothing behind.
+    ///
+    /// Claimed once, like the submission: the same report sent twice is a
+    /// duplicate the node is right to drop, which would read as a failure to
+    /// include it.
+    pub fn take_report_plan(&self) -> Option<ScheduledReport> {
+        lock(&self.report_plan).take()
+    }
+
+    /// Take this run's CE 135 distribution, but only on the connection to the
+    /// validator that must send it.
+    ///
+    /// Checked before taking, not after: a peer that took a plan it may not
+    /// send would have to put it back, and another connection could claim it
+    /// in between.
+    pub fn claim_report_plan(&self, peer: u16) -> Option<ScheduledReport> {
+        let mut plan = lock(&self.report_plan);
+        if plan.as_ref().is_some_and(|p| p.sender == peer) {
+            plan.take()
+        } else {
+            None
+        }
+    }
+
+    /// Take this run's CE 133 submission, leaving nothing behind.
+    ///
+    /// `None` once taken, so a second connection does not submit the same
+    /// package twice -- which a node would be right to treat as a duplicate.
+    pub fn take_submission_plan(&self) -> Option<SubmissionSchedule> {
+        lock(&self.submission_plan).take()
     }
 
     /// True for the first caller only: the sync probes are assertions about
@@ -251,10 +318,17 @@ impl Emulator {
             obs: Arc::new(Mutex::new(ObsLog::new())),
             nut_blocks: Arc::new(Mutex::new(Vec::new())),
             ticket_plans: Arc::new(Mutex::new(HashMap::new())),
-            ticket_plans_set: watch::channel(false).0,
+            plans_set: watch::channel(false).0,
+            submission_plan: Arc::new(Mutex::new(None)),
+            submissions: Arc::new(Mutex::new(Vec::new())),
+            sharing_answer: Arc::new(Mutex::new(None)),
+            report_plan: Arc::new(Mutex::new(None)),
+            distributed: Arc::new(Mutex::new(Vec::new())),
             deliveries: Arc::new(Mutex::new(Vec::new())),
             ce128_probes: Arc::new(Mutex::new(Vec::new())),
             ce129_probes: Arc::new(Mutex::new(Vec::new())),
+            sharing_seen: Arc::new(Mutex::new(Vec::new())),
+            reports_seen: Arc::new(Mutex::new(Vec::new())),
             sync_probe_pending: Arc::new(AtomicBool::new(true)),
             nut_final_slot: Arc::new(AtomicU32::new(NO_ADVERTISED_FINAL)),
             announce: broadcast::Sender::new(ANNOUNCE_BUFFER),
@@ -270,7 +344,44 @@ impl Emulator {
         // After the map, never before: a sender woken by this goes straight
         // to `take_ticket_plan`. `send_replace` rather than `send` so the flag
         // sticks even when no sender is listening yet.
-        self.ticket_plans_set.send_replace(true);
+        self.plans_set.send_replace(true);
+    }
+
+    /// Set the CE 133 submission for this run.
+    ///
+    /// Gated behind the same flag as the ticket plans and for the same
+    /// reason: a plan written while the node is still importing the seeded
+    /// chain names a slot the submission will not arrive in.
+    pub fn set_submission_plan(&self, plan: SubmissionSchedule) {
+        // No answer yet: it is signed over the report the package refines
+        // to, and the package is not built until shortly before its slot.
+        *lock(&self.submission_plan) = Some(plan);
+        self.plans_set.send_replace(true);
+    }
+
+    /// CE 133 submissions the emulator made, with what the node did with them.
+    pub fn submissions(&self) -> Arc<Mutex<Vec<SubmittedPackage>>> {
+        Arc::clone(&self.submissions)
+    }
+
+    /// The CE 134 answer planned for this run, if any. The lane reads the
+    /// report hash out of it to compare the node's own against.
+    pub fn sharing_answer(&self) -> Arc<Mutex<Option<SharingAnswer>>> {
+        Arc::clone(&self.sharing_answer)
+    }
+
+    /// Set the reference-guaranteed report this run distributes to the NUT.
+    ///
+    /// Behind the same gate as the other plans: a report distributed while
+    /// the node is still importing names a slot it will not act in.
+    pub fn set_report_plan(&self, plan: ScheduledReport) {
+        *lock(&self.report_plan) = Some(plan);
+        self.plans_set.send_replace(true);
+    }
+
+    /// Reports the emulator distributed, for the inclusion rows.
+    pub fn distributed(&self) -> Arc<Mutex<Vec<DistributedReport>>> {
+        Arc::clone(&self.distributed)
     }
 
     /// The tickets the emulator put on the wire, with their send times.
@@ -288,6 +399,16 @@ impl Emulator {
         Arc::clone(&self.ce129_probes)
     }
 
+    /// CE 134 sharing streams the NUT opened to an emulated co-guarantor.
+    pub fn sharing_seen(&self) -> Arc<Mutex<Vec<SharingSeen>>> {
+        Arc::clone(&self.sharing_seen)
+    }
+
+    /// CE 135 report distributions the NUT sent.
+    pub fn reports_seen(&self) -> Arc<Mutex<Vec<ReportSeen>>> {
+        Arc::clone(&self.reports_seen)
+    }
+
     /// The state every connection handler shares, over `ref_chain`.
     pub fn shared(&self, ref_chain: Arc<RefChain>) -> EmuShared {
         EmuShared {
@@ -298,10 +419,17 @@ impl Emulator {
             nut_blocks: Arc::clone(&self.nut_blocks),
             announce: self.announce.clone(),
             ticket_plans: Arc::clone(&self.ticket_plans),
-            ticket_plans_set: self.ticket_plans_set.subscribe(),
+            plans_set: self.plans_set.subscribe(),
+            submission_plan: Arc::clone(&self.submission_plan),
+            submissions: Arc::clone(&self.submissions),
+            sharing_answer: Arc::clone(&self.sharing_answer),
+            report_plan: Arc::clone(&self.report_plan),
+            distributed: Arc::clone(&self.distributed),
             deliveries: Arc::clone(&self.deliveries),
             ce128_probes: Arc::clone(&self.ce128_probes),
             ce129_probes: Arc::clone(&self.ce129_probes),
+            sharing_seen: Arc::clone(&self.sharing_seen),
+            reports_seen: Arc::clone(&self.reports_seen),
             sync_probe_pending: Arc::clone(&self.sync_probe_pending),
             nut_final_slot: Arc::clone(&self.nut_final_slot),
         }
@@ -479,6 +607,13 @@ pub async fn dial_nut(
     // Deliver the peer's N2 tickets on their own streams, concurrently with
     // the handler — unless the accept side already took the plan.
     start_ticket_delivery(&connection, peer, &shared);
+    // And the N3 report, for the same reason the tickets are here: a plan is
+    // claimed on the first connection to its peer, whichever side opened it.
+    // This was missing, so a run whose designated sender was a peer the
+    // emulator dialled had no distributor at all and sent nothing -- the
+    // node never saw a CE 135 and the inclusion row failed with no trace of
+    // why, in half the runs.
+    start_report_distribution(&connection, peer, &shared);
     start_sync_probe(&connection, peer, &shared);
 
     // Serve the NUT's CE 128 / CE 129 requests on the dialed connection.
@@ -549,6 +684,7 @@ async fn endpoint_task(
         // side opened it: the NUT reaching us first must not cost the peer its
         // whole ticket plan.
         start_ticket_delivery(&connection, peer_index, &shared);
+        start_report_distribution(&connection, peer_index, &shared);
         start_sync_probe(&connection, peer_index, &shared);
         // One task per connection: with UP 0 persistent the handler runs for
         // the lifetime of the connection, so awaiting it here would stall the
@@ -560,6 +696,35 @@ async fn endpoint_task(
     }
 }
 
+/// Spawn the CE 135 distributor on this connection, if it claims this run's
+/// report.
+fn start_report_distribution(connection: &Conn, peer: u16, shared: &EmuShared) {
+    let connection = connection.clone();
+    let mut plans_set = shared.plans_set.clone();
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        while !*plans_set.borrow_and_update() {
+            if plans_set.changed().await.is_err() {
+                return;
+            }
+        }
+        let Some(plan) = shared.claim_report_plan(peer) else {
+            return;
+        };
+        crate::report_io::spawn_report_sender(
+            connection,
+            plan.slot,
+            plan.nut,
+            Arc::clone(&shared.ref_chain),
+            Arc::clone(&shared.trace),
+            Arc::clone(&shared.obs),
+            Arc::clone(&shared.distributed),
+            peer,
+        )
+        .await;
+    });
+}
+
 /// Spawn the ticket sender for `peer` once a plan exists and if its plan has
 /// not been taken yet.
 ///
@@ -569,7 +734,7 @@ async fn endpoint_task(
 /// map at connect time found it empty and delivered nothing.
 fn start_ticket_delivery(connection: &Conn, peer: u16, shared: &EmuShared) {
     let connection = connection.clone();
-    let mut plans_set = shared.ticket_plans_set.clone();
+    let mut plans_set = shared.plans_set.clone();
     let shared = shared.clone();
     tokio::spawn(async move {
         while !*plans_set.borrow_and_update() {
@@ -728,6 +893,30 @@ async fn handle_stream(
         CE129 => serve_state_request(&mut send, peer_index, &content, stream_id, trace, obs).await,
         CE131 | CE132 => {
             crate::ticket_io::handle_inbound_ticket(kind, &content, peer_index, obs).await;
+        }
+        // CE 134 is the NUT sharing a package it was given with its
+        // co-guarantors; CE 135 is it distributing the resulting report. Both
+        // are the node talking, so neither is refused -- the harness records
+        // what it said and the N3 lane grades it.
+        CE134 => {
+            crate::report_io::handle_inbound_sharing(
+                &content,
+                &mut reader,
+                &mut send,
+                peer_index,
+                obs,
+                &shared.sharing_seen,
+                &shared.sharing_answer,
+            )
+            .await;
+        }
+        CE135 => {
+            crate::report_io::handle_inbound_report(
+                &content,
+                peer_index,
+                obs,
+                &shared.reports_seen,
+            );
         }
         // Spec-known kinds outside this subset: reset rather than drop, so the
         // refusal is observable to the NUT (DESIGN.md `:477`).
@@ -1100,6 +1289,19 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 ///
 /// Public so the runner can record decisions it makes about a connection
 /// before any emulator code runs on it, such as the post-grace fallback dial.
+/// Seconds per slot (JAM common slot period).
+pub const SLOT_PERIOD_SEC: u64 = 6;
+
+/// Wall-clock milliseconds at which `slot` begins.
+///
+/// Wall clock, not run-relative: everything that schedules against a slot --
+/// ticket delivery, package submission -- is compared by the lanes against
+/// absolute slot starts, and a run-relative stamp would put every event
+/// before the run began.
+pub fn slot_start_ms(slot: u32) -> u64 {
+    (jam_types::JAM_COMMON_ERA + u64::from(slot) * SLOT_PERIOD_SEC) * 1000
+}
+
 pub fn record(obs: &Mutex<ObsLog>, peer: u16, kind: ObsKind) {
     let at = mono_ts();
     lock(obs).push(
@@ -1135,6 +1337,293 @@ mod tests {
         assert!(
             ports.iter().all(|&p| p >= 40001),
             "ports must be >= base + 1"
+        );
+        Ok(())
+    }
+
+    /// A share is answered with the reference's report hash and this
+    /// validator's signature over it (`simple.md:456`).
+    ///
+    /// The reply carries no kind byte: the node opened the stream, so what
+    /// comes back on it is a bare message. Getting that wrong would put a
+    /// stray 134 in front of the hash and the node would read the first 32
+    /// bytes of a 33-byte value.
+    #[tokio::test]
+    async fn a_ce134_share_is_answered_with_the_reference_hash_and_signature(
+    ) -> Result<(), EmuError> {
+        use jamnp_s::codec::ce131_136::{SharingContext, SharingReply};
+        use jamnp_s::framing::CE134;
+        use jamnp_s::transport::mock::MockNetwork;
+        use jamnp_s::transport::Transport;
+        use m2_reference::reports::SharingAnswer;
+        use std::time::Duration;
+
+        const GENESIS: [u8; 32] = [0xdd; 32];
+        const PEER: u16 = 1;
+        let net = MockNetwork::new();
+        let emu =
+            Emulator::n0_on(Arc::new(net.clone()), vec![PEER as usize], GENESIS, 40300).await?;
+        let addr = emu.local_addrs()[0];
+        let ref_chain = Arc::new(RefChain::tiny(0).map_err(chain_err)?);
+
+        let report_hash = [0x3c; 32];
+        let signature = [0x9e; 64];
+        *lock(&emu.sharing_answer) = Some(SharingAnswer {
+            report_hash,
+            // Validator 4 holds the core too; only this peer's own signature
+            // may come back on this stream.
+            signatures: vec![(PEER, signature), (4, [0x11; 64])],
+        });
+        let _accepting = emu.accept_loop(ref_chain);
+
+        let conn = net
+            .connect(
+                EndpointConfig {
+                    genesis_hash: GENESIS,
+                    builder: false,
+                },
+                SigningKey::from([9u8; 32]),
+                "peer".to_string(),
+                addr,
+            )
+            .await
+            .expect("the stand-in node reaches the emulated validator");
+
+        let (mut send, mut recv) = conn.open_bi().await.expect("CE 134 opens");
+        let context = SharingContext {
+            core_index: 0,
+            shard_count: 6,
+            mappings: Vec::new(),
+        };
+        send.write_all(&frame(CE134, &context.encode()))
+            .await
+            .expect("message 1 goes out");
+        send.write_all(&frame_message(&[0xab; 16]))
+            .await
+            .expect("message 2 goes out");
+        send.finish();
+
+        // We opened the stream, so the answer is a bare message under CE 134.
+        let mut reader = FrameReader::with_kind(CE134);
+        let mut buf = [0u8; 4096];
+        let answer = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(Some((_, content))) = reader.next_frame() {
+                    return content;
+                }
+                match recv.read(&mut buf).await {
+                    Ok(Some(n)) => reader.push(&buf[..n]),
+                    _ => return Vec::new(),
+                }
+            }
+        })
+        .await
+        .expect("the answer arrives in time");
+
+        let decoded = SharingReply::decode(&mut &answer[..]).expect("the answer is a CE 134 reply");
+        assert_eq!(decoded.report_hash.0, report_hash);
+        assert_eq!(
+            decoded.signature, signature,
+            "the peer signs as itself, not as another holder of the core"
+        );
+        Ok(())
+    }
+
+    /// The CE 133 submitter puts both messages on one stream and records the
+    /// node's answer.
+    ///
+    /// Driven directly rather than through the emulator's accept loop: the
+    /// submission is builder-to-guarantor and no longer rides a validator
+    /// connection, so the emulator does not spawn it. What is still worth
+    /// proving over the carrier is the sender itself -- two messages on one
+    /// stream, under the CE 133 kind byte, with the package unprefixed and
+    /// the extrinsic bodies concatenated.
+    #[tokio::test]
+    async fn a_ce133_submission_reaches_the_node_as_two_messages() -> Result<(), EmuError> {
+        use jamnp_s::framing::CE133;
+        use jamnp_s::transport::mock::MockNetwork;
+        use jamnp_s::transport::Transport;
+        use m2_reference::reports::ScheduledSubmission;
+        use std::time::Duration;
+
+        const GENESIS: [u8; 32] = [0xcc; 32];
+        let net = MockNetwork::new();
+        let config = EndpointConfig {
+            genesis_hash: GENESIS,
+            builder: false,
+        };
+        // A stand-in node, listening.
+        let node = net
+            .listen(
+                config.clone(),
+                SigningKey::from([7u8; 32]),
+                "127.0.0.1:40200".parse().expect("addr parses"),
+            )
+            .await
+            .expect("the stand-in node binds");
+        let addr = node.local_addr();
+
+        // Slot 0 is long past, so the sender does not wait for a slot start.
+        let package = vec![0xa1; 48];
+        let extrinsics = vec![vec![0x01, 0x02], vec![0x03]];
+        let plan = ScheduledSubmission {
+            slot: 0,
+            core: 1,
+            package: package.clone(),
+            package_hash: [0x5a; 32],
+            extrinsics: extrinsics.clone(),
+            co_guarantors: vec![2, 3],
+        };
+
+        let builder = net
+            .connect(
+                EndpointConfig {
+                    genesis_hash: GENESIS,
+                    builder: true,
+                },
+                SigningKey::from([9u8; 32]),
+                "peer".to_string(),
+                addr,
+            )
+            .await
+            .expect("the builder reaches the node");
+
+        let submissions = Arc::new(Mutex::new(Vec::new()));
+        let sender = tokio::spawn(crate::report_io::spawn_package_sender(
+            builder.clone(),
+            plan,
+            Arc::new(Mutex::new(Trace::default())),
+            Arc::new(Mutex::new(ObsLog::new())),
+            Arc::clone(&submissions),
+            0xB0,
+        ));
+
+        let incoming = tokio::time::timeout(Duration::from_secs(5), node.accept())
+            .await
+            .expect("the builder connects in time")
+            .expect("a connection arrives");
+        let connection = incoming
+            .established()
+            .await
+            .expect("the connection establishes");
+        let (_send, mut recv) =
+            tokio::time::timeout(Duration::from_secs(5), connection.accept_bi())
+                .await
+                .expect("the submission arrives in time")
+                .expect("a stream is opened");
+
+        let mut reader = FrameReader::new();
+        let mut buf = [0u8; 4096];
+        let mut messages: Vec<(u8, Vec<u8>)> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while messages.len() < 2 {
+                if let Ok(Some(item)) = reader.next_frame() {
+                    messages.push(item);
+                    continue;
+                }
+                match recv.read(&mut buf).await {
+                    Ok(Some(n)) => reader.push(&buf[..n]),
+                    _ => break,
+                }
+            }
+        })
+        .await
+        .expect("both messages arrive in time");
+
+        assert_eq!(messages.len(), 2, "two messages on one stream");
+        assert_eq!(messages[0].0, CE133, "under the CE 133 kind byte");
+        let mut expected_first = 1u16.encode();
+        expected_first.extend_from_slice(&package);
+        assert_eq!(
+            messages[0].1, expected_first,
+            "message 1 is the core index then the package, unprefixed"
+        );
+        assert_eq!(
+            messages[1].1,
+            vec![0x01, 0x02, 0x03],
+            "message 2 is the extrinsic bodies concatenated"
+        );
+
+        sender.abort();
+        assert_eq!(
+            lock(&submissions).first().map(|s| s.core),
+            Some(1),
+            "the submission is recorded against the core it named"
+        );
+        Ok(())
+    }
+
+    /// A CE 134 share the node opens is recorded whole: the context from
+    /// message 1 and the bundle from message 2.
+    ///
+    /// End to end over the carrier rather than by calling the handler, because
+    /// the thing most likely to be wrong is the dispatch -- a kind byte that
+    /// reaches the catch-all is refused, and the share would be lost with no
+    /// record that anything arrived.
+    #[tokio::test]
+    async fn a_ce134_share_from_the_node_is_recorded() -> Result<(), EmuError> {
+        use jamnp_s::codec::ce131_136::{SharingBundle, SharingContext};
+        use jamnp_s::framing::CE134;
+        use jamnp_s::transport::mock::MockNetwork;
+        use jamnp_s::transport::Transport;
+        use std::time::Duration;
+
+        const GENESIS: [u8; 32] = [0xbb; 32];
+        let net = MockNetwork::new();
+        let emu = Emulator::n0_on(Arc::new(net.clone()), vec![1], GENESIS, 40100).await?;
+        let addr = emu.local_addrs()[0];
+        let ref_chain = Arc::new(RefChain::tiny(0).map_err(chain_err)?);
+        let records = emu.sharing_seen();
+        let _accepting = emu.accept_loop(ref_chain);
+
+        let conn = net
+            .connect(
+                EndpointConfig {
+                    genesis_hash: GENESIS,
+                    builder: false,
+                },
+                SigningKey::from([9u8; 32]),
+                "peer".to_string(),
+                addr,
+            )
+            .await
+            .expect("the stand-in node reaches the emulated validator");
+
+        let context = SharingContext {
+            core_index: 1,
+            shard_count: 6,
+            mappings: vec![(jam_types::WorkPackageHash::from([0x11; 32]), [0x22; 32])],
+        };
+        let bundle = SharingBundle {
+            bundle: vec![0xab; 64],
+        };
+        let (mut send, _recv) = conn.open_bi().await.expect("CE 134 opens");
+        send.write_all(&frame(CE134, &context.encode()))
+            .await
+            .expect("message 1 goes out");
+        send.write_all(&frame_message(&bundle.encode()))
+            .await
+            .expect("message 2 goes out");
+        send.finish();
+
+        let seen = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(first) = lock(&records).first() {
+                    return first.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the share is recorded in time");
+
+        assert_eq!(seen.core_index, 1);
+        assert_eq!(seen.shard_count, 6);
+        assert_eq!(seen.mappings, context.mappings);
+        assert_eq!(
+            seen.bundle.as_deref(),
+            Some(&bundle.bundle[..]),
+            "the bundle is the message, with no length of its own"
         );
         Ok(())
     }

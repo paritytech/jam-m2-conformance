@@ -207,7 +207,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // between genesis and now has to be filled for the chain to be
         // current, and the entropy the tickets are later proved against is
         // read from its head.
+        let t = std::time::Instant::now();
         seed_past_slots(&ref_chain).map_err(internal)?;
+        phase("seed_past_slots", t);
         let epoch_contexts: EpochContexts = Arc::new(Mutex::new(Vec::new()));
         let emu = Emulator::n0(emu_indices.clone(), genesis_hash, cli.base_port)
             .await
@@ -266,6 +268,16 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // window, with the plan none the wiser. Planning against a node that
         // can already accept makes the slots the schedule names the slots the
         // tickets arrive in.
+        // The same readiness gate serves the package lane. A node still
+        // importing the chain it was handed is not guaranteeing anything
+        // either, and a submission aimed at a slot it spends catching up in
+        // would grade it for work it was never in a position to do.
+        if cli.lanes.needs_package() && !cli.lanes.needs_tickets() {
+            let t = std::time::Instant::now();
+            wait_until_the_node_can_accept_tickets(&shared, cli.observe_secs).await;
+            phase("readiness_gate", t);
+        }
+        let t_tickets = std::time::Instant::now();
         let (ticket_ctx, ticket_plan, target_epoch) = if cli.lanes.needs_tickets() {
             wait_until_the_node_can_accept_tickets(&shared, cli.observe_secs).await;
             plan_tickets_for_this_run(&ref_chain, nut_index)
@@ -277,6 +289,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             // for the node to be able to accept tickets costs more still.
             (ref_chain.ticket_ctx().map_err(internal)?, Vec::new(), 0)
         };
+        phase("ticket_plan", t_tickets);
         // Counted from the chain rather than from the seeding: by now
         // `drive_slots` has added blocks of its own, and the N0 lane compares
         // this against the reference chain the contexts are built from, which
@@ -288,6 +301,86 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // Each emulated validator's tickets go out on the connection to it,
         // whichever side opened it; the senders pick the plan up from here.
         emu.set_ticket_plans(plans_by_peer(&ticket_plan));
+        if cli.lanes.needs_package() {
+            let t = std::time::Instant::now();
+            // The lane aims one epoch ahead, and the epoch view can only
+            // answer for the cached epoch and the one after it. While the
+            // cache trails the head by more than an epoch the target
+            // resolves to nothing and the run exercises nothing at all --
+            // which is what a third of runs did.
+            //
+            // The cache advances on finalization, so this waits for it to
+            // catch up rather than planning against a view that cannot see
+            // where the submission is going.
+            wait_for_the_epoch_view_to_catch_up(&ref_chain, cli.observe_secs).await;
+            // Aiming into the next epoch can mean waiting most of one, so a
+            // window that closes first leaves the lane unexercised with
+            // nothing to say why.
+            let wait_secs = u64::from(
+                (ref_chain.next_slot() / jam_types::epoch_period() + 1) * jam_types::epoch_period()
+                    - ref_chain.next_slot(),
+            ) * m2_scenario::ctx::SLOT_PERIOD_MS
+                / 1000;
+            if wait_secs + MIN_SECS_AFTER_SUBMISSION > cli.observe_secs {
+                conn_findings.push(short_window_finding(wait_secs, cli.observe_secs));
+            }
+            match plan_package_for_this_run(&ref_chain, nut_index) {
+                Ok(plan) => {
+                    // The report to be included rides the same slot plan: it
+                    // is guaranteed on a core the NUT does not hold, so the
+                    // two never collide.
+                    let t_dist = std::time::Instant::now();
+                    match ref_chain.report_to_distribute(
+                        // A different payload from the submission's, or the
+                        // two are the same package and the node refuses the
+                        // second as a duplicate.
+                        vec![work_item_with_payload(b"n3-distributed".to_vec())],
+                        nut_index as u16,
+                        plan.slot,
+                    ) {
+                        Ok(Some(report)) => {
+                            eprintln!(
+                                "[assignment] distributing report on core {} in slot {}",
+                                report.core, report.slot
+                            );
+                            emu.set_report_plan(report)
+                        }
+                        // One core, or no assignment: the inclusion row says
+                        // it was not exercised rather than failing the node.
+                        Ok(None) => eprintln!(
+                            "[assignment] no report to distribute: the NUT holds no core at \
+                             slot {} in the epoch view, or there is only one core",
+                            plan.slot
+                        ),
+                        Err(e) => conn_findings.push(no_package_plan_finding(&e)),
+                    }
+                    phase("plan_package.report_to_distribute", t_dist);
+                    emu.set_submission_plan(plan);
+                    // CE 133 is builder -> guarantor, so it goes out over a
+                    // builder connection of its own rather than riding an
+                    // emulated validator's. polkajam hands out direct
+                    // submission slots by peer role, and a validator gets
+                    // none: the first real run was refused with `TooMany`,
+                    // the per-peer concurrency limit, having never been
+                    // offered a slot at all.
+                    let shared_for_builder = shared.clone();
+                    let san = nut_san.clone();
+                    dial_tasks.push(tokio::spawn(async move {
+                        submit_as_builder(nut_addr, san, genesis_hash, shared_for_builder).await;
+                    }));
+                }
+                // A run that cannot plan a submission still grades every
+                // other lane; N3 reports the rule as unexercised rather than
+                // failing the node for the harness's inability to ask.
+                Err(e) => conn_findings.push(no_package_plan_finding(&e)),
+            }
+            phase("plan_package", t);
+        }
+        let submissions = emu.submissions();
+        let sharing_answer = emu.sharing_answer();
+        let distributed = emu.distributed();
+        let sharing_seen = emu.sharing_seen();
+        let reports_seen = emu.reports_seen();
         let ce128_probes = emu.ce128_probes();
         let ce129_probes = emu.ce129_probes();
         let real_run = RealRunData {
@@ -300,6 +393,11 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             nut_index,
             emu_indices: emu_indices.clone(),
             epoch_contexts,
+            submissions,
+            sharing_seen,
+            reports_seen,
+            sharing_answer,
+            distributed,
         };
         (
             ObsSource::Emulator {
@@ -307,7 +405,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                 trace,
                 ce128_probes,
                 ce129_probes,
-                _emu: emu,
+                _emu: Box::new(emu),
             },
             count,
             dial_tasks,
@@ -316,9 +414,11 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     };
 
     if !dial_tasks.is_empty() {
+        let t = std::time::Instant::now();
         jamnp_s::clock::current()
             .sleep(Duration::from_secs(cli.observe_secs))
             .await;
+        phase("observation_window", t);
     }
     // Abort rather than drop: dropping a `JoinHandle` detaches the task, so the
     // slot driver would keep authoring into the reference chain while the
@@ -328,6 +428,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     }
     drop(dial_tasks);
 
+    let t_ctx = std::time::Instant::now();
     let run_ctx = match &source {
         ObsSource::Emulator {
             trace,
@@ -369,11 +470,14 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         }
     };
 
+    phase("build_run_ctx", t_ctx);
+    let t_eval = std::time::Instant::now();
     let evaluation = match &source {
         ObsSource::Emulator { obs, .. } => evaluate(&lock(obs), &run_ctx, cli.lanes),
         ObsSource::Fabricated { log, .. } => evaluate(log, &run_ctx, cli.lanes),
     };
 
+    phase("evaluate", t_eval);
     // §4.6 teardown: kill the NUT (stdout/stderr already collected by `spawn`).
     if let Some(nut) = nut.take() {
         launch::kill(nut).await.map_err(internal)?;
@@ -627,6 +731,315 @@ fn empty_ticket_plan_finding(ref_chain: &RefChain, target_epoch: u32) -> Finding
              epoch {target_epoch} has closed, so the ticket lanes are not exercised",
             now % jam_types::epoch_period()
         ),
+    }
+}
+
+/// How much of its rotation the node is left to work in.
+///
+/// Sharing is given ~3 s by DESIGN §11 N3, and distributing the report
+/// follows it; two slots is twelve seconds, which clears both without
+/// pushing the submission so far into the rotation that a slow node runs out
+/// of room through no fault of its own.
+const SUBMISSION_MARGIN_SLOTS: u32 = 2;
+
+/// Build this run's CE 133 submission: one trivial work item, aimed at a slot
+/// the NUT guarantees a core in with room left to act.
+fn plan_package_for_this_run(
+    ref_chain: &RefChain,
+    nut_index: usize,
+) -> Result<m2_reference::reports::SubmissionSchedule, m2_reference::chain::ChainError> {
+    // Into the *next* epoch, not the next slot.
+    //
+    // The two core assignments read different entries of the entropy buffer.
+    // `core_assignments_for` takes entry 2 for a slot in the head's own epoch
+    // and entry 1 for one in the next; the cached epoch view a guarantor
+    // shares by carries entry 1 either way. So they disagree for a slot in
+    // the head's epoch and agree for a slot in the next one -- which is the
+    // whole of why this lane passed every row in one run and failed the
+    // sharing row in the next, with the run's start time as the only
+    // variable.
+    //
+    // Aiming into the next epoch puts the submission where the node's
+    // sharing cohort and the on-chain rule provably read the same entropy,
+    // so the lane grades an assignment both sides agree on instead of
+    // picking a side. Which of the two is authoritative for a same-epoch
+    // slot is a separate question, recorded in findings.md.
+    //
+    // A few slots *into* that epoch, not its first slot. The node's cached
+    // epoch view rotates on finalization, which trails the head, so at the
+    // boundary itself it is still shuffling by the old epoch's entropy and
+    // shares with the old cohort -- a run that aimed at the first slot of an
+    // epoch saw the node open CE 134 to one co-guarantor instead of two even
+    // though both views agreed on paper.
+    //
+    // Aimed from the *cached* epoch, not from the head. The epoch view
+    // resolves the cached epoch and the one after it, so aiming at
+    // `cached + 1` is resolvable by construction. Aiming from the head is
+    // not: the run waits for the cache to catch up and then reads the head
+    // again, and a head that crosses an epoch in between puts the target two
+    // epochs past the cache, which resolves to nothing and leaves the whole
+    // lane unexercised. Three runs in five did exactly that, all of them
+    // near a boundary.
+    let epoch = jam_types::epoch_period();
+    let (cached_epoch_index, state_epoch_index) = ref_chain.epoch_views();
+    let base = cached_epoch_index.max(state_epoch_index);
+    let from = (base + 1) * epoch + EPOCH_SETTLE_SLOTS;
+    let plan = ref_chain
+        .submission_slot_for(nut_index as u16, from, SUBMISSION_MARGIN_SLOTS)
+        .ok_or_else(|| {
+            m2_reference::chain::ChainError::Chain(format!(
+                "no slot at or after {from} leaves {SUBMISSION_MARGIN_SLOTS} slots of its \
+                 rotation for the node to act in"
+            ))
+        })?;
+    eprintln!(
+        "[assignment] aiming at slot {} (epoch {}), head is slot {} (epoch {})",
+        plan.slot,
+        plan.slot / epoch,
+        ref_chain.next_slot(),
+        ref_chain.next_slot() / epoch
+    );
+    let (cached_epoch, state_epoch) = ref_chain.epoch_views();
+    let (cached_entropy, entropy1, entropy2) = ref_chain.assignment_entropy();
+    eprintln!(
+        "[assignment] entropy: cached {cached_entropy}  best-block[1] {entropy1}  \
+         best-block[2] {entropy2}  -> cached matches {}",
+        if cached_entropy == entropy2 {
+            "entry 2 (the on-chain rule)"
+        } else if cached_entropy == entropy1 {
+            "entry 1 (one epoch ahead)"
+        } else {
+            "neither"
+        }
+    );
+    eprintln!(
+        "[assignment] cached epoch view {cached_epoch}, best-block state epoch {state_epoch}{}",
+        if cached_epoch == state_epoch {
+            ""
+        } else {
+            "  <-- CACHE LAGS THE STATE"
+        }
+    );
+    eprintln!(
+        "[assignment] reference head slot {} (epoch {}), submission slot {} (epoch {})",
+        ref_chain.best_slot(),
+        ref_chain.best_slot() / jam_types::epoch_period(),
+        plan.slot,
+        plan.slot / jam_types::epoch_period()
+    );
+    // The whole assignment at the submission slot, so a disagreement with the
+    // node over who holds a core is visible in the run rather than inferred
+    // from which peers it talked to.
+    for core in 0..jam_types::core_count() {
+        eprintln!(
+            "[assignment] slot {} core {core}: storage {:?} epoch {:?}",
+            plan.slot,
+            ref_chain.guarantors_for(core, plan.slot),
+            ref_chain.guarantors_for_in_epoch(core, plan.slot),
+        );
+    }
+    Ok(m2_reference::reports::SubmissionSchedule {
+        slot: plan.slot,
+        core: plan.core,
+        co_guarantors: plan.co_guarantors,
+    })
+}
+
+/// A work item with a distinguishing payload, so two packages built in one
+/// run are two packages.
+///
+/// The submission and the distributed report were once both built from the
+/// empty item, which made them one package: the node noted the report and
+/// then refused the submission as already reported.
+fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
+    jam_node::hazmat::BuildItem::new(
+        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+        jam_types::WorkPayload(payload),
+        jam_types::max_refine_gas(),
+        jam_types::max_accumulate_gas(),
+        Vec::new(),
+        Vec::new(),
+        0,
+    )
+}
+
+/// Wait until the chain's cached epoch view names the epoch its own head is
+/// in.
+///
+/// `EpochInfo` is refreshed when a block is finalized, so it trails the head
+/// by however far finality is behind. The lane plans one epoch ahead of the
+/// head and the view resolves only the cached epoch and the next, so a cache
+/// two or more epochs behind cannot answer for the slot the submission is
+/// aimed at and no plan is made.
+///
+/// Bounded, and silent on expiry: a cache that never catches up leaves the
+/// plan to fail on its own and report the rule unexercised, which is the
+/// truth. Budgeted in protocol time against the same clock the slots come
+/// from, so a virtual clock does not wait forever.
+async fn wait_for_the_epoch_view_to_catch_up(ref_chain: &RefChain, budget_secs: u64) {
+    let clock = jamnp_s::clock::current();
+    let deadline = clock
+        .mono_ms()
+        .saturating_add((budget_secs / 2).saturating_mul(1000));
+    while clock.mono_ms() < deadline {
+        let (cached, state) = ref_chain.epoch_views();
+        if cached >= state {
+            return;
+        }
+        clock
+            .sleep(Duration::from_millis(NODE_READINESS_POLL_MS))
+            .await;
+    }
+}
+
+/// Stderr phase marker, so a run that stalls says which phase it stalled in.
+///
+/// A conformance run is minutes of mostly-silent waiting, and when one hangs
+/// the node's own log is the only clock -- it shows the symptom and never the
+/// phase. These lines are the harness's own clock.
+pub(crate) fn phase(label: &str, started: std::time::Instant) {
+    eprintln!("[phase] {label}: {:?}", started.elapsed());
+}
+
+/// Peer index the CE 133 builder is recorded under.
+///
+/// Outside the validator range on purpose: a builder is not a validator, and
+/// an N0 row keyed on a validator peer could otherwise read the builder's
+/// traffic as its own.
+pub(crate) const BUILDER_PEER: u16 = 0xB0;
+
+/// Slots before the submission at which its package is built.
+///
+/// Two opposing bounds, both measured against a live node. Build against the
+/// very head and the node refuses the submission: it has not imported that
+/// block yet, so the anchor is unknown. Build far enough back and the anchor
+/// ages out of recent history -- about eleven slots ahead is accepted and
+/// about fourteen is not. A couple of slots sits inside both.
+const PACKAGE_BUILD_LEAD_SLOTS: u32 = 2;
+
+/// Open a builder connection to the NUT and submit this run's work package.
+///
+/// The package is built `PACKAGE_BUILD_LEAD_SLOTS` before the slot and the
+/// connection dialled at it. Both are timing, not ceremony: the anchor has a
+/// window, and a connection opened early and held idle is one QUIC closes
+/// under us.
+async fn submit_as_builder(
+    addr: SocketAddr,
+    expected_san: String,
+    genesis_hash: [u8; 32],
+    shared: m2_emu::emu::EmuShared,
+) {
+    let Some(schedule) = shared.take_submission_plan() else {
+        eprintln!("[builder] no submission plan to claim");
+        return;
+    };
+    sleep_until_slot(schedule.slot.saturating_sub(PACKAGE_BUILD_LEAD_SLOTS)).await;
+    let (plan, answer) = match shared.ref_chain.submission_now(&schedule) {
+        Ok(built) => built,
+        Err(e) => {
+            eprintln!("[builder] could not build the package: {e}");
+            return;
+        }
+    };
+    // In place before the node can share, which it does within milliseconds
+    // of accepting.
+    *shared
+        .sharing_answer
+        .lock()
+        .expect("the sharing answer lock is never poisoned") = Some(answer);
+    eprintln!(
+        "[builder] built for slot {} against head {}",
+        schedule.slot,
+        shared.ref_chain.next_slot()
+    );
+
+    sleep_until_slot(schedule.slot).await;
+    let mut seed = [0u8; 32];
+    seed[0] = 0xB0;
+    seed[1] = 0xD1;
+    use jamnp_s::transport::Transport as _;
+    let connected = jamnp_s::transport::quic::QuicTransport
+        .connect(
+            jamnp_s::endpoint::EndpointConfig {
+                genesis_hash,
+                builder: true,
+            },
+            ed25519_consensus::SigningKey::from(seed),
+            expected_san,
+            addr,
+        )
+        .await;
+    let connection = match connected {
+        Ok(connection) => connection,
+        Err(e) => {
+            eprintln!("[builder] could not connect as a builder: {e}");
+            return;
+        }
+    };
+    m2_emu::report_io::spawn_package_sender(
+        connection.clone(),
+        plan,
+        Arc::clone(&shared.trace),
+        Arc::clone(&shared.obs),
+        Arc::clone(&shared.submissions),
+        BUILDER_PEER,
+    )
+    .await;
+    drop(connection);
+}
+
+/// Wait until `slot` begins.
+async fn sleep_until_slot(slot: u32) {
+    let target_ms = m2_emu::emu::slot_start_ms(slot);
+    loop {
+        let now = jamnp_s::trace::wall_ts();
+        if now >= target_ms {
+            return;
+        }
+        jamnp_s::clock::current()
+            .sleep(Duration::from_millis(target_ms - now))
+            .await;
+    }
+}
+
+/// Slots to let an epoch settle before submitting into it.
+///
+/// Zero, measured. Three was tried and made the lane strictly worse: five
+/// consecutive runs scored no passes at all. Aiming that far out puts the
+/// slot beyond the cached epoch view, which knows only the current epoch and
+/// the next, and the submitted package's anchor ages out of recent history
+/// over the longer wait. See findings.md 2.
+const EPOCH_SETTLE_SLOTS: u32 = 0;
+
+/// Seconds the node needs after a submission to share, be answered, build a
+/// guarantee and distribute it. Measured at a few seconds in practice; this
+/// leaves room for a slow one.
+const MIN_SECS_AFTER_SUBMISSION: u64 = 30;
+
+/// Reported when the observation window closes before the submission slot.
+fn short_window_finding(wait_secs: u64, observe_secs: u64) -> Finding {
+    Finding {
+        severity: "soft".into(),
+        spec_citation: "simple.md :351-376".into(),
+        slot: None,
+        evidence: "work-package plan".into(),
+        message: format!(
+            "the submission slot is {wait_secs} s away and the window is {observe_secs} s, so \
+             N3 will not be exercised; the lane aims into the next epoch, so it needs at least \
+             {} s",
+            wait_secs + MIN_SECS_AFTER_SUBMISSION
+        ),
+    }
+}
+
+/// Reported when the harness could not pose the CE 133 row at all.
+fn no_package_plan_finding(error: &m2_reference::chain::ChainError) -> Finding {
+    Finding {
+        severity: "soft".into(),
+        spec_citation: "simple.md :351-376".into(),
+        slot: None,
+        evidence: "work-package plan".into(),
+        message: format!("no work package submitted, so N3's CE 133 row is not exercised: {error}"),
     }
 }
 
@@ -934,6 +1347,9 @@ mod tests {
     /// `RefChain` forces because the compiler backend needs a userfaultfd
     /// sandbox. N3 schedules work packages into slots, so the figure decides
     /// whether that calendar is realistic.
+    /// The NUT's validator index in the anchored test chain.
+    const TEST_NUT_INDEX: u16 = 5;
+
     /// A reference chain anchored to the current epoch, seeded to the present.
     ///
     /// Everything about guaranteeing needs one: assignments come from the
@@ -948,7 +1364,7 @@ mod tests {
         let anchor = m2_reference::chain::current_epoch_start_slot();
         let spec = spec::tiny_spec(&loopback_ips(), &ports, anchor)
             .map_err(|e| m2_reference::chain::ChainError::Chain(e.to_string()))?;
-        let chain = RefChain::with_spec(5, spec)?;
+        let chain = RefChain::with_spec(TEST_NUT_INDEX as usize, spec)?;
         seed_past_slots(&chain)?;
         Ok(chain)
     }
@@ -957,8 +1373,8 @@ mod tests {
     /// assignment agree. A harness that read them apart would grade a node
     /// against a split the engine never made.
     #[test]
-    fn the_assignment_is_a_partition_and_both_directions_agree()
-    -> Result<(), m2_reference::chain::ChainError> {
+    fn the_assignment_is_a_partition_and_both_directions_agree(
+    ) -> Result<(), m2_reference::chain::ChainError> {
         let chain = anchored_chain(42000)?;
         let slot = chain.best_slot();
         let mut seen = Vec::new();
@@ -982,7 +1398,9 @@ mod tests {
             "every validator holds exactly one core"
         );
         assert!(
-            chain.guarantors_for(jam_types::core_count(), slot).is_none(),
+            chain
+                .guarantors_for(jam_types::core_count(), slot)
+                .is_none(),
             "a core outside the active set has no holders"
         );
         Ok(())
@@ -1043,6 +1461,187 @@ mod tests {
         Ok(())
     }
 
+    /// The submission slot keeps the NUT on one core for the whole window.
+    ///
+    /// That is the only thing the margin is for. A package submitted in the
+    /// last slot of a rotation names a core the node stops holding before it
+    /// can share and distribute, and the lane would record a node that did
+    /// nothing wrong as having failed to share.
+    #[test]
+    fn a_submission_slot_holds_its_core_for_the_whole_margin(
+    ) -> Result<(), m2_reference::chain::ChainError> {
+        let chain = anchored_chain(47000)?;
+        let margin = 2u32;
+        let rotation = jam_types::rotation_period();
+
+        // Every starting point in a rotation, so the one that has to skip
+        // ahead is covered rather than whichever the clock happens to land on.
+        for offset in 0..rotation {
+            let from = chain.best_slot() + offset;
+            let plan = chain
+                .submission_slot_for(TEST_NUT_INDEX, from, margin)
+                .expect("a slot within one rotation always qualifies");
+            assert!(plan.slot >= from, "the plan never aims into the past");
+            assert!(
+                plan.slot < from + rotation,
+                "and never further than one rotation out"
+            );
+            assert_eq!(
+                chain.core_for(TEST_NUT_INDEX, plan.slot),
+                Some(plan.core),
+                "the plan names the core the NUT actually holds"
+            );
+            for slot in plan.slot..plan.slot + margin {
+                assert_eq!(
+                    chain.core_for(TEST_NUT_INDEX, slot),
+                    Some(plan.core),
+                    "the core must not move under the node during the window \
+                     (start {}, slot {slot})",
+                    plan.slot
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A margin no rotation can satisfy has no answer, rather than a slot
+    /// that silently fails to hold.
+    #[test]
+    fn a_margin_longer_than_a_rotation_has_no_submission_slot(
+    ) -> Result<(), m2_reference::chain::ChainError> {
+        let chain = anchored_chain(48000)?;
+        assert!(
+            chain
+                .submission_slot_for(
+                    TEST_NUT_INDEX,
+                    chain.best_slot(),
+                    jam_types::rotation_period() + 1
+                )
+                .is_none(),
+            "no slot has more than a rotation left in its rotation"
+        );
+        Ok(())
+    }
+
+    /// CE 133's extrinsic message is the bodies concatenated, and the only
+    /// thing that says where one ends is the package's own declared lengths.
+    ///
+    /// Against a real package, not a hand-made one: `extrinsic_lens` reads a
+    /// nested field of the engine's `WorkPackage`, and a hand-made package
+    /// would only prove that my own two sides agree.
+    #[test]
+    fn the_extrinsic_message_is_split_by_the_packages_declared_lengths(
+    ) -> Result<(), m2_reference::chain::ChainError> {
+        use jamnp_s::codec::ce131_136::{extrinsic_lens, WorkPackageSubmission};
+
+        let chain = anchored_chain(46000)?;
+        let bodies = vec![vec![1u8, 2, 3], vec![4u8, 5]];
+        let item = jam_node::hazmat::BuildItem::new(
+            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+            jam_types::WorkPayload(Vec::new()),
+            jam_types::max_refine_gas(),
+            jam_types::max_accumulate_gas(),
+            bodies.clone(),
+            Vec::new(),
+            0,
+        );
+        let built = chain.build_work_package(vec![item]);
+
+        assert_eq!(
+            built.extrinsics, bodies,
+            "the builder hands back the bodies it was given"
+        );
+        let lens = extrinsic_lens(&built.package);
+        assert_eq!(
+            lens,
+            vec![3u32, 2],
+            "the package declares each body's length, in wire order"
+        );
+        assert_eq!(
+            lens.iter().sum::<u32>(),
+            built.package.saturated_extrinsic_size(),
+            "and they sum to the size the message must have"
+        );
+
+        let submission =
+            WorkPackageSubmission::from_package(0, &built.package, built.extrinsics.clone());
+        let wire = submission.encode_extrinsics();
+        assert_eq!(
+            wire,
+            vec![1u8, 2, 3, 4, 5],
+            "the message is the bodies and nothing else"
+        );
+        assert_eq!(
+            WorkPackageSubmission::decode_extrinsics(&wire, &lens).unwrap(),
+            bodies,
+            "and the declared lengths cut it back apart"
+        );
+        Ok(())
+    }
+
+    /// The builder-side package is submittable: it fits under the CE 133 cap,
+    /// and the unauthorized variant differs from it *only* in the authorizer.
+    ///
+    /// That last part is the whole value of the fault. If the two packages
+    /// differed anywhere else, a node refusing the unauthorized one would
+    /// prove nothing about authorization -- it could be rejecting the
+    /// difference instead.
+    #[test]
+    fn the_unauthorized_package_differs_only_in_its_authorizer(
+    ) -> Result<(), m2_reference::chain::ChainError> {
+        use jamnp_s::codec::ce131_136::WorkPackageSubmission;
+
+        let chain = anchored_chain(45000)?;
+        let item = || {
+            jam_node::hazmat::BuildItem::new(
+                jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+                jam_types::WorkPayload(Vec::new()),
+                jam_types::max_refine_gas(),
+                jam_types::max_accumulate_gas(),
+                Vec::new(),
+                Vec::new(),
+                0,
+            )
+        };
+        let good = chain.build_work_package(vec![item()]);
+        let bad = chain.build_unauthorized_package(vec![item()]);
+
+        let submission = WorkPackageSubmission::from_package(0, &good.package, Vec::new());
+        assert!(
+            submission.validate_initial_size(),
+            "a one-item package must fit the CE 133 initial message"
+        );
+        assert_eq!(
+            good.extrinsics, bad.extrinsics,
+            "the two packages carry the same extrinsic bodies"
+        );
+
+        assert_ne!(
+            good.package.authorizer.code_hash, bad.package.authorizer.code_hash,
+            "the unauthorized package must name an authorizer the core does not have"
+        );
+        assert_eq!(
+            codec::Encode::encode(&good.package.items),
+            codec::Encode::encode(&bad.package.items),
+            "the work items must be identical, or the fault proves nothing"
+        );
+        assert_eq!(
+            codec::Encode::encode(&good.package.context),
+            codec::Encode::encode(&bad.package.context),
+            "the refine context must be identical too"
+        );
+
+        // CE 133 addresses a core, so the lane needs the NUT to hold one at
+        // the slot it submits in. Without this the submission has nowhere to
+        // go and the lane's first row is unreachable.
+        let slot = chain.best_slot();
+        assert!(
+            chain.core_for(TEST_NUT_INDEX, slot).is_some(),
+            "the NUT must guarantee some core at the slot a package is submitted in"
+        );
+        Ok(())
+    }
+
     /// A CE 133 submission carries the real package, and `package()` is the
     /// exact inverse of `from_package`.
     ///
@@ -1050,8 +1649,8 @@ mod tests {
     /// engine actually built: a hand-made one would agree with a codec that
     /// got the field order wrong, because both sides would be mine.
     #[test]
-    fn a_submission_round_trips_the_real_work_package()
-    -> Result<(), m2_reference::chain::ChainError> {
+    fn a_submission_round_trips_the_real_work_package(
+    ) -> Result<(), m2_reference::chain::ChainError> {
         use jamnp_s::codec::ce131_136::WorkPackageSubmission;
 
         let chain = anchored_chain(44000)?;

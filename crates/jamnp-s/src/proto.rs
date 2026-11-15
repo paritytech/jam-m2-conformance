@@ -524,7 +524,9 @@ mod tests {
                 Message::Ce134SharingBundle(SharingBundle {
                     bundle: vec![0xaa; 4],
                 }),
-                vec![0x04, 0xaa, 0xaa, 0xaa, 0xaa],
+                // The message is the bundle: the frame's length delimits it,
+                // so it carries no second length of its own.
+                vec![0xaa, 0xaa, 0xaa, 0xaa],
             ),
             (
                 Message::Ce134Reply(SharingReply {

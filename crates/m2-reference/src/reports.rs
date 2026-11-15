@@ -19,12 +19,413 @@ use crate::chain::{ChainError, RefChain};
 /// guarantee, and the report is what a block must come to carry.
 pub struct GuaranteedWork {
     pub package: jam_types::WorkPackage,
+    /// The extrinsic bodies the package declares, in wire order. CE 133's
+    /// second message is these concatenated, so the submission needs them
+    /// from the same build as the package: building twice would re-read the
+    /// chain head and could produce a different package entirely.
+    pub extrinsics: Vec<Vec<u8>>,
     pub report: jam_std_common::WorkReport,
     pub bundle: Vec<u8>,
     pub guarantee: jam_std_common::ReportGuarantee,
 }
 
+/// The GP work-package hash, as the engine computes it.
+///
+/// Not recomputed here. CE 134's mappings are keyed by this hash, so the lane
+/// correlates what the node shared with what the harness submitted by it, and
+/// a harness that hashed packages its own way would be comparing its
+/// arithmetic against the node's rather than the node against the protocol.
+pub fn package_hash(package: &jam_types::WorkPackage) -> jam_types::WorkPackageHash {
+    jam_std_common::ImmutableWorkPackage::from(package).hash()
+}
+
+/// A CE 133 submission the harness will make, resolved down to wire values.
+///
+/// The package is carried encoded because that is what goes on the wire and
+/// what the faults act on: an oversized initial message is a property of the
+/// bytes, not of the structure.
+#[derive(Debug, Clone)]
+pub struct ScheduledSubmission {
+    /// Slot to submit in; see [`RefChain::submission_slot_for`].
+    pub slot: u32,
+    /// Core index to address the submission to.
+    ///
+    /// Normally the core the NUT holds at `slot`. The "not a guarantor" fault
+    /// is exactly this field naming a different one.
+    pub core: u16,
+    /// GP-encoded work package.
+    pub package: Vec<u8>,
+    /// Hash of that package, for correlating with what the node shares.
+    pub package_hash: [u8; 32],
+    /// Extrinsic bodies, in the order the package declares them.
+    pub extrinsics: Vec<Vec<u8>>,
+    /// The validators that hold `core` at `slot` alongside the NUT.
+    ///
+    /// Computed here, off the engine's assignment, because it is the set the
+    /// node is expected to share with. A harness that derived it itself would
+    /// be grading the node against its own arithmetic rather than against the
+    /// chain.
+    pub co_guarantors: Vec<u16>,
+}
+
+/// The epoch info `slot` belongs to, out of the two the chain holds.
+///
+/// `EpochInfo::core_assignments` requires the slot to be in that epoch, and
+/// the chain only ever holds the current one and the next. Asking the current
+/// epoch about a slot in the next gives an assignment for neither: a run
+/// whose reference head sat in epoch 815091 while the submission slot had
+/// crossed into 815092 graded the node against exactly that, and the sharing
+/// row failed for a split the node never made.
+///
+/// `None` for anything outside those two, which is the honest answer rather
+/// than a shuffle computed from the wrong entropy.
+fn epoch_info_for<'a, E>(
+    slot: u32,
+    current_index: u32,
+    current: &'a E,
+    next: &'a E,
+) -> Option<&'a E> {
+    let slot_epoch = slot / jam_types::epoch_period();
+    if slot_epoch == current_index {
+        Some(current)
+    } else if slot_epoch == current_index + 1 {
+        Some(next)
+    } else {
+        None
+    }
+}
+
+/// The smallest work item that refines: no payload, no imports, no
+/// extrinsics.
+pub fn trivial_work_item() -> jam_node::hazmat::BuildItem {
+    work_item_with_payload(Vec::new())
+}
+
+/// The same item with a distinguishing payload, so two packages built in one
+/// run are two packages.
+///
+/// The submission and the distributed report are built moments apart from
+/// the same template. Given the same payload they are byte-identical, and a
+/// node that has noted one refuses the other as already reported -- which
+/// reads as the submission being rejected, not as a duplicate.
+pub fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
+    jam_node::hazmat::BuildItem::new(
+        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+        jam_types::WorkPayload(payload),
+        jam_types::max_refine_gas(),
+        jam_types::max_accumulate_gas(),
+        Vec::new(),
+        Vec::new(),
+        0,
+    )
+}
+
+/// When and where to submit, with no package attached.
+///
+/// The package is built a few slots before the slot, not when the run is
+/// planned. Its refine context is anchored to the chain head at build time,
+/// and the anchor has to satisfy two opposing bounds: recent enough to still
+/// be in the node's recent history, old enough that the node has imported
+/// it. Measured against a live node, about eleven slots ahead is accepted
+/// and about fourteen is not, while building against the very head is
+/// refused outright.
+#[derive(Debug, Clone)]
+pub struct SubmissionSchedule {
+    pub slot: u32,
+    pub core: u16,
+    /// Validators holding `core` at `slot` besides the NUT.
+    pub co_guarantors: Vec<u16>,
+}
+
+/// A guaranteed work-report the harness distributes over CE 135, so the node
+/// can be graded on including it.
+#[derive(Debug, Clone)]
+pub struct ScheduledReport {
+    /// Slot to distribute in.
+    pub slot: u32,
+    /// Core the report is guaranteed on.
+    pub core: u16,
+    /// The node under test, carried so the sender can recompose near the
+    /// slot without re-deriving which core to avoid.
+    pub nut: u16,
+    /// The emulated validator that must put this on the wire.
+    ///
+    /// A node validates a received guarantee against the peer that sent it
+    /// and refuses one carrying `No signature from peer` -- in those words.
+    /// So the sender has to be one of the signers, which is a property of
+    /// the cohort and not of whichever connection happened to claim the plan.
+    pub sender: u16,
+    /// Hash of the report, which is what a block's guarantees are read by.
+    pub report_hash: [u8; 32],
+    /// The encoded `Guaranteed Work-Report` (`simple.md:478`).
+    pub wire: Vec<u8>,
+}
+
+/// What an emulated co-guarantor answers a CE 134 share with
+/// (`simple.md:456`): the hash of the refined work-report, and a signature
+/// over it that can go into a guaranteed work-report.
+///
+/// Computed from the package the harness submitted rather than from the
+/// bundle the node shares back. That is deliberate twice over: decoding a
+/// bundle would make the harness's answer depend on the node getting the
+/// bundle right, and the reference report is the value the lane compares the
+/// node's against anyway. A node that refined something else will disagree
+/// with this hash, which is the finding, not an error.
+#[derive(Debug, Clone)]
+pub struct SharingAnswer {
+    /// Hash of the report the reference refined from the submitted package.
+    pub report_hash: [u8; 32],
+    /// One signature per validator holding the core, by validator index.
+    ///
+    /// Includes the NUT's own, which the harness never sends: the engine
+    /// signs for every holder because it has every keyset, and filtering it
+    /// out here would leave the emulator deciding who may answer.
+    pub signatures: Vec<(u16, [u8; 64])>,
+}
+
+impl GuaranteedWork {
+    /// The CE 134 answer for `cohort`: the report's hash, and each listed
+    /// validator's own signature over it.
+    ///
+    /// Signed per validator rather than taken from `self.guarantee`. The
+    /// guarantee is composed over the storage view of the assignment, while a
+    /// node shares with the cohort its *epoch* view names, and the two
+    /// disagree -- so the guarantee holds no signature for the validators
+    /// that actually receive the share. Answering with nothing left the node
+    /// unable to assemble a guarantee at all, and no CE 135 was ever sent.
+    ///
+    /// The message is `jam_guarantee ++ hash`, which is the engine's own
+    /// [`ed25519::Message::Guarantee`], so the bytes are not reconstructed
+    /// here.
+    pub fn sharing_answer_for(&self, cohort: &[u16]) -> SharingAnswer {
+        let hash = self.report.hash();
+        SharingAnswer {
+            report_hash: hash.0,
+            signatures: cohort
+                .iter()
+                .map(|&validator| {
+                    let secret =
+                        jam_std_common::SecretKeyset::trivial(u32::from(validator)).ed25519;
+                    (
+                        validator,
+                        secret
+                            .sign(&jam_std_common::ed25519::Message::Guarantee(hash))
+                            .to_bytes(),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl SharingAnswer {
+    /// The signature `validator` should reply with, if it holds the core.
+    pub fn signature_for(&self, validator: u16) -> Option<[u8; 64]> {
+        self.signatures
+            .iter()
+            .find(|(index, _)| *index == validator)
+            .map(|(_, signature)| *signature)
+    }
+}
+
+/// Where a CE 133 submission is aimed: a slot, and the core the NUT holds
+/// at that slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionPlan {
+    pub slot: u32,
+    pub core: CoreIndex,
+    /// The validators holding `core` at `slot` besides the NUT: who it is
+    /// expected to open CE 134 to.
+    pub co_guarantors: Vec<u16>,
+}
+
+/// A package as a builder would put it on CE 133, with the extrinsic bodies
+/// that go with it as message 2.
+///
+/// Separate from [`GuaranteedWork`] because CE 133 is the builder-to-guarantor
+/// hop, where the *node* does the refining. Refining here would be wasted
+/// work, and worse, it would assert that the reference holds the core --
+/// which on a CE 133 submission is exactly the validator the package is being
+/// sent to, not us.
+pub struct BuiltPackage {
+    pub package: jam_types::WorkPackage,
+    pub extrinsics: Vec<Vec<u8>>,
+}
+
 impl RefChain {
+    /// Build this run's package against the current chain head, with the
+    /// CE 134 answer its co-guarantors will give.
+    ///
+    /// Called a few slots before the submission so the anchor lands inside
+    /// the window on [`SubmissionSchedule`].
+    pub fn submission_now(
+        &self,
+        schedule: &SubmissionSchedule,
+    ) -> Result<(ScheduledSubmission, SharingAnswer), ChainError> {
+        let work = self.guarantee_work(vec![trivial_work_item()], schedule.core)?;
+        let answer = work.sharing_answer_for(&schedule.co_guarantors);
+        Ok((
+            ScheduledSubmission {
+                slot: schedule.slot,
+                core: schedule.core,
+                package: jam_types::Encode::encode(&work.package),
+                package_hash: package_hash(&work.package).0,
+                extrinsics: work.extrinsics,
+                co_guarantors: schedule.co_guarantors.clone(),
+            },
+            answer,
+        ))
+    }
+
+    /// Build `items` into an authorized package for a builder to submit.
+    pub fn build_work_package(&self, items: Vec<jam_node::hazmat::BuildItem>) -> BuiltPackage {
+        let (package, extrinsics) = self.harness().build_package(items);
+        BuiltPackage {
+            package,
+            extrinsics,
+        }
+    }
+
+    /// The same package, against an authorizer no core will accept.
+    ///
+    /// `Authorizer::any()`'s code hash is zero, so nothing on the core
+    /// authorizes it. This is the "unauthorized package -> no sharing" fault
+    /// of DESIGN §11 N3: the package is otherwise well-formed, so a node that
+    /// shares it has skipped the authorization check rather than failed to
+    /// parse anything.
+    pub fn build_unauthorized_package(
+        &self,
+        items: Vec<jam_node::hazmat::BuildItem>,
+    ) -> BuiltPackage {
+        let (package, extrinsics) = self.harness().build_package_with_auth(
+            items,
+            jam_types::Authorizer::any(),
+            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+            jam_types::Authorization::new(),
+        );
+        BuiltPackage {
+            package,
+            extrinsics,
+        }
+    }
+
+    /// Where to aim a CE 133 submission: the first slot at or after `from`
+    /// that still has `margin` slots left in its rotation, and the core the
+    /// NUT holds there.
+    ///
+    /// The core alone is not enough. CE 133 says the package goes to a
+    /// guarantor "in the NUT's rotation", and a validator holds a different
+    /// core after every rotation boundary. Submitting in the last slot before
+    /// one leaves the node no room to share the package and distribute the
+    /// report before the assignment it was given moves out from under it, and
+    /// the lane would record a node that did nothing wrong as having failed
+    /// to share.
+    ///
+    /// `None` if no slot within one rotation of `from` qualifies, which can
+    /// only happen if `margin` is at least the rotation period.
+    pub fn submission_slot_for(&self, nut: u16, from: u32, margin: u32) -> Option<SubmissionPlan> {
+        let rotation = jam_types::rotation_period();
+        let epoch = jam_types::epoch_period();
+        for slot in from..from.saturating_add(rotation) {
+            // Rotations are counted inside the epoch, so the position within
+            // one is epoch-relative. `slot % rotation` agrees only when the
+            // epoch is a whole number of rotations -- true under tiny, and
+            // not something to rely on.
+            let in_epoch = slot % epoch;
+            let left_in_rotation = rotation - (in_epoch % rotation);
+            // The epoch boundary moves the assignment too: it reshuffles on
+            // new entropy, not just by the rotation offset. A window that
+            // straddles one is no safer than one that straddles a rotation.
+            let left_in_epoch = epoch - in_epoch;
+            if left_in_rotation.min(left_in_epoch) >= margin {
+                // The epoch view, not the storage one. A guarantor picks who
+                // to share a package with from its epoch's own assignment,
+                // and the two disagree: measured against a real node in the
+                // same epoch as the reference head, storage said core 0 was
+                // [2, 3, 5] while the epoch said [0, 4, 5], and the node
+                // shared with 4. Aiming a submission by the storage view
+                // grades the node against an assignment it is not using.
+                // `continue`, not an early return: a slot the epoch view
+                // cannot answer for is not a reason to give up on the later
+                // ones. Returning here made one unanswerable slot look like
+                // a rotation with no usable slot in it at all.
+                let Some(core) = self.core_for_in_epoch(nut, slot) else {
+                    continue;
+                };
+                return Some(SubmissionPlan {
+                    slot,
+                    core,
+                    co_guarantors: self
+                        .guarantors_for_in_epoch(core, slot)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|v| *v != nut)
+                        .collect(),
+                });
+            }
+        }
+        None
+    }
+
+    /// A fully reference-guaranteed report for a core the NUT does *not*
+    /// hold at `slot`, ready to distribute over CE 135.
+    ///
+    /// A different core on purpose. The node is already guaranteeing the
+    /// package the harness submitted on its own core, and a second report for
+    /// the same core would be a duplicate the node is right to drop -- which
+    /// would read as a failure to include. On a core it does not hold, every
+    /// signature is the reference's and the node's only job is to include it.
+    ///
+    /// `None` when the NUT holds every core, which cannot happen while there
+    /// is more than one.
+    pub fn report_to_distribute(
+        &self,
+        items: Vec<jam_node::hazmat::BuildItem>,
+        nut: u16,
+        slot: u32,
+    ) -> Result<Option<ScheduledReport>, ChainError> {
+        let Some(nut_core) = self.core_for_in_epoch(nut, slot) else {
+            return Ok(None);
+        };
+        let cores = jam_types::core_count();
+        if cores < 2 {
+            return Ok(None);
+        }
+        let core = (nut_core + 1) % cores;
+        let work = self.guarantee_work(items, core)?;
+        // Signed by the cohort the *epoch* view names, not the one
+        // `try_compose_guarantee` used. That composes over the storage view,
+        // and a node checks a received guarantee's signers against its own
+        // assignment: with the two views apart it answered every distributed
+        // report with `Invalid guarantee: Wrong core assignment`, in those
+        // words. The same split, and the same fix, as the CE 134 answer.
+        let mut cohort = self.guarantors_for_in_epoch(core, slot).unwrap_or_default();
+        // Strictly ascending, which is what a guarantee's signatures must be.
+        cohort.sort_unstable();
+        cohort.dedup();
+        let signed = work.sharing_answer_for(&cohort);
+        let distribution = jamnp_s::codec::ce131_136::GuaranteedWorkReport {
+            report: work.report.clone(),
+            // The slot the cohort was signed for, not the one the guarantee
+            // was composed in. A node derives the expected signers from the
+            // slot the guarantee declares, so a guarantee signed by the
+            // cohort of one slot and stamped with another is rejected as a
+            // wrong core assignment however right both halves are.
+            slot,
+            signatures: signed.signatures,
+        };
+        Ok(Some(ScheduledReport {
+            slot,
+            core,
+            nut,
+            sender: *cohort.first().ok_or_else(|| {
+                ChainError::Chain(format!("core {core} has no holders at slot {slot}"))
+            })?,
+            report_hash: work.report.hash().0,
+            wire: jam_types::Encode::encode(&distribution),
+        }))
+    }
+
     /// Build `items` into a package, refine it on `core`, and sign the
     /// guarantee.
     ///
@@ -39,6 +440,7 @@ impl RefChain {
         let mut harness = self.harness();
         let (package, xts) = harness.build_package(items);
         let wire = package.clone();
+        let xts: Vec<Vec<u8>> = xts.into_iter().collect();
         let (report, bundle, _) = harness
             .try_compose_report(package, &xts, core)
             .map_err(|e| ChainError::Chain(format!("compose report: {e}")))?;
@@ -47,6 +449,7 @@ impl RefChain {
             .map_err(|e| ChainError::Chain(format!("compose guarantee: {e}")))?;
         Ok(GuaranteedWork {
             package: wire,
+            extrinsics: xts,
             report,
             bundle: bundle.to_vec(),
             guarantee,
@@ -80,6 +483,81 @@ impl RefChain {
             .map(|vals| vals.to_vec())
     }
 
+    /// The epoch index the chain's cached epoch view currently names, and the
+    /// epoch its best block's state is in.
+    ///
+    /// The two can differ, and that is the whole of the storage-versus-epoch
+    /// disagreement: `EpochInfo` is a cache built from an epoch mark, while
+    /// `core_assignments_for` reads the state. When the cache lags, the
+    /// "current" epoch is the previous one and its shuffle is a different
+    /// shuffle.
+    pub fn epoch_views(&self) -> (u32, u32) {
+        let harness = self.harness();
+        let jam = harness.chain();
+        let (index, _current, _next) = jam.current_and_next_epochs();
+        let head = jam.best_block().1;
+        (index, head / jam_types::epoch_period())
+    }
+
+    /// The entropy each view would shuffle with: the cached epoch's, and
+    /// entries 1 and 2 of the best block's buffer.
+    ///
+    /// The on-chain rule shuffles with entry 2 (`exec/reports.rs`), so a
+    /// cached value equal to entry 1 is an epoch out, and one equal to
+    /// neither came from a state the chain has moved past.
+    pub fn assignment_entropy(&self) -> (String, String, String) {
+        let harness = self.harness();
+        let jam = harness.chain();
+        let (_index, current, _next) = jam.current_and_next_epochs();
+        let short =
+            |bytes: &[u8]| -> String { bytes[..8].iter().map(|b| format!("{b:02x}")).collect() };
+        let cached = short(&current.core_assignment_entropy.0);
+        let storage = harness.storage(None);
+        let buffer = storage
+            .entropy()
+            .expect("the best block has an entropy buffer");
+        (cached, short(&buffer[1].0), short(&buffer[2].0))
+    }
+
+    /// The validators assigned to `core` at `slot`, as the *epoch view*
+    /// computes it.
+    ///
+    /// The other half of a disagreement worth keeping visible.
+    /// [`guarantors_for`](Self::guarantors_for) reads the storage, which
+    /// picks its entropy relative to the storage's own slot -- `Same` takes
+    /// entropy 2, `Prev` takes 3, `Next` takes 1. This reads the epoch's own
+    /// precomputed entropy instead, which is what a guarantor uses when it
+    /// chooses who to share a package with.
+    ///
+    /// They should agree whenever the reference's head and `slot` sit in the
+    /// same epoch. Where they do not, one of the two is being read from the
+    /// wrong state, and the lane needs to know which before it grades a node
+    /// against either.
+    pub fn guarantors_for_in_epoch(&self, core: CoreIndex, slot: u32) -> Option<Vec<u16>> {
+        let harness = self.harness();
+        let jam = harness.chain();
+        let (index, current, next) = jam.current_and_next_epochs();
+        epoch_info_for(slot, index, &current, &next)?
+            .core_assignments(slot)
+            .core_to_vals(core)
+            .map(|vals| vals.to_vec())
+    }
+
+    /// The core validator `index` guarantees at `slot`, as the epoch view
+    /// computes it.
+    ///
+    /// The view that decides whether the node considers itself a guarantor
+    /// of the core a package is addressed to, so it is the one a submission
+    /// is aimed with.
+    pub fn core_for_in_epoch(&self, validator: u16, slot: u32) -> Option<CoreIndex> {
+        let harness = self.harness();
+        let jam = harness.chain();
+        let (index, current, next) = jam.current_and_next_epochs();
+        epoch_info_for(slot, index, &current, &next)?
+            .core_assignments(slot)
+            .val_to_core(validator)
+    }
+
     /// The core validator `index` guarantees at `slot`.
     pub fn core_for(&self, index: u16, slot: u32) -> Option<CoreIndex> {
         self.harness()
@@ -89,4 +567,3 @@ impl RefChain {
             .val_to_core(index)
     }
 }
-

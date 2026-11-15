@@ -9,15 +9,14 @@
 //! `m2-emu` never executes core logic: every value and decision is computed
 //! once here and injected.
 //!
-//! **Not here yet.** DESIGN §3 describes this crate as also signing guarantees,
-//! assurances and judgments, refining work packages, and erasure-coding
-//! bundles. None of that exists: those are N3's and N4's, and DESIGN §8 lists
-//! the polkajam `hazmat` changes they need first -- public, RNG-parameterised
-//! provisioners, a keyset-subset constructor, `compose_guarantee` returning a
-//! signed artefact rather than submitting it, and an export for bundle ->
-//! shards + justifications + segment proofs, whose surface §8 says still needs
-//! inspection. This paragraph is here because the sentence it replaces read as
-//! though the work was done.
+//! Building work packages, refining them into reports and signing guarantees
+//! is [`reports`], which N3 puts on CE 133, CE 134 and CE 135.
+//!
+//! **Not here yet.** DESIGN §3 also describes this crate as signing
+//! assurances and judgments and erasure-coding bundles. None of that exists:
+//! those are N4's and N5's, and the export for bundle -> shards +
+//! justifications + segment proofs is the one DESIGN §8 prerequisite still
+//! outstanding.
 #![deny(unsafe_code)]
 
 pub mod chain;

@@ -19,6 +19,10 @@ use m2_scenario::ctx::{
     NutTicketFacts, TicketDelivery as CtxDelivery, TicketFault as CtxFault, SLOT_PERIOD_MS,
 };
 
+use m2_scenario::scenarios::n3::{
+    DistributedReport, N3Ctx, ReportSeen, SharingSeen, SubmittedPackage,
+};
+
 use crate::scenario::RunCtx;
 
 /// Reference-side facts the N1/N2 context builders read after the observation
@@ -33,6 +37,17 @@ pub(crate) struct RealRunData {
     pub(crate) nut_index: usize,
     pub(crate) emu_indices: Vec<usize>,
     pub(crate) epoch_contexts: EpochContexts,
+    /// CE 133 submissions the emulator made, with the node's answers.
+    pub(crate) submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
+    /// CE 134 shares the node opened.
+    pub(crate) sharing_seen: Arc<Mutex<Vec<SharingSeen>>>,
+    /// CE 135 distributions the node sent.
+    pub(crate) reports_seen: Arc<Mutex<Vec<ReportSeen>>>,
+    /// The CE 134 answer planned for this run; its report hash is what the
+    /// node's own report is compared against.
+    pub(crate) sharing_answer: Arc<Mutex<Option<m2_reference::reports::SharingAnswer>>>,
+    /// Reports the emulator distributed to the NUT, for the inclusion rows.
+    pub(crate) distributed: Arc<Mutex<Vec<DistributedReport>>>,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
@@ -132,9 +147,15 @@ pub(crate) fn build_real_run_ctx(
     n0: m2_scenario::scenarios::n0::N0Ctx,
 ) -> RunCtx {
     let nut_blocks = lock(&data.nut_blocks);
+    let t = std::time::Instant::now();
     let contexts = ticket_contexts(data);
+    crate::run::phase("ctx.ticket_contexts", t);
+    let t = std::time::Instant::now();
     let nut_tickets = collect_nut_tickets(trace, &contexts);
+    crate::run::phase("ctx.collect_nut_tickets", t);
+    let t = std::time::Instant::now();
     let nut_finals = collect_nut_finals(trace);
+    crate::run::phase("ctx.collect_nut_finals", t);
     // Every ticket the node announced is one it legitimately held, whether it
     // ran the lottery for it or is forwarding it as proxy. Both lanes need
     // this to tell "the node invented a ticket" from "the node is a validator".
@@ -142,12 +163,15 @@ pub(crate) fn build_real_run_ctx(
         .iter()
         .map(|f| m2_reference::tickets::ticket_id(&f.ticket.proof))
         .collect();
+    let t = std::time::Instant::now();
     let n1 = build_n1_ctx(
         &data.ref_chain,
         &nut_blocks,
         &lock(&data.deliveries),
         own_ticket_ids.clone(),
     );
+    crate::run::phase("ctx.build_n1", t);
+    let t = std::time::Instant::now();
     let n2 = build_n2_ctx(
         &contexts,
         data,
@@ -156,10 +180,55 @@ pub(crate) fn build_real_run_ctx(
         &nut_blocks,
         own_ticket_ids,
     );
+    crate::run::phase("ctx.build_n2", t);
+    let t = std::time::Instant::now();
+    // Always built, never gated on the lane: when N3 was not selected no
+    // package was planned, so the records are empty and the lane is not
+    // evaluated. When it was selected and nothing was submitted anyway, the
+    // lane says the rule was not exercised, which is the truth and not a pass.
+    // Taken before the literal, not inside it. A guard created in a struct
+    // literal is a temporary that lives until the end of the whole `let`
+    // statement, so reading `data.submissions` twice in one literal takes a
+    // non-reentrant lock it is still holding -- which deadlocks, and did:
+    // every phase of a real run finished in milliseconds and this one never
+    // returned.
+    let submissions = lock(&data.submissions).clone();
+    let n3 = N3Ctx {
+        nut_index: data.nut_index as u16,
+        // The harness answers CE 134 whenever it planned a submission, which
+        // is exactly when it has a report hash and signatures to answer with.
+        answers_sharing: !submissions.is_empty(),
+        submissions,
+        shares: lock(&data.sharing_seen).clone(),
+        reports: lock(&data.reports_seen).clone(),
+        expected_report_hash: lock(&data.sharing_answer)
+            .as_ref()
+            .map(|answer| answer.report_hash),
+        emulated_peers: data.emu_indices.iter().map(|i| *i as u16).collect(),
+        distributed: lock(&data.distributed).clone(),
+        // Report hashes the node put on chain, with the slot of the block
+        // that carried them. Read off the blocks it announced: a report it
+        // included is one it actually authored into a block, not one it
+        // merely acknowledged on the wire.
+        included: nut_blocks
+            .iter()
+            .flat_map(|nut| {
+                let slot = nut.block.header.slot;
+                nut.block
+                    .extrinsic
+                    .guarantees_prehashed()
+                    .into_iter()
+                    .map(move |(hash, _, _)| (hash.0, slot))
+            })
+            .collect(),
+        authored_slots: nut_blocks.iter().map(|n| n.block.header.slot).collect(),
+    };
+    crate::run::phase("ctx.build_n3", t);
     RunCtx {
         n0,
         n1: Some(n1),
         n2: Some(n2),
+        n3: Some(n3),
     }
 }
 
