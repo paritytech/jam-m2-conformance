@@ -212,3 +212,43 @@ together. They are stashed as `n3-send-time-build` and
 
 Phase 1, the deepest part of that band, has since come back clean twice,
 which closes the sampling gap this entry was left with.
+
+---
+
+## 4. The node accepts a CE 133 first message over the size cap
+
+**Status:** open, observed once, and it may be the spec rather than the node.
+Opened 2026-11-15.
+
+The CE 133 fault rows put a deliberately oversized first message on the wire:
+**205,076 bytes against the cap of 204,802** (`2 + 200 * 1024`), read off the
+trace rather than inferred. The node accepted it and did not reset the
+stream.
+
+DESIGN §11 N3 reads that as a defect -- its fault column says `first message
+> 2+200*1024 bytes -> reset :362-364`. The spec is softer than DESIGN:
+
+> The initial message `Core Index ++ Work-Package` **should be limited** to
+> `2 + (200 * 1024)` bytes. This ensures that Guarantors can not be forced to
+> download huge work packages, before they can check that the Work-Package is
+> actually authorized.
+
+That is a SHOULD addressed to the builder, with a rationale about protecting
+guarantors. Whether a guarantor **must** reject a larger one is an
+interpretation DESIGN made and the spec does not state. polkajam reads its
+first message with `read_decoded`, which caps at the type's
+`max_encoded_len`, and a `WorkPackage`'s is far above 200 KiB -- so it is
+enforcing a different limit, not no limit.
+
+**Before this is reported as a node defect it needs settling**, and it is a
+question for the conformance group rather than for the harness:
+
+1. Is the cap normative on the receiver, or only on the sender? If only the
+   sender, the row is wrong and should be dropped or made soft.
+2. If normative, what is a guarantor meant to do -- reset, or read and
+   discard? The rationale is about not being *forced to download*, which
+   argues for a reset before the body arrives.
+3. Seen once. It should be reproduced before anything is filed.
+
+This is the first N3 row that failed for a reason that is not plainly the
+harness's. Every earlier one was ours.

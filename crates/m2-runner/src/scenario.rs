@@ -507,6 +507,7 @@ pub(crate) fn fabricated_run_ctx(
             sent_at_wall_ms: submitted_at,
             refused: false,
             reset_code: None,
+            fault: None,
             co_guarantors: fab_co_guarantors.clone(),
         }],
         shares: fab_co_guarantors

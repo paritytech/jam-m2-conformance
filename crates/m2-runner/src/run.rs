@@ -326,6 +326,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             }
             match plan_package_for_this_run(&ref_chain, nut_index) {
                 Ok(plan) => {
+                    // The honest submission leads the plan; the report is
+                    // distributed in its slot.
+                    let honest_slot = plan.first().map(|p| p.slot).unwrap_or_default();
                     // The report to be included rides the same slot plan: it
                     // is guaranteed on a core the NUT does not hold, so the
                     // two never collide.
@@ -336,7 +339,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         // second as a duplicate.
                         vec![work_item_with_payload(b"n3-distributed".to_vec())],
                         nut_index as u16,
-                        plan.slot,
+                        honest_slot,
                     ) {
                         Ok(Some(report)) => {
                             eprintln!(
@@ -350,7 +353,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         Ok(None) => eprintln!(
                             "[assignment] no report to distribute: the NUT holds no core at \
                              slot {} in the epoch view, or there is only one core",
-                            plan.slot
+                            honest_slot
                         ),
                         Err(e) => conn_findings.push(no_package_plan_finding(&e)),
                     }
@@ -747,7 +750,7 @@ const SUBMISSION_MARGIN_SLOTS: u32 = 2;
 fn plan_package_for_this_run(
     ref_chain: &RefChain,
     nut_index: usize,
-) -> Result<m2_reference::reports::SubmissionSchedule, m2_reference::chain::ChainError> {
+) -> Result<Vec<m2_reference::reports::SubmissionSchedule>, m2_reference::chain::ChainError> {
     // Into the *next* epoch, not the next slot.
     //
     // The two core assignments read different entries of the entropy buffer.
@@ -838,11 +841,53 @@ fn plan_package_for_this_run(
             ref_chain.guarantors_for_in_epoch(core, plan.slot),
         );
     }
-    Ok(m2_reference::reports::SubmissionSchedule {
+    // The honest submission first, then one per fault, each a rotation later
+    // so the node has finished with the previous one and the assignment has
+    // not moved under the next. A fault sharing a slot with the honest
+    // submission would be graded against a node already busy with it.
+    use m2_reference::reports::SubmissionFault::*;
+    let mut plans = vec![m2_reference::reports::SubmissionSchedule {
         slot: plan.slot,
         core: plan.core,
-        co_guarantors: plan.co_guarantors,
-    })
+        co_guarantors: plan.co_guarantors.clone(),
+        fault: None,
+    }];
+    let rotation = jam_types::rotation_period();
+    for (i, fault) in [
+        Oversized,
+        Unauthorized,
+        ExtrinsicSizeMismatch,
+        NotAGuarantor,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let slot = plan.slot + rotation * (i as u32 + 1);
+        // Each fault needs the assignment at *its own* slot: a rotation later
+        // the NUT may hold a different core, and a package aimed at the core
+        // it held before is the not-a-guarantor fault by accident.
+        let Some(core) = ref_chain.core_for_in_epoch(nut_index as u16, slot) else {
+            continue;
+        };
+        let addressed = if fault == NotAGuarantor {
+            // Deliberately the core it does *not* hold.
+            (core + 1) % jam_types::core_count()
+        } else {
+            core
+        };
+        plans.push(m2_reference::reports::SubmissionSchedule {
+            slot,
+            core: addressed,
+            co_guarantors: ref_chain
+                .guarantors_for_in_epoch(addressed, slot)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| *v != nut_index as u16)
+                .collect(),
+            fault: Some(fault),
+        });
+    }
+    Ok(plans)
 }
 
 /// A work item with a distinguishing payload, so two packages built in one
@@ -929,10 +974,28 @@ async fn submit_as_builder(
     genesis_hash: [u8; 32],
     shared: m2_emu::emu::EmuShared,
 ) {
-    let Some(schedule) = shared.take_submission_plan() else {
+    let plan = shared.take_submission_plan();
+    if plan.is_empty() {
         eprintln!("[builder] no submission plan to claim");
         return;
-    };
+    }
+    for schedule in plan {
+        submit_one(addr, &expected_san, genesis_hash, &shared, schedule).await;
+    }
+}
+
+/// Submit one scheduled package, honest or faulty.
+///
+/// A connection of its own per submission. They are a rotation apart, which
+/// is far longer than QUIC holds an idle one open, and a builder that
+/// submits twice on one connection would be relying on it surviving the gap.
+async fn submit_one(
+    addr: SocketAddr,
+    expected_san: &str,
+    genesis_hash: [u8; 32],
+    shared: &m2_emu::emu::EmuShared,
+    schedule: m2_reference::reports::SubmissionSchedule,
+) {
     sleep_until_slot(schedule.slot.saturating_sub(PACKAGE_BUILD_LEAD_SLOTS)).await;
     let (plan, answer) = match shared.ref_chain.submission_now(&schedule) {
         Ok(built) => built,
@@ -965,7 +1028,7 @@ async fn submit_as_builder(
                 builder: true,
             },
             ed25519_consensus::SigningKey::from(seed),
-            expected_san,
+            expected_san.to_string(),
             addr,
         )
         .await;

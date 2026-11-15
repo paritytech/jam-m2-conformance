@@ -40,6 +40,46 @@ pub struct SharingSeen {
     pub at_wall_ms: u64,
 }
 
+/// A deliberate defect in a CE 133 submission, as the lane sees it
+/// (DESIGN §11 N3).
+///
+/// The lane's own copy of `m2_reference::reports::SubmissionFault`, mapped
+/// in the runner. The same split the ticket faults use: a scenario lane
+/// describes what was posed, the reference knows how to pose it, and neither
+/// crate has to depend on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionFault {
+    /// Message 1 over `2 + 200 * 1024` bytes (`simple.md:362-364`).
+    Oversized,
+    /// Addressed to a core the NUT does not hold at the slot.
+    NotAGuarantor,
+    /// Built against an authorizer no core will accept.
+    Unauthorized,
+    /// Message 2 is not the sum of the declared extrinsic lengths.
+    ExtrinsicSizeMismatch,
+}
+
+impl SubmissionFault {
+    /// Whether DESIGN §11 N3 expects the node to reset the stream.
+    ///
+    /// Two of the four ask for a reset; the other two ask for silence. A
+    /// package for a core the node does not hold is ignored, and an
+    /// unauthorized one is taken onto the stream and then not shared. So
+    /// "was it refused" is the wrong question for half of these.
+    pub fn expects_reset(&self) -> bool {
+        matches!(self, Self::Oversized | Self::ExtrinsicSizeMismatch)
+    }
+
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Oversized => "a first message over the CE 133 size cap",
+            Self::NotAGuarantor => "a core the NUT does not hold",
+            Self::Unauthorized => "an authorizer no core accepts",
+            Self::ExtrinsicSizeMismatch => "an extrinsic message of the wrong size",
+        }
+    }
+}
+
 /// A CE 135 work-report distribution the NUT sent (`simple.md:460-485`).
 #[derive(Debug, Clone)]
 pub struct ReportSeen {
@@ -92,6 +132,12 @@ pub struct SubmittedPackage {
     /// take right now is the difference between the node's defect and the
     /// harness aiming badly.
     pub reset_code: Option<u64>,
+    /// What was deliberately wrong with this submission, if anything.
+    ///
+    /// `None` is the honest one. The lane asks a different question of each
+    /// fault, because DESIGN §11 N3 expects a reset for two of them and
+    /// silence for the other two.
+    pub fault: Option<SubmissionFault>,
     /// The validators holding `core` at `slot` alongside the NUT: who the
     /// node is expected to open CE 134 to.
     ///
@@ -192,6 +238,13 @@ pub fn n3_ce133_submission(ctx: &N3Ctx) -> Check {
 
         let mut results = Vec::new();
         for submitted in &ctx.submissions {
+            // A faulty submission is graded by its own rule, not by the
+            // honest one's. Two of the four ask for a reset and two ask for
+            // silence, so "was it accepted" is the wrong question for half.
+            if let Some(fault) = submitted.fault {
+                results.extend(grade_fault(&ctx, submitted, fault));
+                continue;
+            }
             results.push(log::check_detail(
                 "n3_ce133_accepted",
                 !submitted.refused,
@@ -362,7 +415,15 @@ pub fn n3_ce135_distribution(ctx: &N3Ctx) -> Check {
                 ));
             }
 
-            if let Some(expected) = ctx.expected_report_hash {
+            // Only reports the *honest* submission could have produced. A
+            // run poses faults too, and a node that refines one of those
+            // distributes a report the reference never built -- comparing it
+            // against the honest package's hash fails a node for refining
+            // something it was deliberately handed.
+            let graded = ctx
+                .first_faulty_submission_at()
+                .is_none_or(|cutoff| report.at_wall_ms < cutoff);
+            if let (true, Some(expected)) = (graded, ctx.expected_report_hash) {
                 results.push(log::check_detail(
                     "n3_ce135_report_matches_the_reference",
                     report.report_hash == expected,
@@ -460,6 +521,83 @@ pub fn n3_ce135_inclusion(ctx: &N3Ctx) -> Check {
     })
 }
 
+/// Grade one deliberately faulty submission (DESIGN §11 N3).
+///
+/// Each fault names one rule, so each gets one row and the rows are named
+/// apart: a single `fault_rejected` row would pass for the wrong reason
+/// whenever a node refused for a rule other than the one being posed.
+fn grade_fault(
+    ctx: &N3Ctx,
+    submitted: &SubmittedPackage,
+    fault: SubmissionFault,
+) -> Vec<crate::dsl::CheckResult> {
+    // Shares that answer this submission, by time. A node that shared
+    // something else earlier in the run has not shared *this*.
+    let shared_after: Vec<u16> = ctx
+        .shares
+        .iter()
+        .filter(|share| share.at_wall_ms >= submitted.sent_at_wall_ms)
+        .map(|share| share.peer)
+        .collect();
+
+    match fault {
+        // `simple.md:362-364` asks for the stream to be reset: a guarantor
+        // must not be made to download a huge package before it can check
+        // the authorization.
+        SubmissionFault::Oversized => vec![log::check_detail(
+            "n3_ce133_oversized_reset",
+            submitted.refused,
+            Severity::Hard,
+            || {
+                format!(
+                    "the NUT accepted a first message over the {} byte cap instead of \
+                     resetting the stream",
+                    jamnp_s::codec::ce131_136::WORK_PACKAGE_INITIAL_MAX
+                )
+            },
+        )],
+        // The extrinsic message did not match the lengths the package
+        // declares, which the node reads exactly and so must notice.
+        SubmissionFault::ExtrinsicSizeMismatch => vec![log::check_detail(
+            "n3_ce133_extrinsic_mismatch_reset",
+            submitted.refused,
+            Severity::Hard,
+            || {
+                "the NUT accepted an extrinsic message whose size did not equal the sum of \
+                 the lengths its package declared"
+                    .to_string()
+            },
+        )],
+        // Not a reset but silence: the node is not a guarantor of that core,
+        // so the package is none of its business and it must not share it.
+        SubmissionFault::NotAGuarantor => vec![log::check_detail(
+            "n3_ce133_not_a_guarantor_ignored",
+            shared_after.is_empty(),
+            Severity::Hard,
+            || {
+                format!(
+                    "the NUT shared a package addressed to core {}, which it does not hold \
+                     at slot {}; it reached {:?}",
+                    submitted.core, submitted.slot, shared_after
+                )
+            },
+        )],
+        // Authorization is the one check `simple.md:410-415` puts before
+        // sharing, so an unauthorized package must not be shared on.
+        SubmissionFault::Unauthorized => vec![log::check_detail(
+            "n3_ce133_unauthorized_not_shared",
+            shared_after.is_empty(),
+            Severity::Hard,
+            || {
+                format!(
+                    "the NUT shared a package built against an authorizer no core accepts; \
+                     it reached {shared_after:?}"
+                )
+            },
+        )],
+    }
+}
+
 /// Every N3 check, in the order the lane reports them.
 pub fn all(ctx: &N3Ctx) -> Vec<Check> {
     vec![
@@ -470,6 +608,18 @@ pub fn all(ctx: &N3Ctx) -> Vec<Check> {
 }
 
 impl N3Ctx {
+    /// When the first deliberately faulty submission went out, if any.
+    ///
+    /// The boundary past which a distributed report can no longer be
+    /// attributed to the honest package.
+    pub fn first_faulty_submission_at(&self) -> Option<u64> {
+        self.submissions
+            .iter()
+            .filter(|s| s.fault.is_some())
+            .map(|s| s.sent_at_wall_ms)
+            .min()
+    }
+
     /// Whether the NUT authored any block after `slot`.
     ///
     /// Separate from the included hashes because a block with an empty
@@ -518,6 +668,7 @@ mod tests {
             sent_at_wall_ms: SENT_AT,
             refused,
             reset_code: refused.then_some(0x0103),
+            fault: None,
             co_guarantors: CO.to_vec(),
         }
     }
@@ -785,6 +936,148 @@ mod tests {
         };
         let results = run(&n3_ce135_inclusion(&ctx));
         assert_eq!(names(&results), vec!["n3_ce135_inclusion_not_exercised"]);
+    }
+
+    fn faulty(fault: SubmissionFault, refused: bool) -> SubmittedPackage {
+        SubmittedPackage {
+            fault: Some(fault),
+            refused,
+            ..submission(refused)
+        }
+    }
+
+    /// A report distributed after a faulty submission is not compared with
+    /// the honest package's report. The node may have refined the faulty one.
+    #[test]
+    fn a_report_after_a_faulty_submission_is_not_compared() {
+        let base = dist_ctx(vec![distribution(CO[0], vec![CO[0], NUT], [0x33; 32])]);
+        let ctx = N3Ctx {
+            submissions: vec![
+                submission(false),
+                SubmittedPackage {
+                    fault: Some(SubmissionFault::Oversized),
+                    sent_at_wall_ms: SENT_AT + 1_000,
+                    ..submission(false)
+                },
+            ],
+            ..base
+        };
+        // The distribution is stamped at SENT_AT + 2_000, after the fault.
+        let results = run(&n3_ce135_distribution(&ctx));
+        assert!(
+            !names(&results).contains(&"n3_ce135_report_matches_the_reference"),
+            "got {:?}",
+            names(&results)
+        );
+    }
+
+    /// With no faults posed, every distributed report is still compared.
+    #[test]
+    fn without_faults_the_report_comparison_still_applies() {
+        let results = run(&n3_ce135_distribution(&dist_ctx(vec![distribution(
+            CO[0],
+            vec![CO[0], NUT],
+            [0x33; 32],
+        )])));
+        assert!(failed(
+            &results,
+            "n3_ce135_report_matches_the_reference",
+            Severity::Hard
+        ));
+    }
+
+    /// Each fault is graded by its own rule, not by the honest one's.
+    #[test]
+    fn a_faulty_submission_is_not_graded_as_an_honest_one() {
+        let results = run(&n3_ce133_submission(&ctx(
+            vec![faulty(SubmissionFault::Oversized, true)],
+            Vec::new(),
+        )));
+        assert_eq!(names(&results), vec!["n3_ce133_oversized_reset"]);
+        assert!(
+            !names(&results).contains(&"n3_ce133_accepted"),
+            "a fault must not be judged against the acceptance row"
+        );
+    }
+
+    /// The two faults the spec answers with a reset.
+    #[test]
+    fn a_reset_is_required_for_the_oversized_and_mismatched_submissions() {
+        for fault in [
+            SubmissionFault::Oversized,
+            SubmissionFault::ExtrinsicSizeMismatch,
+        ] {
+            assert!(fault.expects_reset(), "{fault:?} expects a reset");
+            let accepted = run(&n3_ce133_submission(&ctx(
+                vec![faulty(fault, false)],
+                Vec::new(),
+            )));
+            assert!(
+                accepted
+                    .iter()
+                    .any(|r| r.outcome == Outcome::Fail(Severity::Hard)),
+                "{fault:?} accepted must fail"
+            );
+            let reset = run(&n3_ce133_submission(&ctx(
+                vec![faulty(fault, true)],
+                Vec::new(),
+            )));
+            assert!(
+                reset.iter().all(|r| r.outcome == Outcome::Pass),
+                "{fault:?} reset must pass"
+            );
+        }
+    }
+
+    /// The two the spec answers with silence. A reset is not required, so a
+    /// node that quietly declines to share has done the right thing.
+    #[test]
+    fn silence_is_enough_for_the_ignored_and_unauthorized_submissions() {
+        for fault in [
+            SubmissionFault::NotAGuarantor,
+            SubmissionFault::Unauthorized,
+        ] {
+            assert!(!fault.expects_reset(), "{fault:?} does not require a reset");
+            let quiet = run(&n3_ce133_submission(&ctx(
+                vec![faulty(fault, false)],
+                Vec::new(),
+            )));
+            assert!(
+                quiet.iter().all(|r| r.outcome == Outcome::Pass),
+                "{fault:?} with no sharing must pass, got {:?}",
+                names(&quiet)
+            );
+
+            // Sharing it is the defect.
+            let shared = run(&n3_ce133_submission(&N3Ctx {
+                shares: vec![share(CO[0], SENT_AT + 10, Vec::new())],
+                ..ctx(vec![faulty(fault, false)], Vec::new())
+            }));
+            assert!(
+                shared
+                    .iter()
+                    .any(|r| r.outcome == Outcome::Fail(Severity::Hard)),
+                "{fault:?} that was shared on must fail"
+            );
+        }
+    }
+
+    /// A share from before the submission is not an answer to it, for the
+    /// fault rows as much as the honest one.
+    #[test]
+    fn an_earlier_share_does_not_condemn_a_faulty_submission() {
+        let results = run(&n3_ce133_submission(&N3Ctx {
+            shares: vec![share(CO[0], SENT_AT - 1, Vec::new())],
+            ..ctx(
+                vec![faulty(SubmissionFault::Unauthorized, false)],
+                Vec::new(),
+            )
+        }));
+        assert!(
+            results.iter().all(|r| r.outcome == Outcome::Pass),
+            "got {:?}",
+            names(&results)
+        );
     }
 
     /// The happy path: accepted, shared with both, in time.
