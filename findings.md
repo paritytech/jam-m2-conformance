@@ -43,9 +43,18 @@ block. An earlier hypothesis that the cache lags finalization was tested and
 refuted.
 
 **Current workaround.** `plan_package_for_this_run` aims the submission into
-the next epoch, where both sides provably read the same entropy, and waits
-for the chain's cached epoch view to reach its own head epoch before
-planning. The second half matters because the view resolves only the cached
+the next epoch, where both sides provably read the same entropy, and aims it
+from the *cached* epoch index rather than from the head. The epoch view
+resolves the cached epoch and the one after it, so `cached + 1` is
+resolvable by construction.
+
+Waiting for the cache to catch up and then reading the head again is not
+enough, and was the first attempt: a head that crosses an epoch in the gap
+between the wait and the read puts the target two epochs past the cache,
+which resolves to nothing and leaves the lane unexercised. Three runs in
+five did exactly that, all near a boundary. Aiming from the cached index
+closes the race -- five consecutive runs after it, all planning and all
+clean. The second half matters because the view resolves only the cached
 epoch and the next, so a cache more than one epoch behind cannot answer for
 a slot an epoch ahead and no plan is made at all.
 
@@ -201,7 +210,5 @@ together. They are stashed as `n3-send-time-build` and
 **Measured after the fix:** four consecutive runs clean at phases 8, 7, 5 and
 5. Phase 5 is inside the old failing band, where every run had failed.
 
-**Not yet sampled:** phases 1 to 3, the deepest part of that band. The
-mechanism says they should pass, since the anchor is now built two slots
-before distribution whatever the phase, but that is reasoning rather than
-measurement.
+Phase 1, the deepest part of that band, has since come back clean twice,
+which closes the sampling gap this entry was left with.

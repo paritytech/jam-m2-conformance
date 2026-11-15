@@ -771,8 +771,19 @@ fn plan_package_for_this_run(
     // shares with the old cohort -- a run that aimed at the first slot of an
     // epoch saw the node open CE 134 to one co-guarantor instead of two even
     // though both views agreed on paper.
+    //
+    // Aimed from the *cached* epoch, not from the head. The epoch view
+    // resolves the cached epoch and the one after it, so aiming at
+    // `cached + 1` is resolvable by construction. Aiming from the head is
+    // not: the run waits for the cache to catch up and then reads the head
+    // again, and a head that crosses an epoch in between puts the target two
+    // epochs past the cache, which resolves to nothing and leaves the whole
+    // lane unexercised. Three runs in five did exactly that, all of them
+    // near a boundary.
     let epoch = jam_types::epoch_period();
-    let from = (ref_chain.next_slot() / epoch + 1) * epoch + EPOCH_SETTLE_SLOTS;
+    let (cached_epoch_index, state_epoch_index) = ref_chain.epoch_views();
+    let base = cached_epoch_index.max(state_epoch_index);
+    let from = (base + 1) * epoch + EPOCH_SETTLE_SLOTS;
     let plan = ref_chain
         .submission_slot_for(nut_index as u16, from, SUBMISSION_MARGIN_SLOTS)
         .ok_or_else(|| {
