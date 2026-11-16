@@ -1,0 +1,12 @@
+[package]
+name = "m2-oracle-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol between the M2 conformance harness and its out-of-process polkajam oracle"
+
+[dependencies]
+jam-types = { workspace = true }
+jam-std-common = { workspace = true }
+codec = { package = "jam-codec", version = "0.1.1", default-features = false, features = ["derive", "max-encoded-len"] }
+thiserror = { workspace = true }

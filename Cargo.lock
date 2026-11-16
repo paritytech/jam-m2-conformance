@@ -1970,6 +1970,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "m2-oracle-proto"
+version = "0.1.0"
+dependencies = [
+ "jam-codec",
+ "jam-std-common",
+ "jam-types",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "m2-reference"
 version = "0.1.0"
 dependencies = [
