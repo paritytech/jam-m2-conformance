@@ -195,6 +195,80 @@ impl SubmissionFault {
     }
 }
 
+/// A CE 134 share the harness opens *to* the NUT, so the node does the
+/// refining and the lane grades its answer (`simple.md:406-458`).
+///
+/// The other direction from the CE 134 the node opens after a CE 133. Here
+/// the harness is the sharing guarantor and the node is the receiving one,
+/// which is the only N3 row where the node's own refinement is the thing
+/// measured.
+#[derive(Debug, Clone)]
+pub struct ScheduledShare {
+    pub slot: u32,
+    pub core: u16,
+    pub shard_count: u16,
+    pub mappings: Vec<(jam_types::WorkPackageHash, [u8; 32])>,
+    /// The work-package bundle, message 2.
+    pub bundle: Vec<u8>,
+    /// What the reference refined from the same bundle, which the node's
+    /// answer must equal.
+    pub expected_report_hash: [u8; 32],
+    pub fault: Option<ShareFault>,
+}
+
+/// A deliberate defect in a CE 134 share (DESIGN §11 N3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareFault {
+    /// A shard count that is not the active validator count.
+    ///
+    /// `simple.md:432-436`: acceptable means matching the validators active
+    /// at a slot the report could be included in. With a static set that is
+    /// one number, so anything else is rejectable.
+    WrongShardCount,
+}
+
+impl RefChain {
+    /// Build a share to send the NUT at `slot`, on a core it holds.
+    ///
+    /// The package carries a payload of its own so it cannot collide with
+    /// the one the submission path builds: two identical packages in one run
+    /// are one package, and the node refuses whichever arrives second.
+    pub fn share_to_nut(
+        &self,
+        nut: u16,
+        slot: u32,
+        fault: Option<ShareFault>,
+    ) -> Result<Option<ScheduledShare>, ChainError> {
+        let Some(core) = self.core_for_in_epoch(nut, slot) else {
+            return Ok(None);
+        };
+        let work = self.guarantee_work(
+            vec![work_item_with_payload(b"n3-shared-to-nut".to_vec())],
+            core,
+        )?;
+        let validators = jam_types::max_val_count();
+        let shard_count = match fault {
+            // One below the active count: acceptable is exactly the active
+            // count, so this is rejectable without being absurd.
+            Some(ShareFault::WrongShardCount) => validators.saturating_sub(1),
+            None => validators,
+        };
+        Ok(Some(ScheduledShare {
+            slot,
+            core,
+            shard_count,
+            // No imported segments, so no mappings. The spec lets a
+            // guarantor either refuse or trust unverifiable mappings
+            // (`simple.md:443-445`), so a bad-mapping row could not fail
+            // either way and the lane does not pose one.
+            mappings: Vec::new(),
+            bundle: work.bundle,
+            expected_report_hash: work.report.hash().0,
+            fault,
+        }))
+    }
+}
+
 /// A guaranteed work-report the harness distributes over CE 135, so the node
 /// can be graded on including it.
 #[derive(Debug, Clone)]

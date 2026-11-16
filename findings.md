@@ -252,3 +252,35 @@ question for the conformance group rather than for the harness:
 
 This is the first N3 row that failed for a reason that is not plainly the
 harness's. Every earlier one was ours.
+
+---
+
+## 5. The node resets a well-formed CE 134 share with `NoError`
+
+**Status:** open, observed once. Opened 2026-11-16.
+
+The CE 134 receive row shares a bundle *with* the node, on a core the node
+holds at that slot, offering the active validator count as the shard count.
+The node reset the stream rather than answering:
+
+```
+the NUT reset a well-formed share on core 1 with code 0x100
+```
+
+`0x100` is `NoError` in polkajam's own table -- "No error", from RFC 9114 --
+not one of the JAMNP refusal codes (`Unwanted`, `TooBusy`, `TooMany`). So
+the node is not saying the share was bad; it is closing the stream without a
+reason.
+
+The same run's unacceptable-shard-count share *was* correctly refused, so the
+path works and the node does distinguish the two cases.
+
+Worth establishing before this is called a defect:
+
+1. Whether `NoError` on a reset is polkajam's way of declining a share it
+   does not want -- for example because it is already refining that core, or
+   has seen the package -- rather than an error at all.
+2. Whether the harness should be sharing at that slot at all. The share goes
+   out one slot after a run's own submissions, so the node may still be busy
+   with one of those.
+3. Seen once. Reproduce before filing.

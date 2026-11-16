@@ -25,13 +25,15 @@ use jamnp_s::{
     transport::{quic::QuicTransport, Conn, Listener, RecvHalf, SendHalf, Transport},
 };
 use m2_reference::chain::RefChain;
-use m2_reference::reports::{ScheduledReport, SharingAnswer, SubmissionSchedule};
+use m2_reference::reports::{ScheduledReport, ScheduledShare, SharingAnswer, SubmissionSchedule};
 use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::{DeliveredTicket, NutBlock};
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
 use m2_scenario::scenarios::n0;
 use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
-use m2_scenario::scenarios::n3::{DistributedReport, ReportSeen, SharingSeen, SubmittedPackage};
+use m2_scenario::scenarios::n3::{
+    DistributedReport, ReportSeen, SharedToNut, SharingSeen, SubmittedPackage,
+};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
@@ -100,6 +102,9 @@ pub struct Emulator {
     report_plan: Arc<Mutex<Option<ScheduledReport>>>,
     /// Reports the emulator distributed, for the inclusion rows.
     distributed: Arc<Mutex<Vec<DistributedReport>>>,
+    /// CE 134 shares the emulator opened to the NUT.
+    share_plan: Arc<Mutex<Vec<ScheduledShare>>>,
+    shared_to_nut: Arc<Mutex<Vec<SharedToNut>>>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
     ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
@@ -162,6 +167,9 @@ pub struct EmuShared {
     pub report_plan: Arc<Mutex<Option<ScheduledReport>>>,
     /// Reports the emulator distributed.
     pub distributed: Arc<Mutex<Vec<DistributedReport>>>,
+    /// CE 134 shares the emulator opened to the NUT.
+    pub share_plan: Arc<Mutex<Vec<ScheduledShare>>>,
+    pub shared_to_nut: Arc<Mutex<Vec<SharedToNut>>>,
     /// Tickets actually put on the wire, with the wall-clock time they were
     /// sent. The sender knows each ticket's id, so the N1 lane reads this
     /// rather than re-deriving ids from the observation log.
@@ -205,6 +213,14 @@ impl EmuShared {
         lock(&self.ticket_plans)
             .remove(&peer)
             .filter(|p| !p.is_empty())
+    }
+
+    /// Take this run's CE 134 shares, leaving nothing behind.
+    ///
+    /// Claimed whole by one connection, so two cannot share the same bundle
+    /// to the node and have it refuse the second as a duplicate.
+    pub fn take_share_plan(&self) -> Vec<ScheduledShare> {
+        std::mem::take(&mut *lock(&self.share_plan))
     }
 
     /// Take this run's CE 135 distribution, leaving nothing behind.
@@ -329,6 +345,8 @@ impl Emulator {
             sharing_answer: Arc::new(Mutex::new(None)),
             report_plan: Arc::new(Mutex::new(None)),
             distributed: Arc::new(Mutex::new(Vec::new())),
+            share_plan: Arc::new(Mutex::new(Vec::new())),
+            shared_to_nut: Arc::new(Mutex::new(Vec::new())),
             deliveries: Arc::new(Mutex::new(Vec::new())),
             ce128_probes: Arc::new(Mutex::new(Vec::new())),
             ce129_probes: Arc::new(Mutex::new(Vec::new())),
@@ -389,6 +407,17 @@ impl Emulator {
         Arc::clone(&self.distributed)
     }
 
+    /// Set the CE 134 shares this run opens to the NUT.
+    pub fn set_share_plan(&self, plan: Vec<ScheduledShare>) {
+        *lock(&self.share_plan) = plan;
+        self.plans_set.send_replace(true);
+    }
+
+    /// CE 134 shares the emulator opened, with the node's answers.
+    pub fn shared_to_nut(&self) -> Arc<Mutex<Vec<SharedToNut>>> {
+        Arc::clone(&self.shared_to_nut)
+    }
+
     /// The tickets the emulator put on the wire, with their send times.
     pub fn deliveries(&self) -> Arc<Mutex<Vec<DeliveredTicket>>> {
         Arc::clone(&self.deliveries)
@@ -430,6 +459,8 @@ impl Emulator {
             sharing_answer: Arc::clone(&self.sharing_answer),
             report_plan: Arc::clone(&self.report_plan),
             distributed: Arc::clone(&self.distributed),
+            share_plan: Arc::clone(&self.share_plan),
+            shared_to_nut: Arc::clone(&self.shared_to_nut),
             deliveries: Arc::clone(&self.deliveries),
             ce128_probes: Arc::clone(&self.ce128_probes),
             ce129_probes: Arc::clone(&self.ce129_probes),
@@ -619,6 +650,7 @@ pub async fn dial_nut(
     // node never saw a CE 135 and the inclusion row failed with no trace of
     // why, in half the runs.
     start_report_distribution(&connection, peer, &shared);
+    start_share_to_nut(&connection, peer, &shared);
     start_sync_probe(&connection, peer, &shared);
 
     // Serve the NUT's CE 128 / CE 129 requests on the dialed connection.
@@ -690,6 +722,7 @@ async fn endpoint_task(
         // whole ticket plan.
         start_ticket_delivery(&connection, peer_index, &shared);
         start_report_distribution(&connection, peer_index, &shared);
+        start_share_to_nut(&connection, peer_index, &shared);
         start_sync_probe(&connection, peer_index, &shared);
         // One task per connection: with UP 0 persistent the handler runs for
         // the lifetime of the connection, so awaiting it here would stall the
@@ -699,6 +732,35 @@ async fn endpoint_task(
             handle_connection(connection, peer_index, genesis_hash, shared).await;
         });
     }
+}
+
+/// Spawn the CE 134 sharer on this connection, if it claims this run's
+/// shares.
+///
+/// Claimed whole by the first connection to reach this point, whichever side
+/// opened it, the way the ticket plans are.
+fn start_share_to_nut(connection: &Conn, peer: u16, shared: &EmuShared) {
+    let connection = connection.clone();
+    let mut plans_set = shared.plans_set.clone();
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        while !*plans_set.borrow_and_update() {
+            if plans_set.changed().await.is_err() {
+                return;
+            }
+        }
+        for plan in shared.take_share_plan() {
+            crate::report_io::spawn_share_sender(
+                connection.clone(),
+                plan,
+                Arc::clone(&shared.trace),
+                Arc::clone(&shared.obs),
+                Arc::clone(&shared.shared_to_nut),
+                peer,
+            )
+            .await;
+        }
+    });
 }
 
 /// Spawn the CE 135 distributor on this connection, if it claims this run's

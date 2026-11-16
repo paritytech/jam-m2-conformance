@@ -358,6 +358,26 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         Err(e) => conn_findings.push(no_package_plan_finding(&e)),
                     }
                     phase("plan_package.report_to_distribute", t_dist);
+                    // The harness also shares a bundle *to* the node, so
+                    // the node does the refining for once. A rotation after
+                    // the last submission, so the two never contend.
+                    let share_base = honest_slot + SUBMISSION_SPACING_SLOTS * 6;
+                    let mut shares = Vec::new();
+                    for (i, fault) in [
+                        None,
+                        Some(m2_reference::reports::ShareFault::WrongShardCount),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let slot = share_base + SUBMISSION_SPACING_SLOTS * i as u32;
+                        match ref_chain.share_to_nut(nut_index as u16, slot, fault) {
+                            Ok(Some(share)) => shares.push(share),
+                            Ok(None) => {}
+                            Err(e) => conn_findings.push(no_package_plan_finding(&e)),
+                        }
+                    }
+                    emu.set_share_plan(shares);
                     emu.set_submission_plan(plan);
                     // CE 133 is builder -> guarantor, so it goes out over a
                     // builder connection of its own rather than riding an
@@ -382,6 +402,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         let submissions = emu.submissions();
         let sharing_answer = emu.sharing_answer();
         let distributed = emu.distributed();
+        let shared_to_nut = emu.shared_to_nut();
         let sharing_seen = emu.sharing_seen();
         let reports_seen = emu.reports_seen();
         let ce128_probes = emu.ce128_probes();
@@ -401,6 +422,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             reports_seen,
             sharing_answer,
             distributed,
+            shared_to_nut,
         };
         (
             ObsSource::Emulator {
@@ -841,10 +863,10 @@ fn plan_package_for_this_run(
             ref_chain.guarantors_for_in_epoch(core, plan.slot),
         );
     }
-    // The honest submission first, then one per fault, each a rotation later
-    // so the node has finished with the previous one and the assignment has
-    // not moved under the next. A fault sharing a slot with the honest
-    // submission would be graded against a node already busy with it.
+    // The honest submission first, then one per fault, a slot apart. A fault
+    // sharing a slot with the honest submission would be graded against a
+    // node already busy with it; a slot is six seconds, which is far more
+    // than the node needs, since it opens CE 134 within milliseconds.
     use m2_reference::reports::SubmissionFault::*;
     let mut plans = vec![m2_reference::reports::SubmissionSchedule {
         slot: plan.slot,
@@ -852,7 +874,6 @@ fn plan_package_for_this_run(
         co_guarantors: plan.co_guarantors.clone(),
         fault: None,
     }];
-    let rotation = jam_types::rotation_period();
     for (i, fault) in [
         Oversized,
         Unauthorized,
@@ -862,11 +883,19 @@ fn plan_package_for_this_run(
     .into_iter()
     .enumerate()
     {
-        let slot = plan.slot + rotation * (i as u32 + 1);
-        // Each fault needs the assignment at *its own* slot: a rotation later
-        // the NUT may hold a different core, and a package aimed at the core
-        // it held before is the not-a-guarantor fault by accident.
+        let slot = plan.slot + SUBMISSION_SPACING_SLOTS * (i as u32 + 1);
+        // Each fault needs the assignment at *its own* slot: the rotation
+        // can turn between two of them, and a package aimed at the core the
+        // NUT held before is the not-a-guarantor fault by accident.
         let Some(core) = ref_chain.core_for_in_epoch(nut_index as u16, slot) else {
+            // Past the epoch the view can resolve. Said out loud: this used
+            // to drop submissions silently, and the rows then reported
+            // themselves unexercised with no way to tell that from a node
+            // that was never asked.
+            eprintln!(
+                "[assignment] dropping the {fault:?} submission: slot {slot} is past the \
+                 epoch the view resolves"
+            );
             continue;
         };
         let addressed = if fault == NotAGuarantor {
@@ -1004,12 +1033,17 @@ async fn submit_one(
             return;
         }
     };
-    // In place before the node can share, which it does within milliseconds
-    // of accepting.
-    *shared
-        .sharing_answer
-        .lock()
-        .expect("the sharing answer lock is never poisoned") = Some(answer);
+    // Only the honest submission's answer. Set for every submission, each
+    // overwrote the last, so the hash the lane compared the node's report
+    // against was whichever fault happened to be built last -- and the
+    // harness was offering a co-guarantor signature for packages it had
+    // deliberately broken.
+    if schedule.fault.is_none() {
+        *shared
+            .sharing_answer
+            .lock()
+            .expect("the sharing answer lock is never poisoned") = Some(answer);
+    }
     eprintln!(
         "[builder] built for slot {} against head {}",
         schedule.slot,
@@ -1064,6 +1098,18 @@ async fn sleep_until_slot(slot: u32) {
             .await;
     }
 }
+
+/// Slots between one scheduled CE 133 submission or CE 134 share and the
+/// next.
+///
+/// Everything the lane schedules has to fit inside one epoch: it aims at the
+/// start of `cached + 1`, and the epoch view resolves only that epoch, so a
+/// slot past its end has no assignment to plan against and is dropped
+/// silently. A rotation apart put the fourth submission at +12 of a
+/// twelve-slot epoch, and two faults and both shares fell off the end --
+/// they never went out and their rows reported themselves unexercised with
+/// nothing to say why.
+const SUBMISSION_SPACING_SLOTS: u32 = 1;
 
 /// Slots to let an epoch settle before submitting into it.
 ///

@@ -148,6 +148,43 @@ pub struct SubmittedPackage {
     pub co_guarantors: Vec<u16>,
 }
 
+/// A CE 134 share the harness opened to the NUT, and the answer it gave.
+///
+/// The one N3 record where the node does the refining and the harness grades
+/// the result, rather than the other way round.
+#[derive(Debug, Clone)]
+pub struct SharedToNut {
+    /// The emulated validator that opened the stream.
+    pub peer: u16,
+    pub core: u16,
+    pub slot: u32,
+    /// Shard count offered in message 1.
+    pub shard_count: u16,
+    /// What the reference refined from the same bundle.
+    pub expected_report_hash: [u8; 32],
+    /// The node's reply, if it gave one: `Work-Report Hash ++ Ed25519
+    /// Signature` (`simple.md:456`).
+    pub reply: Option<([u8; 32], [u8; 64])>,
+    /// The node reset the stream rather than answering.
+    pub refused: bool,
+    /// The application error code the reset carried, when it did.
+    pub reset_code: Option<u64>,
+    /// What was deliberately wrong with the share, if anything.
+    pub fault: Option<ShareFault>,
+    pub sent_at_wall_ms: u64,
+}
+
+/// A deliberate defect in a CE 134 share, as the lane sees it.
+///
+/// The lane's copy of `m2_reference::reports::ShareFault`, mapped in the
+/// emulator, for the reason the submission faults are split the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareFault {
+    /// A shard count that is not the active validator count
+    /// (`simple.md:432-436`).
+    WrongShardCount,
+}
+
 /// A reference-guaranteed work-report the harness distributed to the NUT,
 /// for grading whether it was then included on chain.
 #[derive(Debug, Clone)]
@@ -201,6 +238,8 @@ pub struct N3Ctx {
     /// Only the emulated ones: the NUT does not distribute to itself, and a
     /// validator the harness is not playing cannot be observed either way.
     pub emulated_peers: Vec<u16>,
+    /// CE 134 shares the harness opened to the NUT, with its answers.
+    pub shared_to_nut: Vec<SharedToNut>,
     /// Reference-guaranteed reports the harness distributed to the NUT.
     pub distributed: Vec<DistributedReport>,
     /// Report hashes the NUT's own blocks carried in their guarantees, with
@@ -414,30 +453,28 @@ pub fn n3_ce135_distribution(ctx: &N3Ctx) -> Check {
                     || format!("validators {strangers:?} signed for a core they do not hold"),
                 ));
             }
+        }
 
-            // Only reports the *honest* submission could have produced. A
-            // run poses faults too, and a node that refines one of those
-            // distributes a report the reference never built -- comparing it
-            // against the honest package's hash fails a node for refining
-            // something it was deliberately handed.
-            let graded = ctx
-                .first_faulty_submission_at()
-                .is_none_or(|cutoff| report.at_wall_ms < cutoff);
-            if let (true, Some(expected)) = (graded, ctx.expected_report_hash) {
-                results.push(log::check_detail(
-                    "n3_ce135_report_matches_the_reference",
-                    report.report_hash == expected,
-                    Severity::Hard,
-                    || {
-                        format!(
-                            "the NUT distributed report {}, the reference refined {} from the \
-                             same package",
-                            short(&report.report_hash),
-                            short(&expected)
-                        )
-                    },
-                ));
-            }
+        // The node distributed the reference's report for the honest
+        // package. Once per run, not once per report: a run poses faulty
+        // submissions too, and a node that refines one of those distributes
+        // a report the reference never built. Grading every report against
+        // the honest hash fails a node for refining exactly what it was
+        // handed, which an earlier version of this row did.
+        if let Some(expected) = ctx.expected_report_hash {
+            let seen: Vec<String> = ctx.reports.iter().map(|r| short(&r.report_hash)).collect();
+            results.push(log::check_detail(
+                "n3_ce135_report_matches_the_reference",
+                ctx.reports.iter().any(|r| r.report_hash == expected),
+                Severity::Hard,
+                || {
+                    format!(
+                        "no report the NUT distributed was {}, which the reference refined \
+                         from the package it was submitted; it sent {seen:?}",
+                        short(&expected)
+                    )
+                },
+            ));
         }
 
         // Distribution reaches every validator the harness is playing
@@ -598,28 +635,103 @@ fn grade_fault(
     }
 }
 
+/// N3 — CE 134 receive: the NUT refines a bundle it is sent and answers with
+/// the report's hash and a signature over it (`simple.md:439-456`).
+///
+/// The one row where the node does the refining and the harness grades the
+/// result. Everything else in N3 grades what the node says about work the
+/// reference did.
+pub fn n3_ce134_receive(ctx: &N3Ctx) -> Check {
+    let ctx = ctx.clone();
+    check("n3_ce134_receive", Severity::Hard, move |_obs| {
+        let control = Control::new(
+            "n3_ce134_receive_not_exercised",
+            "a work-package bundle shared with the NUT",
+            !ctx.shared_to_nut.is_empty(),
+        );
+        if !control.present() {
+            return vec![control.absent("n3_ce134_receive_not_exercised")];
+        }
+
+        let mut results = Vec::new();
+        for share in &ctx.shared_to_nut {
+            match share.fault {
+                // `simple.md:432-436`: acceptable means matching the active
+                // validator count. With a static set that is one number, so
+                // anything else must be refused.
+                Some(ShareFault::WrongShardCount) => results.push(log::check_detail(
+                    "n3_ce134_wrong_shard_count_refused",
+                    share.reply.is_none(),
+                    Severity::Hard,
+                    || {
+                        format!(
+                            "the NUT answered a share offering {} shards, which is not the \
+                             active validator count",
+                            share.shard_count
+                        )
+                    },
+                )),
+                None => {
+                    results.push(log::check_detail(
+                        "n3_ce134_answered",
+                        share.reply.is_some(),
+                        Severity::Hard,
+                        || {
+                            if share.refused {
+                                format!(
+                                    "the NUT reset a well-formed share on core {} with code {}",
+                                    share.core,
+                                    share
+                                        .reset_code
+                                        .map(|c| format!("{c:#x}"))
+                                        .unwrap_or_else(|| "none".into())
+                                )
+                            } else {
+                                format!(
+                                    "the NUT neither answered nor refused a well-formed share \
+                                     on core {}",
+                                    share.core
+                                )
+                            }
+                        },
+                    ));
+                    // The hash is the whole point: it says the node refined
+                    // the bundle rather than echoing something. Only where
+                    // it answered at all, or the row would report one defect
+                    // twice.
+                    if let Some((hash, _)) = share.reply {
+                        results.push(log::check_detail(
+                            "n3_ce134_hash_equals_the_reference",
+                            hash == share.expected_report_hash,
+                            Severity::Hard,
+                            || {
+                                format!(
+                                    "the NUT refined {} from a bundle the reference refined \
+                                     {} from",
+                                    short(&hash),
+                                    short(&share.expected_report_hash)
+                                )
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        results
+    })
+}
+
 /// Every N3 check, in the order the lane reports them.
 pub fn all(ctx: &N3Ctx) -> Vec<Check> {
     vec![
         n3_ce133_submission(ctx),
+        n3_ce134_receive(ctx),
         n3_ce135_distribution(ctx),
         n3_ce135_inclusion(ctx),
     ]
 }
 
 impl N3Ctx {
-    /// When the first deliberately faulty submission went out, if any.
-    ///
-    /// The boundary past which a distributed report can no longer be
-    /// attributed to the honest package.
-    pub fn first_faulty_submission_at(&self) -> Option<u64> {
-        self.submissions
-            .iter()
-            .filter(|s| s.fault.is_some())
-            .map(|s| s.sent_at_wall_ms)
-            .min()
-    }
-
     /// Whether the NUT authored any block after `slot`.
     ///
     /// Separate from the included hashes because a block with an empty
@@ -697,6 +809,7 @@ mod tests {
             answers_sharing: true,
             expected_report_hash: None,
             emulated_peers: CO.to_vec(),
+            shared_to_nut: Vec::new(),
             distributed: Vec::new(),
             included: Vec::new(),
             authored_slots: Vec::new(),
@@ -946,34 +1059,10 @@ mod tests {
         }
     }
 
-    /// A report distributed after a faulty submission is not compared with
-    /// the honest package's report. The node may have refined the faulty one.
+    /// A node that distributed nothing matching the reference fails, even
+    /// though it distributed something.
     #[test]
-    fn a_report_after_a_faulty_submission_is_not_compared() {
-        let base = dist_ctx(vec![distribution(CO[0], vec![CO[0], NUT], [0x33; 32])]);
-        let ctx = N3Ctx {
-            submissions: vec![
-                submission(false),
-                SubmittedPackage {
-                    fault: Some(SubmissionFault::Oversized),
-                    sent_at_wall_ms: SENT_AT + 1_000,
-                    ..submission(false)
-                },
-            ],
-            ..base
-        };
-        // The distribution is stamped at SENT_AT + 2_000, after the fault.
-        let results = run(&n3_ce135_distribution(&ctx));
-        assert!(
-            !names(&results).contains(&"n3_ce135_report_matches_the_reference"),
-            "got {:?}",
-            names(&results)
-        );
-    }
-
-    /// With no faults posed, every distributed report is still compared.
-    #[test]
-    fn without_faults_the_report_comparison_still_applies() {
+    fn a_distribution_that_never_matches_the_reference_fails() {
         let results = run(&n3_ce135_distribution(&dist_ctx(vec![distribution(
             CO[0],
             vec![CO[0], NUT],
@@ -984,6 +1073,101 @@ mod tests {
             "n3_ce135_report_matches_the_reference",
             Severity::Hard
         ));
+    }
+
+    const SHARED: [u8; 32] = [0x6b; 32];
+
+    fn shared(reply: Option<[u8; 32]>, refused: bool, fault: Option<ShareFault>) -> SharedToNut {
+        SharedToNut {
+            peer: CO[0],
+            core: CORE,
+            slot: 100,
+            shard_count: 6,
+            expected_report_hash: SHARED,
+            reply: reply.map(|h| (h, [0u8; 64])),
+            refused,
+            reset_code: refused.then_some(0x0103),
+            fault,
+            sent_at_wall_ms: SENT_AT,
+        }
+    }
+
+    fn share_ctx(shares: Vec<SharedToNut>) -> N3Ctx {
+        N3Ctx {
+            shared_to_nut: shares,
+            ..ctx(Vec::new(), Vec::new())
+        }
+    }
+
+    /// The node refined the bundle and answered with the same report.
+    #[test]
+    fn a_well_formed_share_is_answered_with_the_reference_hash() {
+        let results = run(&n3_ce134_receive(&share_ctx(vec![shared(
+            Some(SHARED),
+            false,
+            None,
+        )])));
+        assert!(
+            results.iter().all(|r| r.outcome == Outcome::Pass),
+            "got {:?}",
+            names(&results)
+        );
+    }
+
+    /// A different hash means the node refined something else.
+    #[test]
+    fn a_hash_that_differs_from_the_reference_fails() {
+        let results = run(&n3_ce134_receive(&share_ctx(vec![shared(
+            Some([0x11; 32]),
+            false,
+            None,
+        )])));
+        assert!(failed(
+            &results,
+            "n3_ce134_hash_equals_the_reference",
+            Severity::Hard
+        ));
+    }
+
+    /// Refusing a well-formed share is a defect, and is reported once.
+    #[test]
+    fn refusing_a_well_formed_share_fails_once() {
+        let results = run(&n3_ce134_receive(&share_ctx(vec![shared(
+            None, true, None,
+        )])));
+        assert!(failed(&results, "n3_ce134_answered", Severity::Hard));
+        assert!(
+            !names(&results).contains(&"n3_ce134_hash_equals_the_reference"),
+            "a node that never answered has no hash to compare"
+        );
+    }
+
+    /// An unacceptable shard count must not be answered.
+    #[test]
+    fn an_unacceptable_shard_count_must_be_refused() {
+        let refused = run(&n3_ce134_receive(&share_ctx(vec![SharedToNut {
+            shard_count: 5,
+            ..shared(None, true, Some(ShareFault::WrongShardCount))
+        }])));
+        assert!(refused.iter().all(|r| r.outcome == Outcome::Pass));
+
+        let answered = run(&n3_ce134_receive(&share_ctx(vec![SharedToNut {
+            shard_count: 5,
+            ..shared(Some(SHARED), false, Some(ShareFault::WrongShardCount))
+        }])));
+        assert!(failed(
+            &answered,
+            "n3_ce134_wrong_shard_count_refused",
+            Severity::Hard
+        ));
+    }
+
+    /// A run that shared nothing proves nothing.
+    #[test]
+    fn a_run_with_no_share_proves_nothing() {
+        let results = run(&n3_ce134_receive(&share_ctx(Vec::new())));
+        assert_eq!(names(&results), vec!["n3_ce134_receive_not_exercised"]);
+        assert!(results.iter().all(|r| r.outcome != Outcome::Pass));
     }
 
     /// Each fault is graded by its own rule, not by the honest one's.
