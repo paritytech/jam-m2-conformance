@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/jamnp-s",
+    "crates/m2-oracle-proto",
     "crates/m2-reference",
     "crates/m2-emu",
     "crates/m2-scenario",

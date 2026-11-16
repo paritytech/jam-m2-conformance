@@ -1,0 +1,457 @@
+//! Wire protocol between the conformance harness and its polkajam oracle.
+//!
+//! The harness compiles polkajam's node crate in-process to use as a
+//! reference oracle, behind the `hazmat` feature whose own documentation
+//! says its interfaces "may change at any time". This crate is the first
+//! step out of that: the message set an out-of-process oracle answers, so
+//! the workspace can depend on polkajam's published crates alone.
+//!
+//! # Framing
+//!
+//! Taken from polkajam's fuzz protocol unchanged: a 4-byte little-endian
+//! length prefix, then a JAM-codec `#[repr(u8)]` message. Tags 0 to 5 and
+//! 255 keep the meaning they have there, so a reader of one is a reader of
+//! the other; M2's own messages start at 16 and the two sets cannot collide.
+//!
+//! # One deviation
+//!
+//! The fuzz protocol's `Error(255)` is the node's verdict on a block --
+//! "this block is invalid" -- and its own documentation says internal
+//! failures must not be signalled with it. An oracle that panics is an
+//! internal failure, so M2 adds [`Message::OracleFault`] for those. Without
+//! the split a report could not tell an oracle crash from a node under test
+//! that was correctly rejected.
+#![deny(unsafe_code)]
+
+use codec::{Decode, Encode};
+
+/// Version of this protocol, carried in the handshake.
+///
+/// Bumped whenever a message changes shape. The client refuses a mismatch
+/// rather than guessing, because a silently misread response is a wrong
+/// conformance verdict rather than an error.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// Largest frame either side will read, matching the fuzz protocol's.
+pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
+
+/// A work item, mirrored.
+///
+/// `jam_node::hazmat::BuildItem` is a hazmat type and cannot cross the wire
+/// or appear in a crate that does not depend on the node. Every field is one
+/// the harness already sets.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct WireItem {
+    pub service: u32,
+    pub payload: Vec<u8>,
+    pub ref_gas: u64,
+    pub acc_gas: u64,
+    /// Extrinsic bodies, in the order the package will declare them.
+    pub xts: Vec<Vec<u8>>,
+    /// Imported segment specs, encoded as the engine encodes them.
+    pub imports: Vec<Vec<u8>>,
+    pub export_count: u16,
+}
+
+/// Which view of the core assignment a request wants.
+///
+/// polkajam computes it two ways and they disagree for a slot in the chain
+/// head's own epoch: the storage reads an entropy entry chosen by its own
+/// slot, while a guarantor choosing who to share with reads its epoch's
+/// precomputed one. The harness needs both -- one to match what the node
+/// does, one to match the on-chain rule -- so the request says which.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub enum AssignmentView {
+    /// `storage.core_assignments_for(slot)`, which the on-chain rule uses.
+    Storage = 0,
+    /// `EpochInfo::core_assignments(slot)`, which a sharing guarantor uses.
+    Epoch = 1,
+}
+
+/// A session on the oracle: one `AuthoringHarness` over one spec file.
+///
+/// Sessions exist because a run holds two chains at once -- the harness's own
+/// and the view it hands the node -- and a single connection has to serve
+/// both without their slots interleaving.
+pub type SessionId = u16;
+
+/// One request or response on the wire.
+///
+/// Tags 0 to 5 and 255 are the fuzz protocol's; 16 upward are M2's.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+#[repr(u8)]
+#[allow(clippy::large_enum_variant)]
+pub enum Message {
+    /// Handshake, both directions. The response carries the oracle's
+    /// protocol version and the polkajam revision it was built from.
+    PeerInfo(PeerInfo) = 0,
+    /// A block to import, answered with `StateRoot` or `Error`.
+    ImportBlock(Vec<u8>) = 3,
+    /// State at a header hash, answered with `State`.
+    GetState([u8; 32]) = 4,
+
+    /// Open a session over a genesis spec file.
+    Open {
+        spec_path: String,
+        /// Validator indices whose secrets this session holds.
+        holds: Vec<u16>,
+    } = 16,
+    /// A session was opened.
+    Opened {
+        session: SessionId,
+        genesis_hash: [u8; 32],
+        genesis_slot: u32,
+    } = 17,
+    /// Close a session and drop its harness.
+    Close(SessionId) = 18,
+    /// Author a block at a slot. `None` means the session held no key for it.
+    AuthorBlock {
+        session: SessionId,
+        slot: u32,
+    } = 19,
+    /// The authored block, encoded, or nothing.
+    Authored(Option<Vec<u8>>) = 20,
+    /// The session's best block.
+    Head(SessionId) = 21,
+    /// Hash and slot of the best block.
+    HeadIs {
+        hash: [u8; 32],
+        slot: u32,
+    } = 22,
+    /// Every block on the session's chain, encoded.
+    ChainBlocks(SessionId) = 23,
+    Blocks(Vec<Vec<u8>>) = 24,
+    /// Posterior state root of a block, if the session has it.
+    StateRootOf {
+        session: SessionId,
+        hash: [u8; 32],
+    } = 25,
+    /// Build a package, optionally against an authorizer no core accepts.
+    BuildPackage {
+        session: SessionId,
+        items: Vec<WireItem>,
+        /// False builds against `Authorizer::any()`, whose code hash is
+        /// zero, which is how the lane poses an unauthorized package.
+        authorized: bool,
+    } = 26,
+    /// The package and the extrinsic bodies that go with it.
+    Package {
+        package: Vec<u8>,
+        extrinsics: Vec<Vec<u8>>,
+    } = 27,
+    /// Build, refine and sign in one pass.
+    GuaranteeWork {
+        session: SessionId,
+        items: Vec<WireItem>,
+        core: u16,
+    } = 28,
+    /// Everything that one pass produces.
+    GuaranteedWork {
+        package: Vec<u8>,
+        extrinsics: Vec<Vec<u8>>,
+        report: Vec<u8>,
+        bundle: Vec<u8>,
+        guarantee: Vec<u8>,
+    } = 29,
+    /// The whole core-to-validators table at a slot, in one answer.
+    ///
+    /// One message rather than four. `guarantors_for`, `core_for` and their
+    /// epoch-view counterparts are all derivable from the table, and a
+    /// round trip each would put four on the slot-critical path.
+    CoreAssignment {
+        session: SessionId,
+        slot: u32,
+        view: AssignmentView,
+    } = 30,
+    /// Validators per core, indexed by core.
+    Assignment(Vec<Vec<u16>>) = 31,
+    /// The two epoch views and the entropy each shuffles with.
+    ///
+    /// Diagnostic, and the one message expected to be deleted: it exists
+    /// for an open question about which assignment is authoritative.
+    EpochProbe(SessionId) = 32,
+    EpochProbed {
+        cached_index: u32,
+        head_epoch: u32,
+        /// Entries 1 and 2 of the best block's entropy buffer.
+        entropy_1: [u8; 32],
+        entropy_2: [u8; 32],
+    } = 33,
+
+    /// Posterior state root, the fuzz protocol's response to `ImportBlock`.
+    StateRoot([u8; 32]) = 2,
+    /// Key-value state, the response to `GetState`.
+    State(Vec<(Vec<u8>, Vec<u8>)>) = 5,
+    /// The oracle's verdict that something it was given was invalid.
+    Error(String) = 255,
+    /// The oracle itself failed: a panic, or a harness error.
+    ///
+    /// Separate from `Error` so a report can say "the oracle fell over"
+    /// rather than attributing it to the node under test.
+    OracleFault(String) = 254,
+}
+
+/// Handshake payload.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct PeerInfo {
+    pub protocol_version: u16,
+    /// The polkajam revision the oracle was built from, so the client can
+    /// refuse an oracle that does not match the node under test.
+    pub polkajam_revision: String,
+    pub name: String,
+}
+
+/// Frame a message: `[len: u32 LE] ++ [body]`.
+pub fn frame(message: &Message) -> Vec<u8> {
+    let body = message.encode();
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum FrameError {
+    #[error("frame of {0} bytes is over the {MAX_MESSAGE_SIZE} byte limit")]
+    TooLarge(u32),
+    #[error("the frame is shorter than its length prefix claims")]
+    Short,
+    #[error("the frame body did not decode: {0}")]
+    Malformed(String),
+}
+
+/// Read one framed message from the front of `input`, returning it and the
+/// bytes that follow.
+///
+/// Strict about trailing bytes inside the frame: a body that decodes and
+/// leaves bytes over is malformed, not merely longer than expected. The
+/// same hole the CE 133 work-package codec had, and worth closing before
+/// anything depends on it.
+pub fn read_frame(input: &[u8]) -> Result<(Message, &[u8]), FrameError> {
+    if input.len() < 4 {
+        return Err(FrameError::Short);
+    }
+    let (prefix, rest) = input.split_at(4);
+    let len = u32::from_le_bytes(prefix.try_into().expect("four bytes"));
+    if len > MAX_MESSAGE_SIZE {
+        return Err(FrameError::TooLarge(len));
+    }
+    let len = len as usize;
+    if rest.len() < len {
+        return Err(FrameError::Short);
+    }
+    let (body, tail) = rest.split_at(len);
+    let mut cursor = body;
+    let message = Message::decode(&mut cursor).map_err(|e| FrameError::Malformed(e.to_string()))?;
+    if !cursor.is_empty() {
+        return Err(FrameError::Malformed(
+            "trailing bytes after the message".into(),
+        ));
+    }
+    Ok((message, tail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn every_message() -> Vec<Message> {
+        let item = WireItem {
+            service: 42,
+            payload: vec![1, 2, 3],
+            ref_gas: 1_000,
+            acc_gas: 2_000,
+            xts: vec![vec![0xaa], vec![]],
+            imports: vec![vec![0xbb; 4]],
+            export_count: 2,
+        };
+        vec![
+            Message::PeerInfo(PeerInfo {
+                protocol_version: PROTOCOL_VERSION,
+                polkajam_revision: "e3d216c2".into(),
+                name: "m2-oracle".into(),
+            }),
+            Message::ImportBlock(vec![0x01; 16]),
+            Message::GetState([0x22; 32]),
+            Message::Open {
+                spec_path: "/tmp/spec.json".into(),
+                holds: vec![0, 4, 5],
+            },
+            Message::Opened {
+                session: 1,
+                genesis_hash: [0x33; 32],
+                genesis_slot: 9_780_000,
+            },
+            Message::Close(1),
+            Message::AuthorBlock {
+                session: 1,
+                slot: 9_780_001,
+            },
+            Message::Authored(Some(vec![0x44; 8])),
+            Message::Authored(None),
+            Message::Head(1),
+            Message::HeadIs {
+                hash: [0x55; 32],
+                slot: 9_780_002,
+            },
+            Message::ChainBlocks(1),
+            Message::Blocks(vec![vec![0x66], vec![0x77, 0x88]]),
+            Message::StateRootOf {
+                session: 1,
+                hash: [0x99; 32],
+            },
+            Message::BuildPackage {
+                session: 1,
+                items: vec![item.clone()],
+                authorized: false,
+            },
+            Message::Package {
+                package: vec![0xab; 48],
+                extrinsics: vec![vec![1, 2], vec![3]],
+            },
+            Message::GuaranteeWork {
+                session: 1,
+                items: vec![item],
+                core: 1,
+            },
+            Message::GuaranteedWork {
+                package: vec![0xcd; 32],
+                extrinsics: vec![vec![4]],
+                report: vec![0xef; 16],
+                bundle: vec![0x11; 64],
+                guarantee: vec![0x22; 24],
+            },
+            Message::CoreAssignment {
+                session: 1,
+                slot: 9_780_003,
+                view: AssignmentView::Epoch,
+            },
+            Message::Assignment(vec![vec![0, 4, 5], vec![1, 2, 3]]),
+            Message::EpochProbe(1),
+            Message::EpochProbed {
+                cached_index: 815_083,
+                head_epoch: 815_083,
+                entropy_1: [0xee; 32],
+                entropy_2: [0xbb; 32],
+            },
+            Message::StateRoot([0x77; 32]),
+            Message::State(vec![(vec![0x01; 31], vec![0xff; 4])]),
+            Message::Error("block rejected".into()),
+            Message::OracleFault("harness panicked".into()),
+        ]
+    }
+
+    #[test]
+    fn every_message_round_trips_through_a_frame() {
+        for message in every_message() {
+            let wire = frame(&message);
+            let (decoded, rest) = read_frame(&wire).expect("the frame reads");
+            assert_eq!(decoded, message, "round trip changed the message");
+            assert!(rest.is_empty(), "one frame leaves nothing over");
+        }
+    }
+
+    /// Frames are self-delimiting, so a reader can take them back to back.
+    #[test]
+    fn frames_can_be_read_back_to_back() {
+        let messages = every_message();
+        let mut wire = Vec::new();
+        for message in &messages {
+            wire.extend_from_slice(&frame(message));
+        }
+        let mut rest: &[u8] = &wire;
+        for expected in &messages {
+            let (decoded, tail) = read_frame(rest).expect("each frame reads");
+            assert_eq!(&decoded, expected);
+            rest = tail;
+        }
+        assert!(rest.is_empty());
+    }
+
+    /// The tags the fuzz protocol already defines keep their meaning, so a
+    /// reader of one does not mistake a message of the other.
+    #[test]
+    fn the_fuzz_protocol_tags_are_unchanged() {
+        for (message, tag) in [
+            (
+                Message::PeerInfo(PeerInfo {
+                    protocol_version: 1,
+                    polkajam_revision: String::new(),
+                    name: String::new(),
+                }),
+                0u8,
+            ),
+            (Message::StateRoot([0; 32]), 2),
+            (Message::ImportBlock(Vec::new()), 3),
+            (Message::GetState([0; 32]), 4),
+            (Message::State(Vec::new()), 5),
+            (Message::Error(String::new()), 255),
+        ] {
+            assert_eq!(
+                message.encode()[0],
+                tag,
+                "{message:?} must keep the fuzz protocol's tag"
+            );
+        }
+    }
+
+    /// M2's own messages start at 16, so they cannot collide with the fuzz
+    /// protocol's 0 to 5 however either set grows.
+    #[test]
+    fn the_m2_messages_start_above_the_fuzz_ones() {
+        for message in every_message() {
+            let tag = message.encode()[0];
+            assert!(
+                tag <= 5 || tag >= 16,
+                "{message:?} has tag {tag}, in the gap reserved for the fuzz protocol"
+            );
+        }
+    }
+
+    /// An internal failure is not the same message as a rejected block. A
+    /// report that could not tell them apart would blame the node under
+    /// test for the oracle falling over.
+    #[test]
+    fn an_oracle_fault_is_not_an_error() {
+        let fault = Message::OracleFault("panicked".into());
+        let error = Message::Error("panicked".into());
+        assert_ne!(fault.encode()[0], error.encode()[0]);
+        assert_ne!(fault, error);
+    }
+
+    #[test]
+    fn a_truncated_frame_is_short_not_malformed() {
+        let wire = frame(&Message::GetState([0x11; 32]));
+        assert_eq!(read_frame(&wire[..3]), Err(FrameError::Short));
+        assert_eq!(
+            read_frame(&wire[..wire.len() - 1]),
+            Err(FrameError::Short),
+            "a body shorter than its prefix claims is short, not malformed"
+        );
+    }
+
+    /// Trailing bytes inside a frame are malformed. `Decode` stops at the
+    /// end of the value it understands, so without the check a sender could
+    /// append anything and the frame would still be accepted -- the same
+    /// hole the CE 133 work-package codec had.
+    #[test]
+    fn trailing_bytes_inside_a_frame_are_rejected() {
+        let message = Message::GetState([0x11; 32]);
+        let body = message.encode();
+        let mut wire = ((body.len() + 1) as u32).to_le_bytes().to_vec();
+        wire.extend_from_slice(&body);
+        wire.push(0xff);
+        assert!(matches!(read_frame(&wire), Err(FrameError::Malformed(_))));
+    }
+
+    #[test]
+    fn a_frame_over_the_limit_is_refused_before_it_is_read() {
+        let mut wire = (MAX_MESSAGE_SIZE + 1).to_le_bytes().to_vec();
+        wire.extend_from_slice(&[0u8; 8]);
+        assert_eq!(
+            read_frame(&wire),
+            Err(FrameError::TooLarge(MAX_MESSAGE_SIZE + 1)),
+            "the length prefix alone decides, before anything is allocated"
+        );
+    }
+}
