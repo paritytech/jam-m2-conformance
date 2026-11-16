@@ -1,0 +1,30 @@
+[package]
+name = "m2-oracle"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Out-of-process polkajam reference oracle for the JAM M2 conformance harness"
+
+# Deliberately outside the conformance workspace. This is the one crate that
+# depends on `jam-node` with the `hazmat` feature, whose own documentation
+# says its interfaces may change at any time; keeping it here means the
+# workspace does not compile the node at all, and a breaking hazmat change
+# lands in ~500 lines rather than across six crates.
+[workspace]
+
+[dependencies]
+m2-oracle-proto = { path = "../crates/m2-oracle-proto" }
+jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a", features = ["hazmat"] }
+jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
+jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
+codec = { package = "jam-codec", version = "0.1.1", default-features = false, features = ["derive", "max-encoded-len"] }
+
+# `jam-node`'s build script embeds the `jam-bootstrap-service` blob only when
+# the profile has no debug info. These overrides moved here from the
+# workspace root, which is the point: the workspace no longer needs them.
+[profile.dev.package.jam-node]
+debug = false
+
+# Ring-VRF proving is the oracle's one hot path.
+[profile.dev.package."*"]
+opt-level = 3
