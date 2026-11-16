@@ -24,5 +24,6 @@ codec = { package = "jam-codec", version = "0.1.1", default-features = false, fe
 ed25519-consensus = { workspace = true }
 m2-scenario = { path = "../../crates/m2-scenario" }
 m2-emu = { path = "../../crates/m2-emu" }
+m2-oracle-proto = { path = "../../crates/m2-oracle-proto" }
 m2-reference = { path = "../../crates/m2-reference" }
 jamnp-s = { path = "../../crates/jamnp-s" }

@@ -35,6 +35,16 @@ pub const PROTOCOL_VERSION: u16 = 2;
 /// Largest frame either side will read, matching the fuzz protocol's.
 pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
 
+/// The dev chain spec's bootstrap service, which is what every work item
+/// this harness builds is addressed to.
+///
+/// A copy of `jam_node::DEV_BOOTSTRAP_SERVICE_ID`, kept here so that a crate
+/// with no node dependency can name the service. The oracle holds both and
+/// asserts they are equal, which is where a re-pin that moved it would be
+/// caught -- the same arrangement as the revision pin, and for the same
+/// reason: one source, one guard, no second copy to forget.
+pub const DEV_BOOTSTRAP_SERVICE_ID: u32 = 0;
+
 /// A work item, mirrored.
 ///
 /// `jam_node::hazmat::BuildItem` is a hazmat type and cannot cross the wire

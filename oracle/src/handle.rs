@@ -505,6 +505,19 @@ fn hex8(bytes: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The protocol crate carries its own copy of the bootstrap service id
+    /// so that a crate without a node dependency can name it. This is the
+    /// one place both are in scope, so it is the only place the copy can be
+    /// checked. A re-pin that moved the id would otherwise address every
+    /// work item in the run to a service that is not there.
+    #[test]
+    fn the_protocols_bootstrap_service_id_is_the_nodes() {
+        assert_eq!(
+            m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+            jam_node::DEV_BOOTSTRAP_SERVICE_ID
+        );
+    }
     use super::*;
 
     /// A request the oracle has no session for is its own fault to report,

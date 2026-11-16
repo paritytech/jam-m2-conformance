@@ -925,16 +925,16 @@ fn plan_package_for_this_run(
 /// The submission and the distributed report were once both built from the
 /// empty item, which made them one package: the node noted the report and
 /// then refused the submission as already reported.
-fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
-    jam_node::hazmat::BuildItem::new(
-        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-        jam_types::WorkPayload(payload),
-        jam_types::max_refine_gas(),
-        jam_types::max_accumulate_gas(),
-        Vec::new(),
-        Vec::new(),
-        0,
-    )
+fn work_item_with_payload(payload: Vec<u8>) -> m2_oracle_proto::WireItem {
+    m2_oracle_proto::WireItem {
+        service: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+        payload,
+        ref_gas: jam_types::max_refine_gas(),
+        acc_gas: jam_types::max_accumulate_gas(),
+        xts: Vec::new(),
+        imports: Vec::new(),
+        export_count: 0,
+    }
 }
 
 /// Wait until the chain's cached epoch view names the epoch its own head is
@@ -1534,15 +1534,7 @@ mod tests {
     {
         let chain = anchored_chain(41000)?;
 
-        let item = jam_node::hazmat::BuildItem::new(
-            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-            jam_types::WorkPayload(Vec::new()),
-            jam_types::max_refine_gas(),
-            jam_types::max_accumulate_gas(),
-            Vec::new(),
-            Vec::new(),
-            0,
-        );
+        let item = m2_reference::reports::trivial_work_item();
         let core = 0;
         let started = std::time::Instant::now();
         let work = chain.guarantee_work(vec![item], core)?;
@@ -1645,16 +1637,11 @@ mod tests {
 
         let chain = anchored_chain(46000)?;
         let bodies = vec![vec![1u8, 2, 3], vec![4u8, 5]];
-        let item = jam_node::hazmat::BuildItem::new(
-            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-            jam_types::WorkPayload(Vec::new()),
-            jam_types::max_refine_gas(),
-            jam_types::max_accumulate_gas(),
-            bodies.clone(),
-            Vec::new(),
-            0,
-        );
-        let built = chain.build_work_package(vec![item]);
+        let item = m2_oracle_proto::WireItem {
+            xts: bodies.clone(),
+            ..m2_reference::reports::trivial_work_item()
+        };
+        let built = chain.build_work_package(vec![item])?;
 
         assert_eq!(
             built.extrinsics, bodies,
@@ -1701,19 +1688,9 @@ mod tests {
         use jamnp_s::codec::ce131_136::WorkPackageSubmission;
 
         let chain = anchored_chain(45000)?;
-        let item = || {
-            jam_node::hazmat::BuildItem::new(
-                jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-                jam_types::WorkPayload(Vec::new()),
-                jam_types::max_refine_gas(),
-                jam_types::max_accumulate_gas(),
-                Vec::new(),
-                Vec::new(),
-                0,
-            )
-        };
-        let good = chain.build_work_package(vec![item()]);
-        let bad = chain.build_unauthorized_package(vec![item()]);
+        let item = || m2_reference::reports::trivial_work_item();
+        let good = chain.build_work_package(vec![item()])?;
+        let bad = chain.build_unauthorized_package(vec![item()])?;
 
         let submission = WorkPackageSubmission::from_package(0, &good.package, Vec::new());
         assert!(
@@ -1763,15 +1740,7 @@ mod tests {
         use jamnp_s::codec::ce131_136::WorkPackageSubmission;
 
         let chain = anchored_chain(44000)?;
-        let item = jam_node::hazmat::BuildItem::new(
-            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-            jam_types::WorkPayload(Vec::new()),
-            jam_types::max_refine_gas(),
-            jam_types::max_accumulate_gas(),
-            Vec::new(),
-            Vec::new(),
-            0,
-        );
+        let item = m2_reference::reports::trivial_work_item();
         let work = chain.guarantee_work(vec![item], 0)?;
 
         let mut sub = WorkPackageSubmission::from_package(0, &work.package, Vec::new());

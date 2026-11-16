@@ -1987,6 +1987,7 @@ dependencies = [
  "jam-std-common",
  "jam-types",
  "jamnp-s",
+ "m2-oracle-proto",
  "thiserror 2.0.20",
 ]
 
@@ -2004,6 +2005,7 @@ dependencies = [
  "jam-types",
  "jamnp-s",
  "m2-emu",
+ "m2-oracle-proto",
  "m2-reference",
  "m2-scenario",
  "serde",

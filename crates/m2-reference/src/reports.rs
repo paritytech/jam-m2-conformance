@@ -6,7 +6,8 @@
 //! does the work; what this module adds is a surface that does not leak it,
 //! so a lane cannot reach past the oracle into the engine.
 
-use jam_types::CoreIndex;
+use jam_types::{CoreIndex, Decode};
+use m2_oracle_proto::WireItem;
 
 use crate::chain::{ChainError, RefChain};
 
@@ -101,7 +102,7 @@ fn epoch_info_for<'a, E>(
 
 /// The smallest work item that refines: no payload, no imports, no
 /// extrinsics.
-pub fn trivial_work_item() -> jam_node::hazmat::BuildItem {
+pub fn trivial_work_item() -> WireItem {
     work_item_with_payload(Vec::new())
 }
 
@@ -112,16 +113,53 @@ pub fn trivial_work_item() -> jam_node::hazmat::BuildItem {
 /// the same template. Given the same payload they are byte-identical, and a
 /// node that has noted one refuses the other as already reported -- which
 /// reads as the submission being rejected, not as a duplicate.
-pub fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
-    jam_node::hazmat::BuildItem::new(
-        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-        jam_types::WorkPayload(payload),
-        jam_types::max_refine_gas(),
-        jam_types::max_accumulate_gas(),
-        Vec::new(),
-        Vec::new(),
-        0,
-    )
+pub fn work_item_with_payload(payload: Vec<u8>) -> WireItem {
+    WireItem {
+        service: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+        payload,
+        ref_gas: jam_types::max_refine_gas(),
+        acc_gas: jam_types::max_accumulate_gas(),
+        xts: Vec::new(),
+        imports: Vec::new(),
+        export_count: 0,
+    }
+}
+
+/// A work item as the engine wants it.
+///
+/// `WireItem` is the harness's own shape, carried so that a crate with no
+/// node dependency can describe an item. This is the one conversion, and it
+/// stays private: a `BuildItem` cannot leave this crate.
+fn build_item(item: &WireItem) -> Result<jam_node::hazmat::BuildItem, ChainError> {
+    // `ImportSpec` has a hand-written codec -- its root is a two-case enum,
+    // not a plain hash -- so the specs travel encoded.
+    let mut imports = Vec::with_capacity(item.imports.len());
+    for (i, encoded) in item.imports.iter().enumerate() {
+        let mut cursor = &encoded[..];
+        let spec = jam_types::ImportSpec::decode(&mut cursor)
+            .map_err(|e| ChainError::Chain(format!("import spec {i} did not decode: {e}")))?;
+        if !cursor.is_empty() {
+            return Err(ChainError::Chain(format!(
+                "import spec {i} has {} trailing bytes",
+                cursor.len()
+            )));
+        }
+        imports.push(spec);
+    }
+    Ok(jam_node::hazmat::BuildItem::new(
+        item.service,
+        jam_types::WorkPayload(item.payload.clone()),
+        item.ref_gas,
+        item.acc_gas,
+        item.xts.clone(),
+        imports,
+        item.export_count,
+    ))
+}
+
+/// Every item, converted, or the first failure.
+fn build_items(items: &[WireItem]) -> Result<Vec<jam_node::hazmat::BuildItem>, ChainError> {
+    items.iter().map(build_item).collect()
 }
 
 /// Payload that carries a package past the CE 133 initial-message cap.
@@ -404,7 +442,7 @@ impl RefChain {
         };
         let work = match schedule.fault {
             Some(SubmissionFault::Unauthorized) => {
-                let built = self.build_unauthorized_package(items);
+                let built = self.build_unauthorized_package(items)?;
                 // An unauthorized package is never refined: the node is
                 // expected to take the submission and then not share it, so
                 // the harness needs the package and no report at all.
@@ -442,12 +480,12 @@ impl RefChain {
     }
 
     /// Build `items` into an authorized package for a builder to submit.
-    pub fn build_work_package(&self, items: Vec<jam_node::hazmat::BuildItem>) -> BuiltPackage {
-        let (package, extrinsics) = self.harness().build_package(items);
-        BuiltPackage {
+    pub fn build_work_package(&self, items: Vec<WireItem>) -> Result<BuiltPackage, ChainError> {
+        let (package, extrinsics) = self.harness().build_package(build_items(&items)?);
+        Ok(BuiltPackage {
             package,
             extrinsics,
-        }
+        })
     }
 
     /// The same package, against an authorizer no core will accept.
@@ -459,18 +497,18 @@ impl RefChain {
     /// parse anything.
     pub fn build_unauthorized_package(
         &self,
-        items: Vec<jam_node::hazmat::BuildItem>,
-    ) -> BuiltPackage {
+        items: Vec<WireItem>,
+    ) -> Result<BuiltPackage, ChainError> {
         let (package, extrinsics) = self.harness().build_package_with_auth(
-            items,
+            build_items(&items)?,
             jam_types::Authorizer::any(),
-            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+            m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
             jam_types::Authorization::new(),
         );
-        BuiltPackage {
+        Ok(BuiltPackage {
             package,
             extrinsics,
-        }
+        })
     }
 
     /// Where to aim a CE 133 submission: the first slot at or after `from`
@@ -544,7 +582,7 @@ impl RefChain {
     /// is more than one.
     pub fn report_to_distribute(
         &self,
-        items: Vec<jam_node::hazmat::BuildItem>,
+        items: Vec<WireItem>,
         nut: u16,
         slot: u32,
     ) -> Result<Option<ScheduledReport>, ChainError> {
@@ -598,9 +636,10 @@ impl RefChain {
     /// adopting it would have no way to pose "guaranteed but never included".
     pub fn guarantee_work(
         &self,
-        items: Vec<jam_node::hazmat::BuildItem>,
+        items: Vec<WireItem>,
         core: CoreIndex,
     ) -> Result<GuaranteedWork, ChainError> {
+        let items = build_items(&items)?;
         let mut harness = self.harness();
         let (package, xts) = harness.build_package(items);
         let wire = package.clone();
