@@ -1,22 +1,61 @@
 //! Tiny-spec genesis + spec-file generation for the NUT (DESIGN.md §7).
 //!
-//! Produces two spec artefacts from one 6-validator tiny `ChainSpec`:
+//! Produces two spec artefacts from one 6-validator tiny genesis:
 //! - the M2-standard JSON (`spec-m2.json`, `M2Spec`) that the NUT reads, and
-//! - polkajam's own spec JSON (`spec.json`, via `ChainSpec::to_file`) that the
-//!   reference engine loads.
+//! - polkajam's own spec JSON (`spec.json`) that the oracle loads.
+//!
+//! The dev genesis underneath both comes from the oracle. It is built around
+//! a bootstrap-service blob that lives inside polkajam's node crate, so it is
+//! the one thing this workspace cannot produce for itself; everything after
+//! that -- anchoring the genesis to a slot, writing this run's validator
+//! addresses into the four places the state keeps a copy of the keyset -- is
+//! done here, from `jam-std-common` types.
 //!
 //! The genesis header is `Header::genesis_with_epoch(epoch0_mark(...))`: slot 0,
 //! and its hash is a function of the validators' bandersnatch/ed25519 keys only
 //! (`EpochKeySet`), so overriding the on-chain `PeerAddr` metadata never changes
 //! the genesis hash — the NUT and the reference agree on genesis.
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use codec::{DecodeAll, Encode};
-use jam_node::ChainSpec;
-use jam_std_common::{StorageKey, SystemKey, ValKeysets};
+use jam_std_common::{Header, StorageKey, SystemKey, ValKeysets};
 use jam_types::BoundedFromFn;
+use m2_oracle_proto::Message;
+use m2_reference::oracle::Oracle;
 use serde::Serialize;
+
+/// A genesis, in the pieces a spec file is written from.
+///
+/// What `jam_node::ChainSpec` carried, minus the lazily-built storage: the
+/// state is already built here, because the only reason to have it is to
+/// patch it.
+pub struct TinySpec {
+    pub genesis_header: Header,
+    /// 31-byte key to value, ordered so two runs of one seed write
+    /// byte-identical files.
+    pub state: BTreeMap<[u8; 31], Vec<u8>>,
+    /// Encoded `ProtocolParameters`, carried through from the oracle so the
+    /// file says what it was built under.
+    pub protocol_parameters: Vec<u8>,
+}
+
+impl TinySpec {
+    /// Hash of the genesis header.
+    pub fn genesis_hash(&self) -> [u8; 32] {
+        self.genesis_header.hash().0
+    }
+}
+
+/// polkajam's own default dev base port.
+///
+/// Only the genesis *keys* reach the header hash, and this run overwrites
+/// every address in the state below, so the port here never shows up in a
+/// spec this module writes. It is named rather than passed so that the
+/// request is the same on every run.
+const DEV_BASE_PORT: u16 = 40_000;
 
 /// Errors raised while building or writing chain specs.
 #[derive(Debug, thiserror::Error)]
@@ -47,10 +86,11 @@ pub enum SpecError {
 /// `m2_reference::chain::current_epoch_start_slot()` to start in the present,
 /// or 0 for the unanchored genesis the tests pin values against.
 pub fn tiny_spec(
+    oracle: &Arc<Oracle>,
     validator_ips: &[[u8; 16]],
     ports: &[u16],
     anchor_slot: jam_types::Slot,
-) -> Result<ChainSpec, SpecError> {
+) -> Result<TinySpec, SpecError> {
     if validator_ips.len() != 6 || ports.len() != 6 {
         return Err(SpecError::ValidatorCount {
             ips: validator_ips.len(),
@@ -64,13 +104,32 @@ pub fn tiny_spec(
     // Reference dev spec: 6 trivial keysets + bootstrap service. Its genesis
     // header hash depends only on bandersnatch/ed25519 keys (EpochKeySet), so
     // overriding the on-chain PeerAddr metadata leaves the hash untouched.
-    let base = jam_node::hazmat::dev_spec(jam_node::DEFAULT_DEV_BASE_PORT);
-    let mut state = base.build_storage().map_err(SpecError::Storage)?;
-    let ChainSpec {
-        mut genesis_header,
-        bootnodes,
-        ..
-    } = base;
+    //
+    // From the oracle, because the bootstrap-service blob it is built around
+    // lives inside polkajam's node crate. Everything below works on the
+    // result with types this workspace has of its own.
+    let (header_bytes, keyvals, protocol_parameters) = match oracle
+        .expect(Message::DevSpec {
+            base_port: DEV_BASE_PORT,
+        })
+        .map_err(|e| SpecError::Storage(e.to_string()))?
+    {
+        Message::DevSpecIs {
+            genesis_header,
+            keyvals,
+            protocol_parameters,
+        } => (genesis_header, keyvals, protocol_parameters),
+        other => return Err(SpecError::Storage(format!("DevSpec answered {other:?}"))),
+    };
+    let mut genesis_header = Header::decode_all(&mut header_bytes.as_slice())
+        .map_err(|e| SpecError::Storage(format!("decode the dev genesis header: {e}")))?;
+    let mut state: BTreeMap<[u8; 31], Vec<u8>> = BTreeMap::new();
+    for (key, value) in keyvals {
+        let key: [u8; 31] = key.as_slice().try_into().map_err(|_| {
+            SpecError::Storage(format!("a genesis key is {} bytes, not 31", key.len()))
+        })?;
+        state.insert(key, value);
+    }
 
     // The slot *is* part of the header preimage, so anchoring moves the genesis
     // hash. Take the new hash before patching the state: the one block in the
@@ -102,18 +161,16 @@ pub fn tiny_spec(
     let recent_key = StorageKey::from(SystemKey::RecentBlocks).0;
     for (k, v) in state.iter_mut() {
         if keys.contains(k) {
-            *v = Some(encoded.clone());
+            *v = encoded.clone();
         } else if *k == safrole_key {
-            let Some(bytes) = v.as_ref() else { continue };
-            let mut safrole = jam_std_common::SafroleState::decode_all(&mut bytes.as_slice())
+            let mut safrole = jam_std_common::SafroleState::decode_all(&mut v.as_slice())
                 .map_err(|e| SpecError::Storage(format!("decode safrole state: {e}")))?;
             safrole.waiting_validators = validators.clone();
-            *v = Some(safrole.encode());
+            *v = safrole.encode();
         } else if *k == now_key {
-            *v = Some(anchor_slot.encode());
+            *v = anchor_slot.encode();
         } else if *k == recent_key {
-            let Some(bytes) = v.as_ref() else { continue };
-            let mut recent = jam_std_common::RecentBlocks::decode_all(&mut bytes.as_slice())
+            let mut recent = jam_std_common::RecentBlocks::decode_all(&mut v.as_slice())
                 .map_err(|e| SpecError::Storage(format!("decode recent blocks: {e}")))?;
             // `BoundedVec` hands out no mutable element access, so rebuild the
             // one-entry history rather than editing it in place.
@@ -126,16 +183,14 @@ pub fn tiny_spec(
             genesis_block.hash = genesis_hash;
             recent.history = jam_types::BoundedVec::try_from(vec![genesis_block])
                 .map_err(|_| SpecError::Storage("recent block count is zero".into()))?;
-            *v = Some(recent.encode());
+            *v = recent.encode();
         }
     }
 
-    let storage_builder =
-        jam_node::hazmat::StorageBuilder::RawFactory(Box::new(move || Ok(state.clone())));
-    Ok(ChainSpec {
-        storage_builder,
+    Ok(TinySpec {
         genesis_header,
-        bootnodes,
+        state,
+        protocol_parameters,
     })
 }
 
@@ -154,26 +209,41 @@ pub struct M2Spec {
     pub bootnodes: Vec<String>,
 }
 
-/// Builds an `M2Spec` from a tiny `ChainSpec`.
-pub fn m2_spec(id: &str, chain_spec: &ChainSpec) -> Result<M2Spec, SpecError> {
-    let genesis_header = format!("0x{}", hex::encode(chain_spec.genesis_header.encode()));
-    let state = chain_spec.build_storage().map_err(SpecError::Storage)?;
-    let mut genesis_state = serde_json::Map::new();
-    for (k, v) in state.iter() {
-        if let Some(v) = v {
-            genesis_state.insert(
-                format!("0x{}", hex::encode(k.as_ref())),
-                serde_json::Value::String(format!("0x{}", hex::encode(v))),
-            );
-        }
-    }
+/// Builds an `M2Spec` from a tiny genesis.
+pub fn m2_spec(id: &str, spec: &TinySpec) -> Result<M2Spec, SpecError> {
     Ok(M2Spec {
         id: id.to_string(),
         parameters: named_parameters(),
-        genesis_header,
-        genesis_state: serde_json::Value::Object(genesis_state),
+        genesis_header: hex0x(&spec.genesis_header.encode()),
+        genesis_state: serde_json::Value::Object(genesis_state_object(spec, hex0x)),
         bootnodes: Vec::new(),
     })
+}
+
+/// `0x`-prefixed lower-case hex, which is how the **M2** spec writes bytes.
+///
+/// polkajam's own spec file writes bare hex and its reader rejects a prefix
+/// -- "invalid digit found in string", from the first `x` it meets. The two
+/// files are otherwise so alike that sharing one helper between them is the
+/// obvious thing to do, and wrong; hence two.
+fn hex0x(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+/// Bare lower-case hex, which is how **polkajam's** spec file writes bytes.
+fn hex_bare(bytes: &[u8]) -> String {
+    hex::encode(bytes)
+}
+
+/// The genesis state, written with `encode` for keys and values alike.
+fn genesis_state_object(
+    spec: &TinySpec,
+    encode: fn(&[u8]) -> String,
+) -> serde_json::Map<String, serde_json::Value> {
+    spec.state
+        .iter()
+        .map(|(k, v)| (encode(k), serde_json::Value::String(encode(v))))
+        .collect()
 }
 
 /// The §7 named parameters, read from the protocol parameters this run is
@@ -235,16 +305,26 @@ pub fn write_m2_spec(dir: &Path, _id: &str, spec: &M2Spec) -> std::io::Result<st
     Ok(path)
 }
 
-/// Writes polkajam's own spec JSON (`dir/spec.json`) via `ChainSpec::to_file`.
-pub fn write_polkajam_spec(
-    dir: &Path,
-    chain_spec: &ChainSpec,
-) -> std::io::Result<std::path::PathBuf> {
+/// Writes polkajam's own spec JSON (`dir/spec.json`).
+///
+/// Written here rather than by `ChainSpec::to_file`, which would need the
+/// node crate. The shape is that file's: `id`, `protocol_parameters`,
+/// `genesis_header` and `genesis_state` -- the parameters carried through
+/// from the oracle rather than re-encoded here, so the file says what the
+/// genesis was actually built under. `polkajam_spec_reopens` is the test
+/// that fails if the shape drifts.
+pub fn write_polkajam_spec(dir: &Path, spec: &TinySpec) -> std::io::Result<std::path::PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join("spec.json");
-    chain_spec
-        .to_file("m2", &path)
-        .map_err(std::io::Error::other)?;
+    let doc = serde_json::json!({
+        "id": "m2",
+        "protocol_parameters": hex_bare(&spec.protocol_parameters),
+        "genesis_header": hex_bare(&spec.genesis_header.encode()),
+        "genesis_state": serde_json::Value::Object(genesis_state_object(spec, hex_bare)),
+        "bootnodes": Vec::<String>::new(),
+    });
+    let json = serde_json::to_string_pretty(&doc).map_err(std::io::Error::other)?;
+    std::fs::write(&path, json)?;
     Ok(path)
 }
 
@@ -254,6 +334,8 @@ mod tests {
 
     use codec::{Decode, DecodeAll};
     use jam_std_common::Header;
+
+    use m2_reference::oracle::Oracle;
 
     use super::{m2_spec, tiny_spec, write_m2_spec, write_polkajam_spec};
 
@@ -292,7 +374,8 @@ mod tests {
     /// `attempts_per_validator`, the one most likely to move.
     #[test]
     fn m2_spec_parameters_match_the_engine() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&Oracle::for_tests(), &loopback_ips(), &ports(), 0)
+            .expect("tiny spec builds");
         let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
         let param = |name: &str| {
             spec.parameters[name]
@@ -351,7 +434,8 @@ mod tests {
     /// handed to a third-party node to the same quantity.
     #[test]
     fn the_declared_attempt_cap_is_the_one_tickets_are_generated_against() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&Oracle::for_tests(), &loopback_ips(), &ports(), 0)
+            .expect("tiny spec builds");
         let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
 
         let declared = spec.parameters["tickets_per_validator"]
@@ -370,7 +454,8 @@ mod tests {
 
     #[test]
     fn m2_spec_shape_and_consistency() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&Oracle::for_tests(), &loopback_ips(), &ports(), 0)
+            .expect("tiny spec builds");
         let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
 
         assert!(spec.genesis_header.starts_with("0x"));
@@ -407,7 +492,8 @@ mod tests {
             .apply()
             .expect("tiny parameters apply");
         let anchor = m2_reference::chain::current_epoch_start_slot();
-        let chain_spec = tiny_spec(&loopback_ips(), &ports(), anchor).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&Oracle::for_tests(), &loopback_ips(), &ports(), anchor)
+            .expect("tiny spec builds");
         let period = jam_types::epoch_period();
         let now = m2_reference::chain::wall_clock_slot();
 
@@ -427,15 +513,13 @@ mod tests {
     fn anchored_genesis_state_agrees_with_its_header() {
         const ANCHOR: u32 = 9_373_122;
 
-        let chain_spec = tiny_spec(&loopback_ips(), &ports(), ANCHOR).expect("tiny spec builds");
-        let state = chain_spec.build_storage().expect("storage builds");
+        let chain_spec = tiny_spec(&Oracle::for_tests(), &loopback_ips(), &ports(), ANCHOR)
+            .expect("tiny spec builds");
         let value = |key: jam_std_common::SystemKey| {
-            state
-                .iter()
-                .find_map(|(k, v)| {
-                    (*k == jam_std_common::StorageKey::from(key).0).then(|| v.clone())
-                })
-                .flatten()
+            chain_spec
+                .state
+                .get(&jam_std_common::StorageKey::from(key).0)
+                .cloned()
                 .expect("genesis writes every system key")
         };
 
@@ -459,14 +543,16 @@ mod tests {
 
     #[test]
     fn genesis_header_hash_consistency() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&Oracle::for_tests(), &loopback_ips(), &ports(), 0)
+            .expect("tiny spec builds");
         let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
 
         let bytes = hex::decode(&spec.genesis_header[2..]).expect("valid hex header");
         let header = Header::decode(&mut &bytes[..]).expect("header decodes");
         let hash = header.hash().0;
 
-        let reference = m2_reference::chain::RefChain::tiny(0).expect("reference chain builds");
+        let reference = m2_reference::chain::RefChain::tiny(&Oracle::for_tests(), 0)
+            .expect("reference chain builds");
         assert_eq!(hash, reference.genesis_hash());
     }
 
@@ -478,17 +564,23 @@ mod tests {
     fn anchored_spec_and_reference_chain_share_a_genesis() {
         const ANCHOR: u32 = 9_373_122;
 
-        let chain_spec = tiny_spec(&loopback_ips(), &ports(), ANCHOR).expect("tiny spec builds");
-        let ref_spec = tiny_spec(&loopback_ips(), &ports(), ANCHOR).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&Oracle::for_tests(), &loopback_ips(), &ports(), ANCHOR)
+            .expect("tiny spec builds");
+        let ref_spec = tiny_spec(&Oracle::for_tests(), &loopback_ips(), &ports(), ANCHOR)
+            .expect("tiny spec builds");
+        let dir = temp_dir("shared-genesis");
+        let ref_path = write_polkajam_spec(&dir, &ref_spec).expect("writes polkajam spec");
         let reference =
-            m2_reference::chain::RefChain::with_spec(0, ref_spec).expect("reference chain builds");
+            m2_reference::chain::RefChain::with_spec(&Oracle::for_tests(), 0, &ref_path)
+                .expect("reference chain builds");
 
         assert_eq!(chain_spec.genesis_header.slot, ANCHOR);
         assert_eq!(chain_spec.genesis_header.hash().0, reference.genesis_hash());
 
         // ... and an unanchored reference chain would not match, which is the
         // failure this guards against.
-        let unanchored = m2_reference::chain::RefChain::tiny(0).expect("reference chain builds");
+        let unanchored = m2_reference::chain::RefChain::tiny(&Oracle::for_tests(), 0)
+            .expect("reference chain builds");
         assert_ne!(
             chain_spec.genesis_header.hash().0,
             unanchored.genesis_hash()
@@ -496,24 +588,38 @@ mod tests {
     }
 
     #[test]
-    fn polkajam_spec_parses() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
+    fn polkajam_spec_reopens() {
+        let chain_spec = tiny_spec(&Oracle::for_tests(), &loopback_ips(), &ports(), 0)
+            .expect("tiny spec builds");
         let dir = temp_dir("parses");
         let path = write_polkajam_spec(&dir, &chain_spec).expect("writes polkajam spec");
 
-        let (_id, parsed) = jam_node::ChainSpec::load_from_file_and_apply_parameters(
-            path.to_str().expect("utf-8 path"),
-        )
-        .expect("polkajam spec re-parses");
-        let validators = parsed.genesis_validators().expect("genesis has validators");
-        assert_eq!(validators.len(), 6);
+        // Opened by the engine that will actually read it, rather than
+        // re-parsed here: a file this module can read back says nothing
+        // about whether polkajam can.
+        let chain = m2_reference::chain::RefChain::with_spec(&Oracle::for_tests(), 0, &path)
+            .expect("the oracle opens the spec this module wrote");
+        assert_eq!(
+            chain.genesis_hash(),
+            chain_spec.genesis_hash(),
+            "the genesis that came back is the one that was written"
+        );
+        let cohorts = chain
+            .guarantors_for(0, chain.genesis_slot())
+            .expect("the assignment resolves")
+            .expect("core 0 has holders");
+        assert!(
+            cohorts.iter().all(|v| (*v as usize) < 6),
+            "the 6-validator set came through: {cohorts:?}"
+        );
 
         cleanup(&dir);
     }
 
     #[test]
     fn files_written() {
-        let chain_spec = tiny_spec(&loopback_ips(), &ports(), 0).expect("tiny spec builds");
+        let chain_spec = tiny_spec(&Oracle::for_tests(), &loopback_ips(), &ports(), 0)
+            .expect("tiny spec builds");
         let spec = m2_spec("m2-test", &chain_spec).expect("m2 spec builds");
 
         let dir = temp_dir("files");

@@ -80,6 +80,7 @@ async fn grade(chain: &Arc<RefChain>, fault: SimFault) -> Vec<(&'static str, Out
     let ce129 = ce129.lock().expect("the CE 129 probes").clone();
     let reference_chain: Vec<[u8; 32]> = chain
         .chain_blocks()
+        .expect("the reference chain reads back")
         .iter()
         .skip(1)
         .map(|block| block.header.hash().0)
@@ -115,7 +116,10 @@ const DIAL_PEERS: [usize; 5] = [1, 2, 3, 4, 5];
 async fn grade_dialing(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     let net = MockNetwork::new();
     let transport = Arc::new(net) as Arc<dyn Transport>;
-    let chain = Arc::new(RefChain::tiny_for(DIAL_NUT_INDEX).expect("the node's chain"));
+    let chain = Arc::new(
+        RefChain::tiny_for(&m2_reference::oracle::Oracle::for_tests(), DIAL_NUT_INDEX)
+            .expect("the node's chain"),
+    );
     let genesis = chain.genesis_hash();
 
     let node = Arc::new(SimNode::at_index(Arc::clone(&chain), fault, DIAL_NUT_INDEX));
@@ -210,7 +214,9 @@ async fn the_n0_checks_catch_a_node_that_gets_one_thing_wrong() {
     clock::install(Arc::new(VirtualClock::starting_at(1_800_000_000_000)))
         .expect("nothing has read the clock yet");
 
-    let chain = Arc::new(RefChain::tiny(0).expect("a reference chain"));
+    let chain = Arc::new(
+        RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0).expect("a reference chain"),
+    );
     let start = chain.next_slot();
     for slot in start..start + BLOCKS {
         chain.author_block(slot).expect("the chain authors");

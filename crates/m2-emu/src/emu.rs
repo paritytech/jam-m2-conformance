@@ -535,12 +535,46 @@ impl Emulator {
 ///
 /// Shared by the announcements a connection sends when it opens and by the ones
 /// the slot driver broadcasts later, so both describe the chain the same way.
-pub fn announcement_wire(block: &Block, ref_chain: &RefChain) -> Vec<u8> {
+pub fn announcement_wire(block: &Block, ref_chain: &RefChain) -> Result<Vec<u8>, EmuError> {
     let ann = Announcement {
         header: (**block.header).clone(),
-        final_block: advertised_final(&ref_chain.chain_blocks(), ref_chain.genesis_hash()),
+        final_block: reference_head(ref_chain)?,
     };
-    frame_message(&ann.encode())
+    Ok(frame_message(&ann.encode()))
+}
+
+/// What the reference chain advertises as final: its own head.
+///
+/// The head, asked for directly, rather than the last entry of the whole
+/// chain. The two are the same block, but one of them is a round trip
+/// carrying every block the run has ever authored, once per announcement
+/// and once per handshake, and the chain only grows.
+fn reference_head(ref_chain: &RefChain) -> Result<Final, EmuError> {
+    let (hash, slot) = ref_chain
+        .best_block()
+        .map_err(|e| EmuError::Protocol(e.to_string()))?;
+    Ok(Final {
+        header_hash: HeaderHash::from(hash),
+        slot,
+    })
+}
+
+/// The reference chain's blocks, or none and a line saying why.
+///
+/// The UP 0 and CE 128 paths below return nothing: there is nowhere to hand
+/// an error, and an emulated validator that does not answer is also what a
+/// dead stream looks like. An oracle failure is not that, so it says so
+/// where a run's log will show it rather than passing for a quiet peer --
+/// grading a node against a harness that could not reach its own engine is
+/// the one outcome worth refusing.
+fn chain_blocks_or_report(ref_chain: &RefChain, during: &str) -> Option<Vec<Block>> {
+    match ref_chain.chain_blocks() {
+        Ok(blocks) => Some(blocks),
+        Err(e) => {
+            eprintln!("[emu] {during}: could not read the reference chain: {e}");
+            None
+        }
+    }
 }
 
 /// Announcements buffered per UP 0 subscriber.
@@ -598,7 +632,7 @@ pub async fn dial_nut(
     record(&obs, peer, ObsKind::OpenUp0);
     let up0_stream_id = send.id();
     let handshake = Handshake {
-        final_block: advertised_final(&ref_chain.chain_blocks(), genesis_hash),
+        final_block: reference_head(&ref_chain)?,
         leaves: vec![],
     };
     let wire = frame(UP, &handshake.encode());
@@ -607,9 +641,12 @@ pub async fn dial_nut(
 
     // Announce the reference blocks (skip genesis) so the NUT has something to
     // sync and re-announce (N1 authoring is announced like a real author).
-    for block in ref_chain.chain_blocks().iter().skip(1) {
+    let blocks = ref_chain
+        .chain_blocks()
+        .map_err(|e| EmuError::Protocol(e.to_string()))?;
+    for block in blocks.iter().skip(1) {
         record(&obs, peer, ObsKind::Up0Announce);
-        let wire = announcement_wire(block, &ref_chain);
+        let wire = announcement_wire(block, &ref_chain)?;
         trace_record(peer, UP, send.id(), &wire, &trace, TraceDir::Rx);
         let _ = send.write_all(&wire).await;
     }
@@ -1113,30 +1150,12 @@ async fn handle_up0(
             record(obs, peer_index, ObsKind::Other(n0::UP0_FINAL_GENESIS));
         }
         if let Some(send) = send {
-            respond_up0(
-                send,
-                peer_index,
-                genesis_hash,
-                stream_id,
-                ref_chain,
-                trace,
-                obs,
-            )
-            .await;
+            respond_up0(send, peer_index, stream_id, ref_chain, trace, obs).await;
         }
         return;
     }
     if let Some(send) = send {
-        respond_up0(
-            send,
-            peer_index,
-            genesis_hash,
-            stream_id,
-            ref_chain,
-            trace,
-            obs,
-        )
-        .await;
+        respond_up0(send, peer_index, stream_id, ref_chain, trace, obs).await;
     }
 }
 
@@ -1162,15 +1181,21 @@ pub fn advertised_final(chain: &[Block], genesis_hash: [u8; 32]) -> Final {
 async fn respond_up0(
     send: &mut SendHalf,
     peer_index: u16,
-    genesis_hash: [u8; 32],
     stream_id: u64,
     ref_chain: &RefChain,
     trace: &Mutex<Trace>,
     obs: &Mutex<ObsLog>,
 ) {
     record(obs, peer_index, ObsKind::OpenUp0);
+    let final_block = match reference_head(ref_chain) {
+        Ok(head) => head,
+        Err(e) => {
+            eprintln!("[emu] answering UP 0: {e}");
+            return;
+        }
+    };
     let handshake = Handshake {
-        final_block: advertised_final(&ref_chain.chain_blocks(), genesis_hash),
+        final_block,
         leaves: vec![],
     };
     let wire = frame_message(&handshake.encode());
@@ -1201,7 +1226,9 @@ async fn serve_block_request(
             at_ms: at,
         },
     );
-    let chain = ref_chain.chain_blocks();
+    let Some(chain) = chain_blocks_or_report(ref_chain, "serving CE 128") else {
+        return;
+    };
     let Ok(response) = serve_ce128(&request, &chain) else {
         return;
     };
@@ -1431,7 +1458,9 @@ mod tests {
         let emu =
             Emulator::n0_on(Arc::new(net.clone()), vec![PEER as usize], GENESIS, 40300).await?;
         let addr = emu.local_addrs()[0];
-        let ref_chain = Arc::new(RefChain::tiny(0).map_err(chain_err)?);
+        let ref_chain = Arc::new(
+            RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0).map_err(chain_err)?,
+        );
 
         let report_hash = [0x3c; 32];
         let signature = [0x9e; 64];
@@ -1640,7 +1669,9 @@ mod tests {
         let net = MockNetwork::new();
         let emu = Emulator::n0_on(Arc::new(net.clone()), vec![1], GENESIS, 40100).await?;
         let addr = emu.local_addrs()[0];
-        let ref_chain = Arc::new(RefChain::tiny(0).map_err(chain_err)?);
+        let ref_chain = Arc::new(
+            RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0).map_err(chain_err)?,
+        );
         let records = emu.sharing_seen();
         let _accepting = emu.accept_loop(ref_chain);
 
@@ -1713,7 +1744,9 @@ mod tests {
         let net = MockNetwork::new();
         let emu = Emulator::n0_on(Arc::new(net.clone()), vec![1], GENESIS, 40000).await?;
         let addr = emu.local_addrs()[0];
-        let ref_chain = Arc::new(RefChain::tiny(0).map_err(chain_err)?);
+        let ref_chain = Arc::new(
+            RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0).map_err(chain_err)?,
+        );
         let _accepting = emu.accept_loop(ref_chain);
 
         let config = EndpointConfig {
@@ -1766,12 +1799,15 @@ mod tests {
 
     #[test]
     fn serves_ce128_ascending_from_genesis() -> Result<(), EmuError> {
-        let ref_chain = RefChain::tiny(0).map_err(chain_err)?;
+        let ref_chain =
+            RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0).map_err(chain_err)?;
         let start = ref_chain.next_slot();
         for slot in start..start + 12 {
             let _ = ref_chain.author_block(slot).map_err(chain_err)?;
         }
-        let chain = ref_chain.chain_blocks();
+        let chain = ref_chain
+            .chain_blocks()
+            .expect("the reference chain reads back");
         let genesis = ref_chain.genesis_hash();
 
         // Ascending-exclusive from genesis equals the reference chain (minus genesis).
@@ -1863,7 +1899,7 @@ mod tests {
     }
 
     fn chain_with_blocks() -> Result<RefChain, m2_reference::chain::ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let start = chain.next_slot();
         let mut authored = 0;
         for slot in start..start + 12 {
@@ -1882,7 +1918,9 @@ mod tests {
     fn advertised_final_is_reference_head() -> Result<(), m2_reference::chain::ChainError> {
         let chain = chain_with_blocks()?;
         let genesis = chain.genesis_hash();
-        let blocks = chain.chain_blocks();
+        let blocks = chain
+            .chain_blocks()
+            .expect("the reference chain reads back");
         let head = blocks.last().expect("chain has a head beyond genesis");
 
         let advertised = advertised_final(&blocks, genesis);

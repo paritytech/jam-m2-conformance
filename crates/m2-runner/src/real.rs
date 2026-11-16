@@ -147,7 +147,7 @@ pub(crate) fn build_real_run_ctx(
     data: &RealRunData,
     trace: &Trace,
     n0: m2_scenario::scenarios::n0::N0Ctx,
-) -> RunCtx {
+) -> Result<RunCtx, m2_reference::chain::ChainError> {
     let nut_blocks = lock(&data.nut_blocks);
     let t = std::time::Instant::now();
     let contexts = ticket_contexts(data);
@@ -171,7 +171,7 @@ pub(crate) fn build_real_run_ctx(
         &nut_blocks,
         &lock(&data.deliveries),
         own_ticket_ids.clone(),
-    );
+    )?;
     crate::run::phase("ctx.build_n1", t);
     let t = std::time::Instant::now();
     let n2 = build_n2_ctx(
@@ -227,12 +227,12 @@ pub(crate) fn build_real_run_ctx(
         authored_slots: nut_blocks.iter().map(|n| n.block.header.slot).collect(),
     };
     crate::run::phase("ctx.build_n3", t);
-    RunCtx {
+    Ok(RunCtx {
         n0,
         n1: Some(n1),
         n2: Some(n2),
         n3: Some(n3),
-    }
+    })
 }
 
 /// Every ticket context the harness can verify a proof against, by the epoch
@@ -311,8 +311,8 @@ pub fn build_n1_ctx(
     nut_blocks: &[NutBlock],
     deliveries: &[DeliveredTicket],
     own_ticket_ids: Vec<[u8; 32]>,
-) -> N1Ctx {
-    let chain = ref_chain.chain_blocks();
+) -> Result<N1Ctx, m2_reference::chain::ChainError> {
+    let chain = ref_chain.chain_blocks()?;
     let reference_best = chain
         .last()
         .map(|block| block.header.hash().0)
@@ -326,8 +326,8 @@ pub fn build_n1_ctx(
     let imports = nut_blocks
         .iter()
         .map(|nut| {
-            let outcome = ref_chain.import_nut_block(&nut.block);
-            ImportFact {
+            let outcome = ref_chain.import_nut_block(&nut.block)?;
+            Ok(ImportFact {
                 header_root: outcome.header_root,
                 parent: outcome.parent,
                 declared_parent_root: outcome.declared_parent_root,
@@ -335,10 +335,10 @@ pub fn build_n1_ctx(
                 ok: outcome.ok,
                 root: outcome.root,
                 error: outcome.error,
-            }
+            })
         })
-        .collect();
-    N1Ctx {
+        .collect::<Result<Vec<_>, m2_reference::chain::ChainError>>()?;
+    Ok(N1Ctx {
         reference_best,
         reference_block_hashes,
         reference_chain,
@@ -350,7 +350,7 @@ pub fn build_n1_ctx(
         epoch_period: jam_types::epoch_period(),
         epoch_tail_start: jam_types::epoch_tail_start(),
         max_tickets_per_block: jam_types::max_tickets_per_block(),
-    }
+    })
 }
 
 /// N2 facts: the emulator's ticket plan plus every ticket the NUT distributed
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn run_collect_nut_tickets() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let ticket = &tickets[0];
@@ -625,7 +625,7 @@ mod tests {
     /// node's ticket as a forged one.
     #[test]
     fn run_nut_tickets_for_an_uncovered_epoch_are_unjudged() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let ticket = &tickets[0];
@@ -653,7 +653,7 @@ mod tests {
         use jam_types::HeaderHash;
         use jamnp_s::codec::up0::Final;
 
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let start = chain.next_slot();
         let block = (start..start + 24)
             .find_map(|slot| chain.author_block(slot).ok().flatten())
@@ -695,7 +695,7 @@ mod tests {
     /// sent (`Rx`) must never be counted as NUT behaviour.
     #[test]
     fn run_collect_nut_tickets_ignores_harness_sent_frames() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let nut_ticket = &tickets[0];
@@ -739,7 +739,7 @@ mod tests {
 
     #[test]
     fn run_build_n1_from_nut_blocks() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let start = ref_chain.next_slot();
         let mut authored = None;
         for slot in start..start + 12 {
@@ -754,7 +754,7 @@ mod tests {
             block: block.clone(),
             announced_wall_ms: 1000,
         }];
-        let n1 = build_n1_ctx(&ref_chain, &nut_blocks, &[], Vec::new());
+        let n1 = build_n1_ctx(&ref_chain, &nut_blocks, &[], Vec::new())?;
 
         assert_eq!(n1.imports.len(), 1, "one import per NUT block");
         assert!(n1.imports[0].ok, "a re-authored block imports OK");
@@ -769,7 +769,7 @@ mod tests {
         assert_eq!(n1.slot_period_ms, SLOT_PERIOD_MS);
         assert_eq!(
             n1.reference_block_hashes.len(),
-            ref_chain.chain_blocks().len(),
+            ref_chain.chain_blocks()?.len(),
             "reference block hashes cover the whole chain"
         );
         assert_eq!(
@@ -794,7 +794,7 @@ mod tests {
     /// peer's tickets; every ticket must land in exactly one peer's plan.
     #[test]
     fn run_plans_split_by_author() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let period = jam_types::epoch_period();
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn run_plan_maps_to_emu_tickets() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let nut_index = 5;
@@ -887,7 +887,7 @@ mod tests {
     /// used to key on picks out two entries at once.
     #[test]
     fn deliveries_are_matched_by_plan_index_not_by_ticket_id() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let plan = plan_tickets(&tickets, 5, 1001, 84);

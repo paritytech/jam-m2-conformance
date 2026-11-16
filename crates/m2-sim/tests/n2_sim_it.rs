@@ -182,8 +182,14 @@ async fn the_n2_generation_checks_catch_a_node_that_distributes_wrongly() {
     // One pair of chains for every variant: nothing here authors, so the
     // ring-VRF setup is the same for all of them and rebuilding it per variant
     // was most of the test's runtime.
-    let harness_chain = Arc::new(RefChain::tiny(NUT_INDEX).expect("the harness chain"));
-    let node_chain = Arc::new(RefChain::tiny_for(NUT_INDEX).expect("the node's chain"));
+    let harness_chain = Arc::new(
+        RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), NUT_INDEX)
+            .expect("the harness chain"),
+    );
+    let node_chain = Arc::new(
+        RefChain::tiny_for(&m2_reference::oracle::Oracle::for_tests(), NUT_INDEX)
+            .expect("the node's chain"),
+    );
 
     let honest = grade(&harness_chain, &node_chain, SimFault::None).await;
     for row in [

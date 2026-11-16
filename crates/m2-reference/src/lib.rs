@@ -21,6 +21,7 @@
 
 pub mod chain;
 pub mod import;
+pub mod oracle;
 pub mod reports;
 pub mod state;
 pub mod tickets;

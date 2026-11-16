@@ -67,8 +67,14 @@ async fn at_slot(slot: u32) {
 async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     let net = MockNetwork::new();
     let transport = Arc::new(net) as Arc<dyn Transport>;
-    let harness_chain = Arc::new(RefChain::tiny(NUT_INDEX).expect("the harness chain"));
-    let node_chain = Arc::new(RefChain::tiny_for(NUT_INDEX).expect("the node's chain"));
+    let harness_chain = Arc::new(
+        RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), NUT_INDEX)
+            .expect("the harness chain"),
+    );
+    let node_chain = Arc::new(
+        RefChain::tiny_for(&m2_reference::oracle::Oracle::for_tests(), NUT_INDEX)
+            .expect("the node's chain"),
+    );
     let genesis = harness_chain.genesis_hash();
 
     let node = Arc::new(SimNode::at_index(Arc::clone(&node_chain), fault, NUT_INDEX));
@@ -120,7 +126,15 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
             if epoch == PLAN_IN_EPOCH && phase == PLAN_AT_PHASE {
                 let ctx = harness_chain.ticket_ctx().expect("a ticket context");
                 let tickets = harness_chain.generate_tickets(&ctx).expect("tickets");
+                eprintln!(
+                    "TKT {} tickets, entropy {:02x?}, authors {:?}, proxies {:?}",
+                    tickets.len(),
+                    &ctx.entropy[..4],
+                    tickets.iter().map(|t| t.author).collect::<Vec<_>>(),
+                    tickets.iter().map(|t| t.proxy).collect::<Vec<_>>(),
+                );
                 plan = plan_tickets(&tickets, NUT_INDEX, slot + 1, slot / period + 1);
+                eprintln!("TKT plan before retain: {}", plan.len());
                 // Only the tickets proxied to the node. The rule is about what
                 // it does with those; the CE 132 broadcasts would just crowd
                 // its block, which holds three, and the forwarded ticket has
@@ -145,10 +159,13 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
             }
             match harness_chain.author_block(slot) {
                 Ok(Some(block)) => {
-                    let _ = emu
-                        .announce_tx()
-                        .send(m2_emu::emu::announcement_wire(&block, &harness_chain));
-                    node_chain.import_nut_block(&block);
+                    let _ = emu.announce_tx().send(
+                        m2_emu::emu::announcement_wire(&block, &harness_chain)
+                            .expect("an announcement is built"),
+                    );
+                    node_chain
+                        .import_nut_block(&block)
+                        .expect("the node\'s chain imports the block");
                 }
                 // The node's own slot: it authors and announces, and nothing
                 // here imports the block into the harness's chain. The

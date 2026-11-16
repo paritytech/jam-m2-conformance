@@ -3,10 +3,9 @@
 
 use std::collections::HashMap;
 
-use jam_std_common::StorageKey;
-use jam_types::HeaderHash;
+use m2_oracle_proto::Message;
 
-use crate::chain::RefChain;
+use crate::chain::{ChainError, RefChain};
 
 /// A single storage key-value pair.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,24 +41,34 @@ pub struct StateDiff {
 }
 
 impl RefChain {
-    /// Snapshot the full storage state at the given block hash.
-    pub fn storage_state(&self, hash: &[u8; 32]) -> Option<State> {
-        let chain = self.harness().chain();
-        let hash = HeaderHash::from(*hash);
-        let storage = chain.storage(&hash)?;
-        let root = chain.state_root(&hash).ok()??;
-        let keyvals = storage
-            .keys()
-            .filter_map(|key| {
-                storage
-                    .get(StorageKey(key))
-                    .map(|value| KeyValue { key, value })
-            })
-            .collect();
-        Some(State {
-            root: root.0,
+    /// Snapshot the full storage state at the given block hash, or `None`
+    /// where the chain does not have that block.
+    ///
+    /// Root and keys arrive together, from one storage view in the oracle.
+    /// Asking for them separately could land either side of an import, and a
+    /// root that does not belong to the keys beside it is the one failure
+    /// [`diff`] cannot detect -- disagreeing is exactly what it expects to
+    /// find.
+    pub fn storage_state(&self, hash: &[u8; 32]) -> Result<Option<State>, ChainError> {
+        let wire = match self.ask(Message::StateOf {
+            session: self.session(),
+            hash: *hash,
+        })? {
+            Message::StateIs(state) => state,
+            other => return Err(ChainError::Oracle(format!("StateOf answered {other:?}"))),
+        };
+        let Some(wire) = wire else { return Ok(None) };
+        let mut keyvals = Vec::with_capacity(wire.keyvals.len());
+        for (key, value) in wire.keyvals {
+            let key: [u8; 31] = key.as_slice().try_into().map_err(|_| {
+                ChainError::Oracle(format!("a state key is {} bytes, not 31", key.len()))
+            })?;
+            keyvals.push(KeyValue { key, value });
+        }
+        Ok(Some(State {
+            root: wire.root,
             keyvals,
-        })
+        }))
     }
 }
 
@@ -102,10 +111,11 @@ pub fn diff(exp: &State, got: &State) -> StateDiff {
 mod tests {
     use super::*;
     use crate::chain::ChainError;
+    use crate::oracle::Oracle;
 
     #[test]
     fn state_snapshot_root_matches_storage_root() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let start = chain.next_slot();
         let mut authored = 0;
         for slot in start..start + 24 {
@@ -119,10 +129,11 @@ mod tests {
         assert_eq!(authored, 2, "expected two emulated slots within 24 slots");
 
         let genesis = chain.genesis_hash();
-        let genesis_state = chain.storage_state(&genesis).expect("genesis has state");
+        let genesis_state = chain.storage_state(&genesis)?.expect("genesis has state");
         assert_eq!(
-            genesis_state.root,
-            chain.storage_root(&genesis).expect("genesis root")
+            Some(genesis_state.root),
+            chain.storage_root(&genesis)?,
+            "the snapshot's root is the chain's own for that block"
         );
         assert!(
             !genesis_state.keyvals.is_empty(),
@@ -130,17 +141,14 @@ mod tests {
         );
 
         let best = chain
-            .chain_blocks()
+            .chain_blocks()?
             .last()
             .expect("authored head block")
             .header
             .hash()
             .0;
-        let best_state = chain.storage_state(&best).expect("head has state");
-        assert_eq!(
-            best_state.root,
-            chain.storage_root(&best).expect("head root")
-        );
+        let best_state = chain.storage_state(&best)?.expect("head has state");
+        assert_eq!(Some(best_state.root), chain.storage_root(&best)?);
         assert!(
             !best_state.keyvals.is_empty(),
             "head state has key-value pairs"
@@ -150,7 +158,7 @@ mod tests {
 
     #[test]
     fn state_diff_reports_root_and_key_mismatch() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let start = chain.next_slot();
         for slot in start..start + 24 {
             if chain.author_block(slot)?.is_some() {
@@ -158,14 +166,14 @@ mod tests {
             }
         }
         let best = chain
-            .chain_blocks()
+            .chain_blocks()?
             .last()
             .expect("authored head block")
             .header
             .hash()
             .0;
-        let state_a = chain.storage_state(&best).expect("head has state");
-        let state_b = chain.storage_state(&best).expect("head has state");
+        let state_a = chain.storage_state(&best)?.expect("head has state");
+        let state_b = chain.storage_state(&best)?.expect("head has state");
 
         let equal = diff(&state_a, &state_b);
         assert_eq!(equal.exp_root, equal.got_root);

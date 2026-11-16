@@ -66,8 +66,14 @@ async fn at_slot(slot: u32) {
 async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     let net = MockNetwork::new();
     let transport = Arc::new(net) as Arc<dyn Transport>;
-    let harness_chain = Arc::new(RefChain::tiny(NUT_INDEX).expect("the harness chain"));
-    let node_chain = Arc::new(RefChain::tiny_for(NUT_INDEX).expect("the node's chain"));
+    let harness_chain = Arc::new(
+        RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), NUT_INDEX)
+            .expect("the harness chain"),
+    );
+    let node_chain = Arc::new(
+        RefChain::tiny_for(&m2_reference::oracle::Oracle::for_tests(), NUT_INDEX)
+            .expect("the node's chain"),
+    );
     let genesis = harness_chain.genesis_hash();
 
     let node = Arc::new(SimNode::at_index(Arc::clone(&node_chain), fault, NUT_INDEX));
@@ -139,10 +145,13 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
             }
             match harness_chain.author_block(slot) {
                 Ok(Some(block)) => {
-                    let _ = emu
-                        .announce_tx()
-                        .send(m2_emu::emu::announcement_wire(&block, &harness_chain));
-                    node_chain.import_nut_block(&block);
+                    let _ = emu.announce_tx().send(
+                        m2_emu::emu::announcement_wire(&block, &harness_chain)
+                            .expect("an announcement is built"),
+                    );
+                    node_chain
+                        .import_nut_block(&block)
+                        .expect("the node\'s chain imports the block");
                 }
                 // The node's own slot: it authors and announces, and nothing
                 // here imports the block into the harness's chain. The
@@ -224,7 +233,8 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         &nut_blocks.lock().expect("the NUT blocks"),
         &deliveries,
         Vec::new(),
-    );
+    )
+    .expect("the N1 facts build");
     use m2_scenario::scenarios::n1;
     // The whole N1 lane on the same blocks: several N2 faults disturb it, and
     // which ones is a fact worth holding rather than a comment.

@@ -107,6 +107,7 @@ fn a_session_runs_over_the_socket() {
     let reply = ask(
         &mut stream,
         Message::Open {
+            now_slot: wall_clock_slot(),
             spec_path: "/nonexistent/spec.json".into(),
             holds: vec![0, 1],
         },
@@ -153,6 +154,7 @@ fn a_real_session_authors_imports_and_reads_state() {
     let open = |stream: &mut UnixStream, holds: Vec<u16>| match ask(
         stream,
         Message::Open {
+            now_slot: wall_clock_slot(),
             spec_path: String::new(),
             holds,
         },
@@ -249,7 +251,7 @@ fn a_real_session_authors_imports_and_reads_state() {
             hash: authored_hash,
         },
     ) {
-        Message::StateRoot(theirs) => assert_eq!(theirs, root, "the two chains agree"),
+        Message::StateRootIs(Some(theirs)) => assert_eq!(theirs, root, "the two chains agree"),
         other => panic!("expected StateRoot, got {other:?}"),
     }
 
@@ -298,6 +300,7 @@ fn tickets_are_proved_over_the_context_the_oracle_gave() {
     let session = match ask(
         &mut stream,
         Message::Open {
+            now_slot: wall_clock_slot(),
             spec_path: String::new(),
             holds: (0..6).collect(),
         },
@@ -363,6 +366,7 @@ fn tickets_are_proved_over_the_context_the_oracle_gave() {
     let narrow = match ask(
         &mut stream,
         Message::Open {
+            now_slot: wall_clock_slot(),
             spec_path: String::new(),
             holds: vec![0],
         },
@@ -402,6 +406,7 @@ fn packages_are_built_authorized_and_not() {
     let (session, genesis_slot) = match ask(
         &mut stream,
         Message::Open {
+            now_slot: wall_clock_slot(),
             spec_path: String::new(),
             holds: (0..6).collect(),
         },
@@ -531,6 +536,7 @@ fn both_assignment_views_answer_and_say_when_they_cannot() {
     let (session, genesis_slot) = match ask(
         &mut stream,
         Message::Open {
+            now_slot: wall_clock_slot(),
             spec_path: String::new(),
             holds: (0..6).collect(),
         },
@@ -584,9 +590,11 @@ fn both_assignment_views_answer_and_say_when_they_cannot() {
         Message::EpochProbed {
             cached_index,
             head_epoch,
+            cached_entropy,
             entropy_1,
             entropy_2,
         } => {
+            assert_ne!(cached_entropy, [0u8; 32], "the cached epoch has entropy");
             assert_eq!(head_epoch, genesis_slot / jam_types::epoch_period());
             assert_eq!(cached_index, head_epoch, "at genesis the two agree");
             assert_ne!(entropy_1, [0u8; 32], "genesis entropy is not zero");
@@ -607,6 +615,16 @@ fn author_over(stream: &mut UnixStream, session: u16, slots: std::ops::Range<u32
         }
     }
     blocks
+}
+
+/// The slot the caller's clock is at. A session's virtual time is seeded
+/// from the caller, not from the oracle's own clock.
+fn wall_clock_slot() -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after 1970")
+        .as_secs();
+    ((now - jam_types::JAM_COMMON_ERA) / 6) as u32
 }
 
 fn decode(block: &[u8]) -> jam_std_common::Block {
@@ -635,6 +653,7 @@ fn a_session_authors_only_for_the_validators_it_holds() {
         let (session, genesis_slot) = match ask(
             &mut stream,
             Message::Open {
+                now_slot: wall_clock_slot(),
                 spec_path: String::new(),
                 holds,
             },
@@ -682,6 +701,7 @@ fn two_sessions_on_one_spec_author_the_same_blocks() {
     let open = |stream: &mut UnixStream| match ask(
         stream,
         Message::Open {
+            now_slot: wall_clock_slot(),
             spec_path: String::new(),
             holds: (0..6).collect(),
         },
@@ -719,6 +739,7 @@ fn the_genesis_state_root_is_the_first_blocks_declared_prior() {
     let (session, genesis_hash, genesis_slot) = match ask(
         &mut stream,
         Message::Open {
+            now_slot: wall_clock_slot(),
             spec_path: String::new(),
             holds: (0..6).collect(),
         },
@@ -738,7 +759,7 @@ fn the_genesis_state_root_is_the_first_blocks_declared_prior() {
             hash: genesis_hash,
         },
     ) {
-        Message::StateRoot(root) => root,
+        Message::StateRootIs(Some(root)) => root,
         other => panic!("expected StateRoot, got {other:?}"),
     };
     assert_ne!(
@@ -767,6 +788,7 @@ fn an_import_reports_its_roots_and_its_refusals() {
     let open = |stream: &mut UnixStream| match ask(
         stream,
         Message::Open {
+            now_slot: wall_clock_slot(),
             spec_path: String::new(),
             holds: (0..6).collect(),
         },

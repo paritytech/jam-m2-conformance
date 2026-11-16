@@ -3,10 +3,9 @@ name = "m2-reference"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Reference oracle over polkajam's hazmat engine: chain state, authoring, signing for emulated keysets"
+description = "Client of the out-of-process polkajam reference oracle: chain state, authoring, signing for emulated keysets"
 
 [dependencies]
-jam-node = { workspace = true }
 m2-oracle-proto = { path = "../m2-oracle-proto" }
 jam-std-common = { workspace = true }
 jamnp-s = { path = "../../crates/jamnp-s" }

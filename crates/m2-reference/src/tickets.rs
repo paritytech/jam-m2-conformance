@@ -1,11 +1,11 @@
 //! Safrole ticket oracle: context extraction, emulated ring-VRF ticket
 //! generation, verification, proxy assignment, and CE 131/132 scheduling.
 
-use jam_node::hazmat::KeystoreSigner;
 use jam_std_common::{
     bandersnatch::{self, ring_vrf},
     Entropy, TicketEnvelope,
 };
+use m2_oracle_proto::Message;
 
 use crate::chain::{ChainError, RefChain};
 
@@ -119,16 +119,10 @@ impl RefChain {
     /// epoch boundary happens to fall between proving and delivery, which a
     /// genesis anchored far enough in the past made likely.
     pub fn ticket_ctx(&self) -> Result<TicketCtx, ChainError> {
-        let storage = self.harness().storage(None);
-        let validators = storage
-            .designate_validators()
-            .map_err(|e| ChainError::Tickets(format!("designate_validators: {e}")))?;
-        let pks = validators.iter().map(|v| v.bandersnatch.0).collect();
-        let entropy = storage
-            .entropy()
-            .map_err(|e| ChainError::Tickets(format!("entropy: {e}")))?[2]
-            .0;
-        Ok(TicketCtx { pks, entropy })
+        match self.ask(Message::TicketCtx(self.session()))? {
+            Message::TicketContext { pks, entropy } => Ok(TicketCtx { pks, entropy }),
+            other => Err(ChainError::Tickets(format!("TicketCtx answered {other:?}"))),
+        }
     }
 
     /// Generate tickets for every keystore-backed author (the emulated set,
@@ -156,8 +150,20 @@ impl RefChain {
     /// epoch it is submittable in is filed under one no block will ask for.
     /// The pool also rejects duplicates and keeps only the lowest ids, which
     /// is why an unsorted or repeated extrinsic cannot be produced this way.
-    pub fn submit_tickets(&self, candidates: &[TicketEnvelope]) {
-        self.harness().submit_tickets(candidates);
+    pub fn submit_tickets(&self, candidates: &[TicketEnvelope]) -> Result<(), ChainError> {
+        let envelopes = candidates
+            .iter()
+            .map(|t| jam_types::Encode::encode(t))
+            .collect();
+        match self.ask(Message::SubmitTickets {
+            session: self.session(),
+            envelopes,
+        })? {
+            Message::Done => Ok(()),
+            other => Err(ChainError::Tickets(format!(
+                "SubmitTickets answered {other:?}"
+            ))),
+        }
     }
 
     /// Generate one author's tickets, or none if the keystore does not hold
@@ -172,8 +178,7 @@ impl RefChain {
         ctx: &TicketCtx,
         author: usize,
     ) -> Result<Vec<EmulatedTicket>, ChainError> {
-        let attempts = 0..jam_types::tickets_per_validator(jam_types::max_val_count());
-        self.sign_tickets(ctx, author, attempts)
+        self.sign_tickets(ctx, Some(author), None)
     }
 
     /// One author's ticket for any `attempt`, including one past the
@@ -190,51 +195,71 @@ impl RefChain {
         attempt: jam_types::TicketAttempt,
     ) -> Result<Option<EmulatedTicket>, ChainError> {
         Ok(self
-            .sign_tickets(ctx, author, std::iter::once(attempt))?
+            .sign_tickets(ctx, Some(author), Some(vec![attempt]))?
             .pop())
     }
 
+    /// Ring-sign one author's tickets, or every author's.
+    ///
+    /// `attempts` of `None` is every attempt up to the per-validator cap.
+    /// Naming them matters for the fault rows: a ticket for an attempt past
+    /// the cap has to be *proved* over that attempt, because the attempt is
+    /// part of the signed message and rewriting it afterwards breaks the
+    /// proof too -- which would give the node two reasons to refuse where
+    /// the row is testing one.
+    ///
+    /// An author whose key the session does not hold comes back empty rather
+    /// than failing: a session holds only some validators, and being asked
+    /// for one it does not hold is ordinary.
     fn sign_tickets(
         &self,
         ctx: &TicketCtx,
-        author: usize,
-        attempts: impl Iterator<Item = jam_types::TicketAttempt>,
+        author: Option<usize>,
+        attempts: Option<Vec<jam_types::TicketAttempt>>,
     ) -> Result<Vec<EmulatedTicket>, ChainError> {
-        let pks: Vec<bandersnatch::Public> =
-            ctx.pks.iter().map(|p| bandersnatch::Public(*p)).collect();
-        let Some(pk) = pks.get(author).copied() else {
-            return Ok(Vec::new());
+        let proved = match self.ask(Message::SignTickets {
+            session: self.session(),
+            author: author.map(|a| a as u16),
+            attempts,
+            pks: ctx.pks.clone(),
+            entropy: ctx.entropy,
+        })? {
+            Message::Tickets(tickets) => tickets,
+            other => {
+                return Err(ChainError::Tickets(format!(
+                    "SignTickets answered {other:?}"
+                )))
+            }
         };
-        let keystore = self.harness().keystore();
-        if !keystore.has_bandersnatch(&pk) {
-            return Ok(Vec::new());
-        }
-        let prover = ring_vrf::RingContext::prover(&pks, author);
-        let mut tickets = Vec::new();
-        for attempt in attempts {
-            let message = bandersnatch::Message::TicketSeal(Entropy(ctx.entropy), attempt);
-            let signature = keystore
-                .bandersnatch_ring_sign(&pk, &message, &[], &prover)
-                .map_err(|e| ChainError::Tickets(format!("ring sign author {author}: {e}")))?;
-            let id = signature.vrf_output().0;
-            tickets.push(EmulatedTicket {
-                id,
-                author,
-                attempt,
-                proof: signature.0,
-                proxy: proxy_index(&id, pks.len()),
-            });
-        }
-        Ok(tickets)
+        proved
+            .into_iter()
+            .map(|t| {
+                let proof: [u8; 784] = t.proof.as_slice().try_into().map_err(|_| {
+                    ChainError::Oracle(format!(
+                        "a ring signature came back {} bytes, not 784",
+                        t.proof.len()
+                    ))
+                })?;
+                Ok(EmulatedTicket {
+                    id: t.id,
+                    author: t.author as usize,
+                    attempt: t.attempt,
+                    proof,
+                    proxy: t.proxy as usize,
+                })
+            })
+            .collect()
     }
 }
 
 /// Index of the validator designated as proxy for a ticket (polkajam rule:
 /// big-endian last 4 bytes of the ticket id, modulo the validator count).
-pub fn proxy_index(ticket_id: &[u8; 32], val_count: usize) -> usize {
-    let last4 = &ticket_id[28..32];
-    u32::from_be_bytes([last4[0], last4[1], last4[2], last4[3]]) as usize % val_count
-}
+///
+/// Re-exported rather than defined here. The oracle stamps every proved
+/// ticket with its proxy and the lanes read that stamp, so the two have to
+/// be the same function -- and when they were not, the only symptom was a
+/// simulated node that appeared to forward nothing.
+pub use m2_oracle_proto::proxy_index;
 
 /// First slot at which the emulator delivers tickets to the NUT.
 ///
@@ -551,10 +576,11 @@ pub fn verify_ticket(ctx: &TicketCtx, attempt: u8, proof: &[u8; 784]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oracle::Oracle;
 
     #[test]
     fn tickets_generate_and_verify() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         assert!(!tickets.is_empty(), "expected emulated tickets");
@@ -575,7 +601,7 @@ mod tests {
 
     #[test]
     fn ticket_wrong_attempt_fails_verify() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let t = &tickets[0];
@@ -597,7 +623,7 @@ mod tests {
 
     #[test]
     fn plan_slots_within_window() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let nut_index = 0;
@@ -635,7 +661,7 @@ mod tests {
     /// node one.
     #[test]
     fn plan_never_schedules_past_the_tail_or_into_the_target_epoch() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let period = jam_types::epoch_period();
@@ -666,7 +692,7 @@ mod tests {
     fn forwarding_window_closes_before_the_submission_window() -> Result<(), ChainError> {
         // Applies the tiny parameters process-wide, which the phase
         // arithmetic below reads.
-        let _chain = RefChain::tiny(0)?;
+        let _chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let period = jam_types::epoch_period();
         let last = last_forwardable_phase().expect("tiny leaves room to forward");
         let target_epoch = 42;
@@ -698,7 +724,7 @@ mod tests {
     /// for.
     #[test]
     fn bad_proof_keeps_the_id_and_loses_the_proof() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let honest = &tickets[0];
@@ -727,7 +753,7 @@ mod tests {
     /// honest delivery. `Duplicate` is the exception and is owed inclusion.
     #[test]
     fn no_id_is_both_expected_and_forbidden() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let period = jam_types::epoch_period();
@@ -761,7 +787,7 @@ mod tests {
     /// take that ticket's honest delivery with them.
     #[test]
     fn every_fault_is_injected_once_and_withdraws_what_it_reuses() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let period = jam_types::epoch_period();
@@ -804,7 +830,7 @@ mod tests {
     /// round, the control wins.
     #[test]
     fn bad_proof_is_skipped_rather_than_consume_the_only_control() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let all = chain.generate_tickets(&ctx)?;
         let nut_index = 5;
@@ -850,7 +876,7 @@ mod tests {
     /// being too late is the stimulus, so the schedule must not clamp it.
     #[test]
     fn the_late_fault_is_scheduled_past_the_window() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let period = jam_types::epoch_period();
@@ -878,7 +904,7 @@ mod tests {
     /// reuses a real proof, costing no extra ring-VRF work.
     #[test]
     fn plan_carries_one_unknown_epoch_fault() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let period = jam_types::epoch_period();
@@ -905,7 +931,7 @@ mod tests {
     /// rather than deliveries the node must refuse.
     #[test]
     fn plan_is_empty_once_the_window_has_closed() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&ctx)?;
         let period = jam_types::epoch_period();
@@ -929,14 +955,18 @@ mod tests {
     /// rejected every ticket the emulator offered.
     #[test]
     fn tickets_are_sealed_with_the_entropy_a_node_checks_them_against() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
         let ctx = chain.ticket_ctx()?;
-        assert_eq!(ctx.entropy.len(), 32);
-        let storage = chain.harness().storage(None);
-        let entropy = storage
-            .entropy()
-            .map_err(|e| ChainError::Tickets(e.to_string()))?;
-        assert_eq!(ctx.entropy, entropy[2].0);
+        let (entry_1, entry_2) = chain.entropy_entries()?;
+        assert_eq!(ctx.entropy, entry_2, "sealed with entry 2");
+        // Said explicitly, because the two agree often enough that the
+        // assertion above can pass while reading the wrong entry: if they
+        // are equal here, this run proves nothing and should say so rather
+        // than report a pass.
+        assert_ne!(
+            entry_1, entry_2,
+            "entries 1 and 2 happen to be equal, so nothing was distinguished"
+        );
         Ok(())
     }
 

@@ -217,7 +217,16 @@ impl SimNode {
     /// Stored before announced: the harness fetches by hash the moment it
     /// hears the announcement.
     pub fn publish(self: &Arc<Self>, block: Block) {
-        let wire = m2_emu::emu::announcement_wire(&block, &self.chain);
+        // A simulated node that cannot reach the oracle has nothing to
+        // announce. Saying so beats announcing nothing quietly, which the
+        // lane would read as the node staying silent.
+        let wire = match m2_emu::emu::announcement_wire(&block, &self.chain) {
+            Ok(wire) => wire,
+            Err(e) => {
+                eprintln!("[sim] could not build an announcement: {e}");
+                return;
+            }
+        };
         let block = self.rewrite_body(block);
         if self.fault == SimFault::ReForwardsAfterFinality {
             // Announcing this block names it final, so anything it carries is
@@ -730,10 +739,17 @@ impl SimNode {
         // Whichever stream it arrived on -- hence before the CE 131-only
         // forwarding rule below.
         if self.fault != SimFault::OmitsDeliveredTickets {
-            self.chain.submit_tickets(&[TicketEnvelope {
+            let envelope = TicketEnvelope {
                 attempt: distribution.ticket.attempt,
                 signature: ring_vrf::Signature(distribution.ticket.proof),
-            }]);
+            };
+            if let Err(e) = self.chain.submit_tickets(&[envelope]) {
+                // A simulated node that could not pool a ticket will not
+                // carry it in a block, which is the fault this very method
+                // can be asked to inject. Saying so is what keeps the two
+                // apart.
+                eprintln!("[sim] could not pool a delivered ticket: {e}");
+            }
         }
         // Only a CE 131 arrival is this node's to pass on: a CE 132 one is
         // already a broadcast.
@@ -787,7 +803,10 @@ impl SimNode {
                 return;
             }
         }
-        let chain = self.chain.chain_blocks();
+        let Ok(chain) = self.chain.chain_blocks() else {
+            eprintln!("[sim] could not read the reference chain to serve CE 128");
+            return;
+        };
         let Ok(mut response) = m2_emu::emu::serve_ce128(&request, &chain) else {
             return;
         };

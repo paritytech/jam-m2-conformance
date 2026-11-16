@@ -48,15 +48,21 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             name: "m2-oracle".to_string(),
         }),
 
-        Message::Open { spec_path, holds } => match sessions.open(&spec_path, &holds) {
+        Message::Open {
+            spec_path,
+            holds,
+            now_slot,
+        } => match sessions.open(&spec_path, &holds) {
             Ok(session) => {
                 let opened = sessions.get_mut(session).expect("just opened");
                 let (genesis_hash, genesis_slot) = (opened.genesis_hash, opened.genesis_slot);
-                // Virtual time: the harness starts at the current slot, the
-                // way `RefChain` seeds it, or everything it authors is
-                // millions of slots in the past.
-                let next = crate::wall_clock_slot();
-                opened.harness.next_slot = next;
+                // Virtual time, seeded from the *caller's* clock. Reading
+                // this process's own would be wrong twice over: a session
+                // left at genesis authors millions of slots in the past, and
+                // one seeded from `SystemTime::now()` lands wherever real
+                // time is, which for a simulation on an installed clock is
+                // nowhere near the run.
+                opened.harness.next_slot = now_slot;
                 Message::Opened {
                     session,
                     genesis_hash,
@@ -136,9 +142,10 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
         }),
 
         Message::StateRootOf { session, hash } => with(sessions, session, |s| {
+            // A block the chain does not have is `None`, not an error: the
+            // caller asked whether there is a root, and there is not.
             match s.harness.chain().state_root(&hash.into()) {
-                Ok(Some(root)) => Message::StateRoot(root.0),
-                Ok(None) => Message::Error(format!("no state for {}", hex8(&hash))),
+                Ok(root) => Message::StateRootIs(root.map(|r| r.0)),
                 Err(e) => Message::Error(format!("state for {}: {e}", hex8(&hash))),
             }
         }),
@@ -205,6 +212,58 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
                 },
             }
         }),
+
+        Message::StateOf { session, hash } => with(sessions, session, |s| {
+            let chain = s.harness.chain();
+            let header = jam_types::HeaderHash::from(hash);
+            let (Some(storage), Ok(Some(root))) =
+                (chain.storage(&header), chain.state_root(&header))
+            else {
+                // Not an error: the caller asked whether this session has
+                // that block, and it does not.
+                return Message::StateIs(None);
+            };
+            // Root and keys off one storage view, in one answer. Fetched
+            // separately they could land either side of an import, and a
+            // root that does not belong to the keys beside it is the one
+            // failure the state diff cannot detect.
+            let keyvals = storage
+                .keys()
+                .filter_map(|key| {
+                    storage
+                        .get(jam_std_common::StorageKey(key))
+                        .map(|value| (key.to_vec(), value))
+                })
+                .collect();
+            Message::StateIs(Some(m2_oracle_proto::WireState {
+                root: root.0,
+                keyvals,
+            }))
+        }),
+
+        Message::DevSpec { base_port } => {
+            // The validator set is sized from the process-wide parameters,
+            // so these come first, exactly as for a dev-spec `Open`.
+            if let Err(e) = jam_types::ProtocolParameters::tiny().apply() {
+                return Message::Error(format!("applying the tiny parameters: {e}"));
+            }
+            let spec = jam_node::hazmat::dev_spec(base_port);
+            let state = match spec.build_storage() {
+                Ok(state) => state,
+                Err(e) => return Message::Error(format!("building the dev genesis: {e}")),
+            };
+            // Only the keys that carry a value. A `None` is a key the
+            // genesis does not set, and a spec file has no way to say so.
+            let keyvals = state
+                .into_iter()
+                .filter_map(|(k, v)| v.map(|v| (k.to_vec(), v)))
+                .collect();
+            Message::DevSpecIs {
+                genesis_header: spec.genesis_header.encode(),
+                keyvals,
+                protocol_parameters: jam_types::ProtocolParameters::get().encode(),
+            }
+        }
 
         Message::GetState(hash) => {
             let Some(session) = sessions.first() else {
@@ -382,7 +441,8 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
 
         Message::EpochProbe(session) => with(sessions, session, |s| {
             let chain = s.harness.chain();
-            let (cached_index, _, _) = chain.current_and_next_epochs();
+            let (cached_index, current, _) = chain.current_and_next_epochs();
+            let cached_entropy = current.core_assignment_entropy.0;
             let head_epoch = chain.best_block().1 / jam_types::epoch_period();
             let buffer = match s.harness.storage(None).entropy() {
                 Ok(buffer) => buffer,
@@ -391,6 +451,7 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             Message::EpochProbed {
                 cached_index,
                 head_epoch,
+                cached_entropy,
                 entropy_1: buffer[1].0,
                 entropy_2: buffer[2].0,
             }
@@ -443,20 +504,10 @@ fn sign_for(
             author,
             attempt,
             proof: signature.0.to_vec(),
-            proxy: proxy_index(&id, keys.len()),
+            proxy: m2_oracle_proto::proxy_index(&id, keys.len()) as u16,
         });
     }
     Ok(tickets)
-}
-
-/// Which validator a ticket is proxied through: its id read as a big-endian
-/// number, modulo the validator count.
-fn proxy_index(id: &[u8; 32], val_count: usize) -> u16 {
-    let mut acc = 0u128;
-    for byte in id.iter().take(16) {
-        acc = (acc << 8) | u128::from(*byte);
-    }
-    (acc % val_count as u128) as u16
 }
 
 /// Turn a wire item back into the engine's own.
@@ -583,6 +634,7 @@ mod tests {
             Message::Open {
                 spec_path: "/nonexistent/spec.json".into(),
                 holds: vec![0],
+                now_slot: 10_711_224,
             },
         );
         assert!(matches!(reply, Message::OracleFault(_)), "got {reply:?}");

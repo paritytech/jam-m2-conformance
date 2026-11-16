@@ -73,13 +73,17 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     // Genesis is anchored to the start of the current epoch (A9). polkajam
     // gates its ticket lottery on the finalized block being in the current
     // epoch, which a genesis at slot 0 can never satisfy, so the node would
-    // never submit a ticket and never author. `ChainSpec` holds a boxed
-    // closure and is not `Clone`, so the reference engine gets its own build
-    // from the same inputs -- `tiny_spec` is deterministic, so the two agree
-    // byte for byte.
+    // never submit a ticket and never author.
+    //
+    // The oracle is started first because the dev genesis both specs are
+    // patched from comes out of it: the bootstrap-service blob it is built
+    // around lives inside polkajam's node crate, which this workspace does
+    // not depend on. It runs for the length of the run and dies with this
+    // handle.
+    let oracle = m2_reference::oracle::Oracle::spawn(session_dir).map_err(internal)?;
     let anchor_slot = m2_reference::chain::current_epoch_start_slot();
-    let chain_spec = spec::tiny_spec(&ips, &ports, anchor_slot).map_err(internal)?;
-    let genesis_hash = chain_spec.genesis_header.hash().0;
+    let chain_spec = spec::tiny_spec(&oracle, &ips, &ports, anchor_slot).map_err(internal)?;
+    let genesis_hash = chain_spec.genesis_hash();
     let spec_id = format!("m2-{}", cli.seed);
     let m2_spec = spec::m2_spec(&spec_id, &chain_spec).map_err(internal)?;
     let m2_spec_path = spec::write_m2_spec(session_dir, &spec_id, &m2_spec).map_err(internal)?;
@@ -112,12 +116,18 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     // plan existed. Generation happens after seeding instead; with the
     // dependencies optimized it costs about three seconds, so there is nothing
     // left to overlap with the node's startup.
+    //
+    // Opened on the very file the node under test is started from, rather
+    // than on a second build from the same inputs. The two builds were
+    // deterministic and did agree, but agreeing by construction is better
+    // than agreeing by argument: the anchor slot is in the genesis header
+    // preimage, so any drift between them would move the genesis hash and
+    // break every UP 0 handshake in the run.
     let reference = if cli.dry_run {
         None
     } else {
-        let ref_spec = spec::tiny_spec(&ips, &ports, anchor_slot).map_err(internal)?;
         Some(Arc::new(
-            RefChain::with_spec(nut_index, ref_spec).map_err(internal)?,
+            RefChain::with_spec(&oracle, nut_index, &spec_path).map_err(internal)?,
         ))
     };
 
@@ -294,7 +304,11 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // `drive_slots` has added blocks of its own, and the N0 lane compares
         // this against the reference chain the contexts are built from, which
         // has to be the same chain.
-        let count = ref_chain.chain_blocks().len().saturating_sub(1);
+        let count = ref_chain
+            .chain_blocks()
+            .map_err(internal)?
+            .len()
+            .saturating_sub(1);
         if cli.lanes.needs_tickets() && ticket_plan.is_empty() {
             conn_findings.push(empty_ticket_plan_finding(&ref_chain, target_epoch));
         }
@@ -469,6 +483,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let reference_chain: Vec<[u8; 32]> = data
                 .ref_chain
                 .chain_blocks()
+                .map_err(internal)?
                 .iter()
                 .skip(1)
                 .map(|block| block.header.hash().0)
@@ -489,9 +504,10 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     emu_preferred_peers: peers_of(&plan.initiate_now, &emu_indices),
                 },
             )
+            .map_err(internal)?
         }
         ObsSource::Fabricated { .. } => {
-            fabricated_run_ctx(reference_block_count).map_err(internal)?
+            fabricated_run_ctx(&oracle, reference_block_count).map_err(internal)?
         }
     };
 
@@ -503,6 +519,17 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     };
 
     phase("evaluate", t_eval);
+    // What the out-of-process engine cost. The question this answers is
+    // whether a round trip per request still leaves tickets inside the
+    // submission window, so the mean matters more than the total.
+    let (requests, spent) = oracle.traffic();
+    eprintln!(
+        "[oracle] {requests} requests, {spent:?} total, {:?} mean, polkajam {}",
+        spent
+            .checked_div(requests.max(1) as u32)
+            .unwrap_or_default(),
+        oracle.revision()
+    );
     // §4.6 teardown: kill the NUT (stdout/stderr already collected by `spawn`).
     if let Some(nut) = nut.take() {
         launch::kill(nut).await.map_err(internal)?;
@@ -564,7 +591,7 @@ fn emulated_indices(nut_index: usize) -> Vec<usize> {
 fn seed_past_slots(chain: &RefChain) -> Result<usize, m2_reference::chain::ChainError> {
     let now = chain.next_slot();
     let mut count = 0;
-    for slot in (chain.best_slot() + 1)..=now {
+    for slot in (chain.best_slot()? + 1)..=now {
         if chain.author_block(slot)?.is_some() {
             count += 1;
         }
@@ -703,7 +730,10 @@ async fn drive_slots(
         // adopted into the chain can already occupy this slot or a later one,
         // and authoring at or behind the head is an error that would end the
         // driver for the rest of the run.
-        if next <= chain.best_slot() {
+        // An unreachable oracle ends the driver, the same as an authoring
+        // error below: there is no chain left to drive.
+        let Ok(head) = chain.best_slot() else { break };
+        if next <= head {
             next += 1;
             continue;
         }
@@ -711,7 +741,9 @@ async fn drive_slots(
             Ok(Some(block)) => {
                 // Fails only when nothing is subscribed, which is not an error:
                 // the announcement simply has nowhere to go yet.
-                let _ = announce.send(m2_emu::emu::announcement_wire(&block, &chain));
+                if let Ok(wire) = m2_emu::emu::announcement_wire(&block, &chain) {
+                    let _ = announce.send(wire);
+                }
             }
             // The NUT's own slot, or nothing to author.
             Ok(None) => {}
@@ -806,11 +838,11 @@ fn plan_package_for_this_run(
     // lane unexercised. Three runs in five did exactly that, all of them
     // near a boundary.
     let epoch = jam_types::epoch_period();
-    let (cached_epoch_index, state_epoch_index) = ref_chain.epoch_views();
+    let (cached_epoch_index, state_epoch_index) = ref_chain.epoch_views()?;
     let base = cached_epoch_index.max(state_epoch_index);
     let from = (base + 1) * epoch + EPOCH_SETTLE_SLOTS;
     let plan = ref_chain
-        .submission_slot_for(nut_index as u16, from, SUBMISSION_MARGIN_SLOTS)
+        .submission_slot_for(nut_index as u16, from, SUBMISSION_MARGIN_SLOTS)?
         .ok_or_else(|| {
             m2_reference::chain::ChainError::Chain(format!(
                 "no slot at or after {from} leaves {SUBMISSION_MARGIN_SLOTS} slots of its \
@@ -824,8 +856,8 @@ fn plan_package_for_this_run(
         ref_chain.next_slot(),
         ref_chain.next_slot() / epoch
     );
-    let (cached_epoch, state_epoch) = ref_chain.epoch_views();
-    let (cached_entropy, entropy1, entropy2) = ref_chain.assignment_entropy();
+    let (cached_epoch, state_epoch) = ref_chain.epoch_views()?;
+    let (cached_entropy, entropy1, entropy2) = ref_chain.assignment_entropy()?;
     eprintln!(
         "[assignment] entropy: cached {cached_entropy}  best-block[1] {entropy1}  \
          best-block[2] {entropy2}  -> cached matches {}",
@@ -847,8 +879,8 @@ fn plan_package_for_this_run(
     );
     eprintln!(
         "[assignment] reference head slot {} (epoch {}), submission slot {} (epoch {})",
-        ref_chain.best_slot(),
-        ref_chain.best_slot() / jam_types::epoch_period(),
+        ref_chain.best_slot()?,
+        ref_chain.best_slot()? / jam_types::epoch_period(),
         plan.slot,
         plan.slot / jam_types::epoch_period()
     );
@@ -887,7 +919,7 @@ fn plan_package_for_this_run(
         // Each fault needs the assignment at *its own* slot: the rotation
         // can turn between two of them, and a package aimed at the core the
         // NUT held before is the not-a-guarantor fault by accident.
-        let Some(core) = ref_chain.core_for_in_epoch(nut_index as u16, slot) else {
+        let Some(core) = ref_chain.core_for_in_epoch(nut_index as u16, slot)? else {
             // Past the epoch the view can resolve. Said out loud: this used
             // to drop submissions silently, and the rows then reported
             // themselves unexercised with no way to tell that from a node
@@ -908,7 +940,7 @@ fn plan_package_for_this_run(
             slot,
             core: addressed,
             co_guarantors: ref_chain
-                .guarantors_for_in_epoch(addressed, slot)
+                .guarantors_for_in_epoch(addressed, slot)?
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|v| *v != nut_index as u16)
@@ -956,7 +988,11 @@ async fn wait_for_the_epoch_view_to_catch_up(ref_chain: &RefChain, budget_secs: 
         .mono_ms()
         .saturating_add((budget_secs / 2).saturating_mul(1000));
     while clock.mono_ms() < deadline {
-        let (cached, state) = ref_chain.epoch_views();
+        // An unreachable oracle is not something waiting will fix, and the
+        // lane behind this will report its own failure in a moment.
+        let Ok((cached, state)) = ref_chain.epoch_views() else {
+            return;
+        };
         if cached >= state {
             return;
         }
@@ -1415,14 +1451,8 @@ mod tests {
         jam_types::ProtocolParameters::tiny()
             .apply()
             .expect("tiny parameters apply");
-        let ports: Vec<u16> = (0..VALIDATOR_COUNT).map(|i| 40000 + i as u16).collect();
-        let anchor = m2_reference::chain::current_epoch_start_slot();
-        let spec = spec::tiny_spec(&loopback_ips(), &ports, anchor)
-            .map_err(|e| m2_reference::chain::ChainError::Chain(e.to_string()))?;
-        let chain = RefChain::with_spec(5, spec)?;
-
-        seed_past_slots(&chain)?;
-        let head = chain.best_slot();
+        let chain = anchored_chain_for(40000, 5)?;
+        let head = chain.best_slot()?;
 
         // The second call is the regression: seeding from genesis would try to
         // re-author a slot the chain already holds, which `author_block`
@@ -1431,11 +1461,11 @@ mod tests {
         // head, and it must not fail.
         let second = seed_past_slots(&chain).expect("seeding resumes instead of re-authoring");
         assert!(
-            chain.best_slot() >= head,
+            chain.best_slot()? >= head,
             "the head only ever moves forward"
         );
         assert_eq!(
-            chain.best_slot() - head,
+            chain.best_slot()? - head,
             second as u32,
             "the second call authored exactly the slots the clock had moved on by"
         );
@@ -1465,15 +1495,32 @@ mod tests {
     /// storage for a slot, and an unanchored chain's state is at epoch 0 while
     /// its clock is eight hundred thousand epochs later, so it has no
     /// assignment for any slot the harness would ask about.
+    /// An anchored chain on a spec file of its own, seeded to the present.
+    ///
+    /// Written out and reopened rather than handed over in memory, because
+    /// that is the only way the oracle can be given one: it is another
+    /// process, and a file is what both ends can read.
     fn anchored_chain(base_port: u16) -> Result<RefChain, m2_reference::chain::ChainError> {
+        anchored_chain_for(base_port, TEST_NUT_INDEX as usize)
+    }
+
+    fn anchored_chain_for(
+        base_port: u16,
+        nut_index: usize,
+    ) -> Result<RefChain, m2_reference::chain::ChainError> {
         jam_types::ProtocolParameters::tiny()
             .apply()
             .expect("tiny parameters apply");
+        let oracle = m2_reference::oracle::Oracle::for_tests();
         let ports: Vec<u16> = (0..VALIDATOR_COUNT).map(|i| base_port + i as u16).collect();
         let anchor = m2_reference::chain::current_epoch_start_slot();
-        let spec = spec::tiny_spec(&loopback_ips(), &ports, anchor)
+        let spec = spec::tiny_spec(&oracle, &loopback_ips(), &ports, anchor)
             .map_err(|e| m2_reference::chain::ChainError::Chain(e.to_string()))?;
-        let chain = RefChain::with_spec(TEST_NUT_INDEX as usize, spec)?;
+        let dir =
+            std::env::temp_dir().join(format!("m2-run-spec-{}-{base_port}", std::process::id()));
+        let path = spec::write_polkajam_spec(&dir, &spec)
+            .map_err(|e| m2_reference::chain::ChainError::Chain(e.to_string()))?;
+        let chain = RefChain::with_spec(&oracle, nut_index, &path)?;
         seed_past_slots(&chain)?;
         Ok(chain)
     }
@@ -1485,15 +1532,15 @@ mod tests {
     fn the_assignment_is_a_partition_and_both_directions_agree(
     ) -> Result<(), m2_reference::chain::ChainError> {
         let chain = anchored_chain(42000)?;
-        let slot = chain.best_slot();
+        let slot = chain.best_slot()?;
         let mut seen = Vec::new();
         for core in 0..jam_types::core_count() {
             let holders = chain
-                .guarantors_for(core, slot)
+                .guarantors_for(core, slot)?
                 .expect("an active core has holders");
             for val in &holders {
                 assert_eq!(
-                    chain.core_for(*val, slot),
+                    chain.core_for(*val, slot)?,
                     Some(core),
                     "validator {val} is listed under core {core} but does not name it"
                 );
@@ -1508,7 +1555,7 @@ mod tests {
         );
         assert!(
             chain
-                .guarantors_for(jam_types::core_count(), slot)
+                .guarantors_for(jam_types::core_count(), slot)?
                 .is_none(),
             "a core outside the active set has no holders"
         );
@@ -1520,10 +1567,10 @@ mod tests {
     #[test]
     fn the_assignment_rotates_within_an_epoch() -> Result<(), m2_reference::chain::ChainError> {
         let chain = anchored_chain(43000)?;
-        let slot = chain.best_slot();
+        let slot = chain.best_slot()?;
         assert_ne!(
-            chain.core_for(0, slot),
-            chain.core_for(0, slot + jam_types::rotation_period()),
+            chain.core_for(0, slot)?,
+            chain.core_for(0, slot + jam_types::rotation_period())?,
             "the core a validator holds must change across a rotation boundary"
         );
         Ok(())
@@ -1550,7 +1597,7 @@ mod tests {
         // the two disagree whenever a run straddles a boundary, and asserting
         // against the head made this test fail about half the time.
         let holders = chain
-            .guarantors_for(core, work.guarantee.slot)
+            .guarantors_for(core, work.guarantee.slot)?
             .expect("an active core has holders");
         for signature in work.guarantee.signatures.iter() {
             assert!(
@@ -1578,9 +1625,9 @@ mod tests {
         // Every starting point in a rotation, so the one that has to skip
         // ahead is covered rather than whichever the clock happens to land on.
         for offset in 0..rotation {
-            let from = chain.best_slot() + offset;
+            let from = chain.best_slot()? + offset;
             let plan = chain
-                .submission_slot_for(TEST_NUT_INDEX, from, margin)
+                .submission_slot_for(TEST_NUT_INDEX, from, margin)?
                 .expect("a slot within one rotation always qualifies");
             assert!(plan.slot >= from, "the plan never aims into the past");
             assert!(
@@ -1588,13 +1635,13 @@ mod tests {
                 "and never further than one rotation out"
             );
             assert_eq!(
-                chain.core_for(TEST_NUT_INDEX, plan.slot),
+                chain.core_for(TEST_NUT_INDEX, plan.slot)?,
                 Some(plan.core),
                 "the plan names the core the NUT actually holds"
             );
             for slot in plan.slot..plan.slot + margin {
                 assert_eq!(
-                    chain.core_for(TEST_NUT_INDEX, slot),
+                    chain.core_for(TEST_NUT_INDEX, slot)?,
                     Some(plan.core),
                     "the core must not move under the node during the window \
                      (start {}, slot {slot})",
@@ -1615,9 +1662,9 @@ mod tests {
             chain
                 .submission_slot_for(
                     TEST_NUT_INDEX,
-                    chain.best_slot(),
+                    chain.best_slot()?,
                     jam_types::rotation_period() + 1
-                )
+                )?
                 .is_none(),
             "no slot has more than a rotation left in its rotation"
         );
@@ -1720,9 +1767,9 @@ mod tests {
         // CE 133 addresses a core, so the lane needs the NUT to hold one at
         // the slot it submits in. Without this the submission has nowhere to
         // go and the lane's first row is unreachable.
-        let slot = chain.best_slot();
+        let slot = chain.best_slot()?;
         assert!(
-            chain.core_for(TEST_NUT_INDEX, slot).is_some(),
+            chain.core_for(TEST_NUT_INDEX, slot)?.is_some(),
             "the NUT must guarantee some core at the slot a package is submitted in"
         );
         Ok(())

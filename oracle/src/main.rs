@@ -21,20 +21,47 @@ use m2_oracle_proto::{frame, read_frame, Message};
 
 use session::Sessions;
 
-/// Wall-clock slot, the way the reference chain computes it.
+/// Exit when stdin reaches EOF, in a thread of its own.
 ///
-/// The harness is virtual-time: a session opened without this authors from
-/// genesis, millions of slots behind the node it is meant to shadow.
-pub fn wall_clock_slot() -> u32 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("the clock is after 1970")
-        .as_secs();
-    ((now - jam_types::JAM_COMMON_ERA) / 6) as u32
+/// A client that owns this process cannot always kill it: a test binary's
+/// shared handle lives until the process exits and so never drops, and a
+/// runner that is itself killed never gets to clean up either. Both would
+/// leave an oracle holding a socket, and the next run would find it there.
+///
+/// The parent passes a pipe as this process's stdin and holds the write end.
+/// When the parent goes -- cleanly or not -- the pipe closes, the read below
+/// returns 0, and this process goes with it.
+///
+/// Opt-in, because stdin is otherwise inherited: under `cargo test` it may
+/// already be at EOF, and an oracle that exited the moment it started would
+/// look exactly like one that failed to bind.
+fn exit_when_stdin_closes() {
+    std::thread::spawn(|| {
+        let mut sink = [0u8; 256];
+        loop {
+            match std::io::stdin().read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        std::process::exit(0);
+    });
 }
 
 fn main() {
-    let path = match std::env::args().nth(1) {
+    let mut args = std::env::args().skip(1);
+    let mut watch_stdin = false;
+    let mut positional = Vec::new();
+    for arg in args.by_ref() {
+        match arg.as_str() {
+            "--exit-on-stdin-eof" => watch_stdin = true,
+            other => positional.push(other.to_string()),
+        }
+    }
+    if watch_stdin {
+        exit_when_stdin_closes();
+    }
+    let path = match positional.into_iter().next() {
         // The revision this binary was built from, on stdout and nothing
         // else, so a build script can compare it with the pin. Checking it
         // there costs a process start; discovering a mismatch from a
@@ -45,7 +72,7 @@ fn main() {
         }
         Some(path) => path,
         None => {
-            eprintln!("usage: m2-oracle <socket-path>");
+            eprintln!("usage: m2-oracle [--exit-on-stdin-eof] <socket-path>");
             eprintln!("       m2-oracle --revision");
             std::process::exit(2);
         }

@@ -1983,7 +1983,6 @@ dependencies = [
 name = "m2-reference"
 version = "0.1.0"
 dependencies = [
- "jam-node",
  "jam-std-common",
  "jam-types",
  "jamnp-s",

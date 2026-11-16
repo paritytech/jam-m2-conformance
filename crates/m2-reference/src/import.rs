@@ -2,11 +2,10 @@
 //! chain with fresh execution and reports the outcome (post-state root or
 //! the rejected-import error message).
 
-use jam_node::hazmat::ImportBlockParams;
 use jam_std_common::Block;
-use jam_types::HeaderHash;
+use m2_oracle_proto::Message;
 
-use crate::chain::RefChain;
+use crate::chain::{ChainError, RefChain};
 
 /// Outcome of importing a NUT block into the reference chain.
 ///
@@ -44,155 +43,73 @@ impl RefChain {
     /// authoring on its own head instead forks away from the node at every
     /// slot the node claims, and then nothing ever builds on a NUT block, so
     /// no block's posterior state root is ever witnessed.
-    pub fn import_nut_block(&self, block: &Block) -> ImportOutcome {
-        let chain = self.harness().chain();
+    ///
+    /// Three of the outcome's seven fields are read off the block itself
+    /// rather than asked for: the caller already holds it, and the oracle
+    /// would only be decoding the same bytes.
+    pub fn import_nut_block(&self, block: &Block) -> Result<ImportOutcome, ChainError> {
         let header_root = block.header.hash().0;
-        let hash = HeaderHash::from(header_root);
-        let parent = block.header.parent;
-        let outcome = |ok, root, error| ImportOutcome {
+        let (ok, root, parent_root, error) = match self.ask(Message::ImportInto {
+            session: self.session(),
+            block: jam_types::Encode::encode(block),
+        })? {
+            Message::Imported {
+                ok,
+                root,
+                parent_root,
+                error,
+            } => (ok, root, parent_root, error),
+            other => return Err(ChainError::Oracle(format!("ImportInto answered {other:?}"))),
+        };
+        Ok(ImportOutcome {
             header_root,
-            parent: parent.0,
+            parent: block.header.parent.0,
             declared_parent_root: block.header.parent_state_root.0,
-            reference_parent_root: chain.state_root(&parent).ok().flatten().map(|r| r.0),
+            reference_parent_root: parent_root,
             ok,
             root,
             error,
-        };
-        match chain.import_block(block.clone(), ImportBlockParams::new_exec(hash)) {
-            Ok(_) => {
-                let root = chain.state_root(&hash).ok().flatten().map(|r| r.0);
-                outcome(true, root, None)
-            }
-            Err(e) => outcome(false, None, Some(e.to_string())),
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use jam_std_common::{bandersnatch::ring_vrf, Extrinsic, TicketEnvelope};
-
     use super::*;
-    use crate::chain::ChainError;
+    use crate::oracle::Oracle;
 
-    const RING_SIGNATURE_SIZE: usize = 784;
-
-    fn authored_head(chain: &mut RefChain) -> Result<Block, ChainError> {
-        let start = chain.next_slot();
-        for slot in start..start + 24 {
-            if let Some(block) = chain.author_block(slot)? {
-                return Ok(block);
-            }
-        }
-        panic!("no emulated slot within 24 slots")
-    }
-
+    // What an import *does* -- accepting a block, refusing a corrupt body,
+    // re-accepting one it already has -- is tested in the oracle crate,
+    // against the engine. What is this crate's own is the mapping below:
+    // three of `ImportOutcome`'s seven fields are read off the block here
+    // rather than asked for, and reading them off the wrong thing is easy
+    // and silent. A header hash and a state root are both 32 bytes.
     #[test]
-    fn import_nut_block_ok_for_chain_head() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
-        let start = chain.next_slot();
-        let mut authored = Vec::new();
-        for slot in start..start + 60 {
-            if let Some(block) = chain.author_block(slot)? {
-                authored.push(block);
-            }
-        }
-        let pair = authored
-            .windows(2)
-            .find(|w| w[1].header.slot > w[0].header.slot + 1)
-            .expect("a NUT (un-authored) slot appears within 60 slots");
-        let block = pair[1].clone();
-        let hash = block.header.hash().0;
+    fn the_outcome_describes_the_block_it_was_given() -> Result<(), ChainError> {
+        let oracle = Oracle::for_tests();
+        let author = RefChain::tiny(&oracle, 0)?;
+        // A session that has not seen the block, so the import is a real one
+        // rather than a short-circuit on a hash the chain already holds.
+        let importer = RefChain::tiny_for(&oracle, 0)?;
 
-        let outcome = chain.import_nut_block(&block);
-        assert!(
-            outcome.ok,
-            "re-import of an authored head succeeds: {:?}",
-            outcome.error
-        );
-        assert!(outcome.error.is_none());
-        assert_eq!(outcome.header_root, hash);
-        let expected = chain.storage_root(&hash).expect("head has a state root");
-        assert_eq!(outcome.root, Some(expected));
-        Ok(())
-    }
-
-    #[test]
-    fn import_nut_block_rejects_bad_extrinsic() -> Result<(), ChainError> {
-        let chain = RefChain::tiny(0)?;
-        let start = chain.next_slot();
-        // Author WITHOUT importing (author_block_no_import): a block produced by
-        // author_block is already in the chain, and re-importing a known hash
-        // short-circuits to AlreadyImported before any verification runs.
-        let mut authored = None;
+        let start = author.next_slot();
+        let mut block = None;
         for slot in start..start + 24 {
-            if let Ok(Some(result)) = chain.harness().author_block_no_import(slot, None) {
-                authored = Some(result.block);
+            if let Some(authored) = author.author_block(slot)? {
+                block = Some(authored);
                 break;
             }
         }
-        let mut corrupt = authored.expect("an emulated slot appears within 24 slots");
-        // Replace the extrinsic with a garbage ticket so the body no longer matches
-        // the header's extrinsic hash.
-        let mut bogus = Extrinsic::default();
-        bogus
-            .tickets
-            .try_push(TicketEnvelope {
-                attempt: 0,
-                signature: ring_vrf::Signature([0xab; RING_SIGNATURE_SIZE]),
-            })
-            .expect("tiny spec allows 3 tickets per block");
-        corrupt.extrinsic = Arc::new(bogus);
+        let block = block.expect("an emulated slot appears within 24 slots");
 
-        let outcome = chain.import_nut_block(&corrupt);
-        assert!(
-            !outcome.ok,
-            "a corrupt extrinsic must be rejected: {:?}",
-            outcome.error
-        );
-        assert!(
-            outcome.error.is_some(),
-            "rejection carries an error message"
-        );
-        assert!(outcome.root.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn import_nut_block_rejects_obsolete() -> Result<(), ChainError> {
-        let mut chain = RefChain::tiny(0)?;
-        let block = authored_head(&mut chain)?;
-
-        let first = chain.import_nut_block(&block);
-        assert!(first.ok, "first import succeeds: {:?}", first.error);
-
-        // polkajam returns AlreadyImported for a known block, surfacing as ok=true.
-        let second = chain.import_nut_block(&block);
-        assert!(
-            second.ok,
-            "re-import of a known block is accepted: {:?}",
-            second.error
-        );
-        assert!(second.error.is_none());
-        assert_eq!(second.header_root, first.header_root);
-        assert_eq!(second.root, first.root);
-        Ok(())
-    }
-
-    /// The two roots the N1 state-root check compares are the header's
-    /// declared prior root and the reference's own root for the same parent —
-    /// never the header hash, which is a different quantity entirely and can
-    /// only ever differ.
-    #[test]
-    fn import_reports_prior_and_posterior_roots_separately() -> Result<(), ChainError> {
-        let mut chain = RefChain::tiny(0)?;
-        let block = authored_head(&mut chain)?;
-        let outcome = chain.import_nut_block(&block);
-
-        assert!(outcome.ok, "import succeeds: {:?}", outcome.error);
+        let outcome = importer.import_nut_block(&block)?;
+        assert!(outcome.ok, "a reference block imports: {:?}", outcome.error);
+        assert_eq!(outcome.header_root, block.header.hash().0);
         assert_eq!(outcome.parent, block.header.parent.0);
+        assert_eq!(
+            outcome.declared_parent_root,
+            block.header.parent_state_root.0
+        );
         assert_eq!(
             outcome.reference_parent_root,
             Some(outcome.declared_parent_root),

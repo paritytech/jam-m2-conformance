@@ -24,7 +24,9 @@ for the design; this README documents the current implementation state.
 | Crate | Responsibility |
 |---|---|
 | `jamnp-s` | Independent JAMNP-S: QUIC/TLS endpoint (quinn 0.11 + rustls), Ed25519 cert + custom SAN, ALPN `jamnp-s/1/<8hex>[/builder]`, preferred-initiator rule, kind-once stream framing (`u32 LE` messages), typed codecs for every UP/CE protocol (UP 0, CE 128–148), message trace recorder, and the `transport` and `clock` boundaries (QUIC or an in-process mock; the machine's clock or a virtual one) that everything above it speaks through. |
-| `m2-reference` | Reference oracle over polkajam `hazmat`: `RefChain` (tiny 6-validator chain, deterministic authoring of emulated slots), NUT-block import + state diff (`import.rs`/`state.rs`), ticket generation/planning/verification (`tickets.rs`). |
+| `m2-oracle-proto` | The wire protocol between the harness and the reference oracle: a 4-byte length prefix and a JAM-codec message, with the fuzz protocol's own tags kept where they were. |
+| `m2-reference` | Client of the reference oracle: `RefChain` (tiny 6-validator chain, deterministic authoring of emulated slots), NUT-block import + state diff (`import.rs`/`state.rs`), ticket generation/planning/verification (`tickets.rs`). Holds a connection and a session id; the engine itself is in `oracle/`. |
+| `oracle/` | **Outside the workspace.** The reference engine, behind a unix socket: the one crate that depends on polkajam's `jam-node` and its `hazmat` feature. Built by `scripts/prepare-nut.sh` from the same revision as the node under test, which is what makes its answers a standard to grade that node by. |
 | `m2-emu` | Five emulated validators (skeletons — no core logic; all values/decisions injected from `m2-reference`): UP 0 announce, CE 128/129 serve, NUT-block fetch (N1), CE 131/132 ticket send/receive (N2). |
 | `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `n0.rs` (9 checks), `n1.rs` (6), `n2.rs` (7). |
 | `m2-runner` | CLI: keygen → spec → NUT launch (docker/polkajam presets) → connectivity → scenario (N0/N1/N2) → `report.md`/`findings.json`/trace → exit code. |
@@ -34,7 +36,12 @@ for the design; this README documents the current implementation state.
 
 ```sh
 cargo build --workspace
-cargo test --workspace
+
+# The tests need the reference oracle, and so does a dry run: both build a
+# real chain, and the engine that builds one lives outside this workspace.
+# Once, and again after a re-pin:
+./scripts/prepare-nut.sh          # third_party/bin/{polkajam,m2-oracle}
+cargo test --workspace            # or set M2_ORACLE_BIN to one you built
 
 # Dry-run baseline (no real NUT; fabricates a conforming observation log):
 cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/m2-dry
