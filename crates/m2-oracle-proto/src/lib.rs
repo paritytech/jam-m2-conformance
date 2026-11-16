@@ -53,6 +53,22 @@ pub struct WireItem {
     pub export_count: u16,
 }
 
+/// A ticket an emulated validator proved.
+///
+/// Mirrors `m2_reference::tickets::EmulatedTicket`, which cannot cross the
+/// wire: it is built from a hazmat keystore.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct WireTicket {
+    /// Ring-VRF output, which is the ticket id and its score.
+    pub id: [u8; 32],
+    pub author: u16,
+    pub attempt: u8,
+    /// Ring signature, 32 + 752 bytes.
+    pub proof: Vec<u8>,
+    /// Proxy index over the validator set.
+    pub proxy: u16,
+}
+
 /// Which view of the core assignment a request wants.
 ///
 /// polkajam computes it two ways and they disagree for a slot in the chain
@@ -126,6 +142,47 @@ pub enum Message {
         session: SessionId,
         hash: [u8; 32],
     } = 25,
+    /// The ring context a target epoch's tickets are proved against.
+    TicketCtx(SessionId) = 34,
+    /// Bandersnatch keys of the designated validators, and the entropy.
+    ///
+    /// Entry 2 of the buffer, which is what the reference reads. The
+    /// entries differ by an epoch and the confusion between them has cost
+    /// this project a session before: every emulated ticket comes back
+    /// "invalid ticket signature", and it goes unnoticed because the two
+    /// agree whenever an epoch boundary falls between proving and
+    /// delivery.
+    TicketContext {
+        pks: Vec<[u8; 32]>,
+        entropy: [u8; 32],
+    } = 35,
+    /// Prove tickets for one author, or for every author the session holds.
+    ///
+    /// Ring-VRF proving is the harness's single most expensive operation --
+    /// five authors times four attempts runs to tens of seconds -- so the
+    /// request names an author where the caller wants one, rather than
+    /// paying for the whole set and discarding most of it.
+    SignTickets {
+        session: SessionId,
+        /// `None` proves for every author the session's keystore backs.
+        author: Option<u16>,
+        pks: Vec<[u8; 32]>,
+        entropy: [u8; 32],
+    } = 36,
+    /// The proved tickets.
+    Tickets(Vec<WireTicket>) = 37,
+    /// Put tickets into the session's pool, as a validator would.
+    SubmitTickets {
+        session: SessionId,
+        /// Encoded `TicketEnvelope`s.
+        envelopes: Vec<Vec<u8>>,
+    } = 38,
+    /// A request that needed no answer succeeded.
+    ///
+    /// Distinct from an empty `Error`: a caller has to be able to tell
+    /// "done" from "the oracle said nothing".
+    Done = 39,
+
     /// Build a package, optionally against an authorizer no core accepts.
     BuildPackage {
         session: SessionId,
@@ -321,6 +378,35 @@ mod tests {
                 bundle: vec![0x11; 64],
                 guarantee: vec![0x22; 24],
             },
+            Message::TicketCtx(1),
+            Message::TicketContext {
+                pks: vec![[0x01; 32], [0x02; 32]],
+                entropy: [0x03; 32],
+            },
+            Message::SignTickets {
+                session: 1,
+                author: Some(3),
+                pks: vec![[0x04; 32]],
+                entropy: [0x05; 32],
+            },
+            Message::SignTickets {
+                session: 1,
+                author: None,
+                pks: vec![[0x04; 32]],
+                entropy: [0x05; 32],
+            },
+            Message::Tickets(vec![WireTicket {
+                id: [0x06; 32],
+                author: 3,
+                attempt: 2,
+                proof: vec![0x07; 784],
+                proxy: 4,
+            }]),
+            Message::SubmitTickets {
+                session: 1,
+                envelopes: vec![vec![0x08; 16]],
+            },
+            Message::Done,
             Message::CoreAssignment {
                 session: 1,
                 slot: 9_780_003,

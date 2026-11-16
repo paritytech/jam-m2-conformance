@@ -211,10 +211,201 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             Message::Assignment(table)
         }),
 
+        Message::TicketCtx(session) => with(sessions, session, |s| {
+            let storage = s.harness.storage(None);
+            let validators = match storage.designate_validators() {
+                Ok(v) => v,
+                Err(e) => return Message::Error(format!("designate_validators: {e}")),
+            };
+            let pks = validators.iter().map(|v| v.bandersnatch.0).collect();
+            // Entry 2, which is what `RefChain::ticket_ctx` reads. Writing
+            // entry 1 here -- as a first pass of this handler did -- makes
+            // every proved ticket come back "invalid ticket signature", and
+            // does it quietly, because the two entries agree whenever an
+            // epoch boundary falls between proving and delivery.
+            let entropy = match storage.entropy() {
+                Ok(buffer) => buffer[2].0,
+                Err(e) => return Message::Error(format!("entropy: {e}")),
+            };
+            Message::TicketContext { pks, entropy }
+        }),
+
+        Message::SignTickets {
+            session,
+            author,
+            pks,
+            entropy,
+        } => with(sessions, session, |s| {
+            let attempts = jam_types::tickets_per_validator(jam_types::max_val_count());
+            let authors: Vec<u16> = match author {
+                Some(one) => vec![one],
+                None => (0..pks.len() as u16).collect(),
+            };
+            let mut proved = Vec::new();
+            for author in authors {
+                match sign_for(s, &pks, entropy, author, attempts) {
+                    Ok(mut tickets) => proved.append(&mut tickets),
+                    Err(e) => return Message::Error(e),
+                }
+            }
+            Message::Tickets(proved)
+        }),
+
+        Message::SubmitTickets { session, envelopes } => with(sessions, session, |s| {
+            let mut decoded = Vec::with_capacity(envelopes.len());
+            for envelope in &envelopes {
+                let mut cursor = &envelope[..];
+                match jam_std_common::TicketEnvelope::decode(&mut cursor) {
+                    Ok(ticket) => decoded.push(ticket),
+                    Err(e) => return Message::Error(format!("a ticket did not decode: {e}")),
+                }
+            }
+            s.harness.submit_tickets(&decoded);
+            Message::Done
+        }),
+
+        Message::BuildPackage {
+            session,
+            items,
+            authorized,
+        } => with(sessions, session, |s| {
+            let items: Vec<_> = items.iter().map(build_item).collect();
+            let (package, extrinsics) = if authorized {
+                s.harness.build_package(items)
+            } else {
+                // `Authorizer::any()`'s code hash is zero, so no core
+                // authorizes it. The package is otherwise well-formed, which
+                // is what makes it a test of the authorization check rather
+                // than of the decoder.
+                s.harness.build_package_with_auth(
+                    items,
+                    jam_types::Authorizer::any(),
+                    jam_node::DEV_BOOTSTRAP_SERVICE_ID,
+                    jam_types::Authorization::new(),
+                )
+            };
+            Message::Package {
+                package: package.encode(),
+                extrinsics: extrinsics.into_iter().collect(),
+            }
+        }),
+
+        Message::GuaranteeWork {
+            session,
+            items,
+            core,
+        } => with(sessions, session, |s| {
+            let items: Vec<_> = items.iter().map(build_item).collect();
+            let (package, xts) = s.harness.build_package(items);
+            let wire = package.clone();
+            let (report, bundle, _) = match s.harness.try_compose_report(package, &xts, core) {
+                Ok(composed) => composed,
+                Err(e) => return Message::Error(format!("compose report: {e}")),
+            };
+            let guarantee = match s.harness.try_compose_guarantee(report.clone()) {
+                Ok(guarantee) => guarantee,
+                Err(e) => return Message::Error(format!("compose guarantee: {e}")),
+            };
+            Message::GuaranteedWork {
+                package: wire.encode(),
+                extrinsics: xts.into_iter().collect(),
+                report: report.encode(),
+                bundle: bundle.to_vec(),
+                guarantee: guarantee.encode(),
+            }
+        }),
+
+        Message::EpochProbe(session) => with(sessions, session, |s| {
+            let chain = s.harness.chain();
+            let (cached_index, _, _) = chain.current_and_next_epochs();
+            let head_epoch = chain.best_block().1 / jam_types::epoch_period();
+            let buffer = match s.harness.storage(None).entropy() {
+                Ok(buffer) => buffer,
+                Err(e) => return Message::Error(format!("entropy: {e}")),
+            };
+            Message::EpochProbed {
+                cached_index,
+                head_epoch,
+                entropy_1: buffer[1].0,
+                entropy_2: buffer[2].0,
+            }
+        }),
+
         // Responses are not requests. A peer that sends one is confused, and
         // saying so beats answering it.
         other => Message::OracleFault(format!("{other:?} is not a request")),
     }
+}
+
+/// Prove one author's tickets, or none where the keystore has no key.
+///
+/// Lifted from `RefChain::sign_tickets`. It stays one function because the
+/// proof is signed over the attempt: a caller that wanted a ticket for a
+/// different attempt cannot rewrite an honest one without breaking it.
+fn sign_for(
+    session: &mut crate::session::Session,
+    pks: &[[u8; 32]],
+    entropy: [u8; 32],
+    author: u16,
+    attempts: u8,
+) -> Result<Vec<m2_oracle_proto::WireTicket>, String> {
+    use jam_node::hazmat::KeystoreSigner as _;
+    use jam_std_common::{
+        bandersnatch::{self, ring_vrf},
+        Entropy,
+    };
+
+    let keys: Vec<bandersnatch::Public> =
+        pks.iter().map(|p| bandersnatch::Public(*p)).collect();
+    let Some(pk) = keys.get(author as usize).copied() else {
+        return Ok(Vec::new());
+    };
+    let keystore = session.harness.keystore();
+    if !keystore.has_bandersnatch(&pk) {
+        // Not an error: a session holds only some validators' keys, and
+        // being asked for one it does not hold is the normal case.
+        return Ok(Vec::new());
+    }
+    let prover = ring_vrf::RingContext::prover(&keys, author as usize);
+    let mut tickets = Vec::new();
+    for attempt in 0..attempts {
+        let message = bandersnatch::Message::TicketSeal(Entropy(entropy), attempt);
+        let signature = keystore
+            .bandersnatch_ring_sign(&pk, &message, &[], &prover)
+            .map_err(|e| format!("ring sign author {author}: {e}"))?;
+        let id = signature.vrf_output().0;
+        tickets.push(m2_oracle_proto::WireTicket {
+            id,
+            author,
+            attempt,
+            proof: signature.0.to_vec(),
+            proxy: proxy_index(&id, keys.len()),
+        });
+    }
+    Ok(tickets)
+}
+
+/// Which validator a ticket is proxied through: its id read as a big-endian
+/// number, modulo the validator count.
+fn proxy_index(id: &[u8; 32], val_count: usize) -> u16 {
+    let mut acc = 0u128;
+    for byte in id.iter().take(16) {
+        acc = (acc << 8) | u128::from(*byte);
+    }
+    (acc % val_count as u128) as u16
+}
+
+/// Turn a wire item back into the engine's own.
+fn build_item(item: &m2_oracle_proto::WireItem) -> jam_node::hazmat::BuildItem {
+    jam_node::hazmat::BuildItem::new(
+        item.service,
+        jam_types::WorkPayload(item.payload.clone()),
+        item.ref_gas,
+        item.acc_gas,
+        item.xts.clone(),
+        Vec::new(),
+        item.export_count,
+    )
 }
 
 fn with(
