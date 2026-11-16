@@ -169,6 +169,43 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             })
         }
 
+        Message::ImportInto { session, block } => with(sessions, session, |s| {
+            let mut cursor = &block[..];
+            let block = match jam_std_common::Block::decode(&mut cursor) {
+                Ok(block) => block,
+                Err(e) => return Message::Error(format!("the block did not decode: {e}")),
+            };
+            if !cursor.is_empty() {
+                return Message::Error(format!("the block has {} trailing bytes", cursor.len()));
+            }
+            let hash = block.header.hash();
+            let parent = block.header.parent;
+            let chain = s.harness.chain();
+            let outcome =
+                chain.import_block(block, jam_node::hazmat::ImportBlockParams::new_exec(hash));
+            // Read after the import, which does not move the parent's root
+            // but does mean the chain knows the parent in the case where it
+            // has just learned it.
+            let parent_root = chain.state_root(&parent).ok().flatten().map(|r| r.0);
+            match outcome {
+                // A block the chain already had imports as `Ok`, which is
+                // what the lane wants: it asked whether the block is
+                // acceptable, not whether it was new.
+                Ok(_) => Message::Imported {
+                    ok: true,
+                    root: chain.state_root(&hash).ok().flatten().map(|r| r.0),
+                    parent_root,
+                    error: None,
+                },
+                Err(e) => Message::Imported {
+                    ok: false,
+                    root: None,
+                    parent_root,
+                    error: Some(e.to_string()),
+                },
+            }
+        }),
+
         Message::GetState(hash) => {
             let Some(session) = sessions.first() else {
                 return Message::OracleFault("no session is open".into());

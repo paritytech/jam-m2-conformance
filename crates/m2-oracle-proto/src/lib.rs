@@ -193,6 +193,39 @@ pub enum Message {
     /// "done" from "the oracle said nothing".
     Done = 39,
 
+    /// Import a block into `session`, answered with `Imported`.
+    ///
+    /// Distinct from the fuzz protocol's `ImportBlock`, which names no
+    /// session and answers with a bare state root. The N1 lane compares
+    /// three different roots and needs a refusal's wording, none of which
+    /// fits in that answer, and it has to say which chain to import into
+    /// rather than take whichever session happened to open first.
+    ImportInto {
+        session: SessionId,
+        block: Vec<u8>,
+    } = 40,
+    /// What came of an import.
+    ///
+    /// The caller already holds the block, so the quantities it can read
+    /// off the header -- the block's hash, its parent, the prior root the
+    /// header declares -- are not repeated here. What it cannot compute is
+    /// everything below: all of it comes from the engine.
+    Imported {
+        /// True when the block was accepted, which includes a block the
+        /// chain already had.
+        ok: bool,
+        /// The block's posterior state root, when it was accepted.
+        root: Option<[u8; 32]>,
+        /// The reference's *own* posterior root for the block's parent,
+        /// when it knows the parent at all.
+        ///
+        /// Not the root the header declares. The lane compares the two, and
+        /// a header may declare a root for a parent this chain never had.
+        parent_root: Option<[u8; 32]>,
+        /// Why the block was refused, in the engine's words.
+        error: Option<String>,
+    } = 41,
+
     /// Build a package, optionally against an authorizer no core accepts.
     BuildPackage {
         session: SessionId,
@@ -427,6 +460,22 @@ mod tests {
                 envelopes: vec![vec![0x08; 16]],
             },
             Message::Done,
+            Message::ImportInto {
+                session: 2,
+                block: vec![0x09; 32],
+            },
+            Message::Imported {
+                ok: true,
+                root: Some([0x0a; 32]),
+                parent_root: Some([0x0b; 32]),
+                error: None,
+            },
+            Message::Imported {
+                ok: false,
+                root: None,
+                parent_root: None,
+                error: Some("obsolete".into()),
+            },
             Message::CoreAssignment {
                 session: 1,
                 slot: 9_780_003,

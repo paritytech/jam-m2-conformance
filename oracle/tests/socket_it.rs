@@ -595,3 +595,255 @@ fn both_assignment_views_answer_and_say_when_they_cannot() {
         other => panic!("expected EpochProbed, got {other:?}"),
     }
 }
+
+/// Author one block per authorable slot in `slots`, returning them encoded.
+fn author_over(stream: &mut UnixStream, session: u16, slots: std::ops::Range<u32>) -> Vec<Vec<u8>> {
+    let mut blocks = Vec::new();
+    for slot in slots {
+        match ask(stream, Message::AuthorBlock { session, slot }) {
+            Message::Authored(Some(block)) => blocks.push(block),
+            Message::Authored(None) => {}
+            other => panic!("authoring slot {slot}: {other:?}"),
+        }
+    }
+    blocks
+}
+
+fn decode(block: &[u8]) -> jam_std_common::Block {
+    use jam_types::Decode;
+    let mut cursor = block;
+    let decoded = jam_std_common::Block::decode(&mut cursor).expect("the block decodes");
+    assert!(cursor.is_empty(), "the block has trailing bytes");
+    decoded
+}
+
+/// A session never authors for a validator it was not given.
+///
+/// This is the one property the whole arrangement rests on. A session that
+/// signs for a validator the run is emulating elsewhere -- the node under
+/// test, most of all -- produces blocks that prove something nobody did,
+/// and the lane grading them has no way to tell. So: six sessions, each
+/// missing a different validator, and no block from any of them carries the
+/// index that session was not given.
+#[test]
+fn a_session_authors_only_for_the_validators_it_holds() {
+    let oracle = start("holds");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    for excluded in 0u16..6 {
+        let holds: Vec<u16> = (0..6).filter(|v| *v != excluded).collect();
+        let (session, genesis_slot) = match ask(
+            &mut stream,
+            Message::Open {
+                spec_path: String::new(),
+                holds,
+            },
+        ) {
+            Message::Opened {
+                session,
+                genesis_slot,
+                ..
+            } => (session, genesis_slot),
+            other => panic!("expected Opened, got {other:?}"),
+        };
+
+        let blocks = author_over(&mut stream, session, genesis_slot + 1..genesis_slot + 13);
+        assert!(
+            !blocks.is_empty(),
+            "excluding {excluded}: nothing was authored in 12 slots, so the \
+             assertion below proves nothing"
+        );
+        for encoded in &blocks {
+            let block = decode(encoded);
+            assert_ne!(
+                block.header.author_index, excluded,
+                "a session without validator {excluded}'s key authored as it"
+            );
+        }
+
+        match ask(&mut stream, Message::Close(session)) {
+            Message::Done => {}
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+}
+
+/// Two sessions over one spec author the same blocks.
+///
+/// The engine holds the only randomness in a run, and the oracle serves
+/// requests serially, so a seed-determined run has to stay seed-determined
+/// across the socket. If it does not, two runs of the same seed grade
+/// differently and no verdict means anything.
+#[test]
+fn two_sessions_on_one_spec_author_the_same_blocks() {
+    let oracle = start("deterministic");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    let open = |stream: &mut UnixStream| match ask(
+        stream,
+        Message::Open {
+            spec_path: String::new(),
+            holds: (0..6).collect(),
+        },
+    ) {
+        Message::Opened {
+            session,
+            genesis_slot,
+            ..
+        } => (session, genesis_slot),
+        other => panic!("expected Opened, got {other:?}"),
+    };
+
+    let (a, genesis_slot) = open(&mut stream);
+    let (b, _) = open(&mut stream);
+    let slots = genesis_slot + 1..genesis_slot + 9;
+
+    let from_a = author_over(&mut stream, a, slots.clone());
+    let from_b = author_over(&mut stream, b, slots);
+    assert!(!from_a.is_empty(), "something was authored");
+    assert_eq!(from_a, from_b, "the same spec authors the same blocks");
+}
+
+/// The genesis state root is what the first block declares as its prior.
+///
+/// Two different quantities that are easy to confuse -- a header hash and a
+/// state root are both 32 bytes -- and the N1 lane compares them for a
+/// living. This pins the relation at the one place it is knowable without
+/// trusting either side: the first block's parent is genesis, so its
+/// `parent_state_root` *is* the genesis state root.
+#[test]
+fn the_genesis_state_root_is_the_first_blocks_declared_prior() {
+    let oracle = start("roots");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    let (session, genesis_hash, genesis_slot) = match ask(
+        &mut stream,
+        Message::Open {
+            spec_path: String::new(),
+            holds: (0..6).collect(),
+        },
+    ) {
+        Message::Opened {
+            session,
+            genesis_hash,
+            genesis_slot,
+        } => (session, genesis_hash, genesis_slot),
+        other => panic!("expected Opened, got {other:?}"),
+    };
+
+    let genesis_root = match ask(
+        &mut stream,
+        Message::StateRootOf {
+            session,
+            hash: genesis_hash,
+        },
+    ) {
+        Message::StateRoot(root) => root,
+        other => panic!("expected StateRoot, got {other:?}"),
+    };
+    assert_ne!(
+        genesis_root, genesis_hash,
+        "the state root is not the header hash"
+    );
+
+    let blocks = author_over(&mut stream, session, genesis_slot + 1..genesis_slot + 13);
+    let first = decode(blocks.first().expect("a slot is authorable"));
+    assert_eq!(first.header.parent.0, genesis_hash);
+    assert_eq!(first.header.parent_state_root.0, genesis_root);
+}
+
+/// What an import says when it refuses, and when it has seen the block.
+///
+/// The lane reads three roots off an import and the engine's own wording
+/// for a refusal, which is why `ImportInto` answers with all of it rather
+/// than the fuzz protocol's bare state root.
+#[test]
+fn an_import_reports_its_roots_and_its_refusals() {
+    use jam_types::Encode;
+
+    let oracle = start("import");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    let open = |stream: &mut UnixStream| match ask(
+        stream,
+        Message::Open {
+            spec_path: String::new(),
+            holds: (0..6).collect(),
+        },
+    ) {
+        Message::Opened {
+            session,
+            genesis_slot,
+            ..
+        } => (session, genesis_slot),
+        other => panic!("expected Opened, got {other:?}"),
+    };
+    // Authored in one session, imported into another that has never seen
+    // it: a block already in a chain short-circuits to "already imported"
+    // before any verification runs, so a corrupt one has to arrive
+    // somewhere fresh to be judged at all.
+    let (author, genesis_slot) = open(&mut stream);
+    let (importer, _) = open(&mut stream);
+
+    let blocks = author_over(&mut stream, author, genesis_slot + 1..genesis_slot + 13);
+    let encoded = blocks.first().expect("a slot is authorable").clone();
+    let block = decode(&encoded);
+
+    let import = |stream: &mut UnixStream, session: u16, block: Vec<u8>| match ask(
+        stream,
+        Message::ImportInto { session, block },
+    ) {
+        Message::Imported {
+            ok,
+            root,
+            parent_root,
+            error,
+        } => (ok, root, parent_root, error),
+        other => panic!("expected Imported, got {other:?}"),
+    };
+
+    let (ok, root, parent_root, error) = import(&mut stream, importer, encoded.clone());
+    assert!(ok, "a well-formed block imports: {error:?}");
+    assert_eq!(error, None);
+    assert_eq!(
+        parent_root,
+        Some(block.header.parent_state_root.0),
+        "a well-formed block's declared prior root is the reference's own"
+    );
+    assert_ne!(
+        root,
+        Some(block.header.hash().0),
+        "the posterior state root is not the header hash"
+    );
+
+    // Importing it again is accepted, not refused: the question the lane
+    // asks is whether the block is acceptable, not whether it is new.
+    let (again, again_root, _, again_error) = import(&mut stream, importer, encoded);
+    assert!(again, "a known block re-imports: {again_error:?}");
+    assert_eq!(again_error, None);
+    assert_eq!(again_root, root);
+
+    // A body that does not match the header's extrinsic hash is refused,
+    // and the refusal carries the engine's own words. It needs a session
+    // that has never seen this header: corrupting the body leaves the
+    // header hash alone, and a chain that already holds that hash
+    // short-circuits to "already imported" without verifying anything --
+    // which is what the two imports above just did to `importer`.
+    let mut corrupt = block;
+    let mut bogus = jam_std_common::Extrinsic::default();
+    bogus
+        .tickets
+        .try_push(jam_std_common::TicketEnvelope {
+            attempt: 0,
+            // 32 + 752, the same number `WireTicket::proof` carries.
+            signature: jam_std_common::bandersnatch::ring_vrf::Signature([0xab; 784]),
+        })
+        .expect("the tiny spec allows tickets in a block");
+    corrupt.extrinsic = std::sync::Arc::new(bogus);
+
+    let (fresh, _) = open(&mut stream);
+    let (ok, root, _, error) = import(&mut stream, fresh, corrupt.encode());
+    assert!(!ok, "a corrupt body is refused");
+    assert!(error.is_some(), "a refusal says why");
+    assert_eq!(root, None);
+}
