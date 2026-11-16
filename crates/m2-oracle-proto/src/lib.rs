@@ -30,7 +30,7 @@ use codec::{Decode, Encode};
 /// Bumped whenever a message changes shape. The client refuses a mismatch
 /// rather than guessing, because a silently misread response is a wrong
 /// conformance verdict rather than an error.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Largest frame either side will read, matching the fuzz protocol's.
 pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
@@ -166,6 +166,16 @@ pub enum Message {
         session: SessionId,
         /// `None` proves for every author the session's keystore backs.
         author: Option<u16>,
+        /// Which attempts to prove; `None` is every attempt up to the
+        /// per-validator cap.
+        ///
+        /// Named rather than implied because a fault row wants a ticket for
+        /// an attempt *past* the cap, proved over that attempt. Rewriting an
+        /// honest ticket's attempt afterwards will not do: the attempt is
+        /// part of the signed message, so the edit breaks the proof too and
+        /// the node then has two reasons to refuse it instead of the one
+        /// the row is testing.
+        attempts: Option<Vec<u8>>,
         pks: Vec<[u8; 32]>,
         entropy: [u8; 32],
     } = 36,
@@ -221,7 +231,15 @@ pub enum Message {
         view: AssignmentView,
     } = 30,
     /// Validators per core, indexed by core.
-    Assignment(Vec<Vec<u16>>) = 31,
+    ///
+    /// `None` for a core the view cannot resolve -- which for the epoch
+    /// view means the slot is outside the two epochs the chain holds, and
+    /// so is every core's answer at that slot. Kept apart from `Some(vec![])`
+    /// on purpose: "nobody holds this core" and "this slot is out of reach"
+    /// read the same if they both arrive empty, and the caller that cannot
+    /// tell them apart aims its submissions at a slot nothing will resolve
+    /// and then reports the node's silence as a failure.
+    Assignment(Vec<Option<Vec<u16>>>) = 31,
     /// The two epoch views and the entropy each shuffles with.
     ///
     /// Diagnostic, and the one message expected to be deleted: it exists
@@ -386,12 +404,14 @@ mod tests {
             Message::SignTickets {
                 session: 1,
                 author: Some(3),
+                attempts: Some(vec![9]),
                 pks: vec![[0x04; 32]],
                 entropy: [0x05; 32],
             },
             Message::SignTickets {
                 session: 1,
                 author: None,
+                attempts: None,
                 pks: vec![[0x04; 32]],
                 entropy: [0x05; 32],
             },
@@ -412,7 +432,7 @@ mod tests {
                 slot: 9_780_003,
                 view: AssignmentView::Epoch,
             },
-            Message::Assignment(vec![vec![0, 4, 5], vec![1, 2, 3]]),
+            Message::Assignment(vec![Some(vec![0, 4, 5]), Some(vec![1, 2, 3])]),
             Message::EpochProbe(1),
             Message::EpochProbed {
                 cached_index: 815_083,

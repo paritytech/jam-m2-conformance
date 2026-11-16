@@ -8,7 +8,9 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use m2_oracle_proto::{frame, read_frame, Message, PeerInfo, PROTOCOL_VERSION};
+use m2_oracle_proto::{
+    frame, read_frame, AssignmentView, Message, PeerInfo, WireItem, PROTOCOL_VERSION,
+};
 
 /// A running oracle, killed when the test drops it.
 ///
@@ -126,4 +128,470 @@ fn the_oracle_survives_a_dropped_connection() {
     let mut second = UnixStream::connect(&oracle.path).expect("reconnect");
     let reply = ask(&mut second, Message::Head(0));
     assert!(matches!(reply, Message::OracleFault(_)), "got {reply:?}");
+}
+
+/// Phase 2's exit criterion: a real session, end to end over the socket.
+///
+/// Two sessions, in the shape a live run uses: the first is the chain the
+/// node's blocks are imported into, and a second holds the keys and
+/// authors. `ImportBlock` carries no session -- it is the fuzz protocol's
+/// tag -- so it lands on the first one opened, which is what makes the
+/// order here load-bearing.
+///
+/// Nothing in it is a stub: the oracle builds an `AuthoringHarness` per
+/// session, runs the Safrole lottery over the keysets each was told it
+/// holds, and executes the block on import. If any of that is wrong the
+/// reply is an `Error` naming the step.
+#[test]
+fn a_real_session_authors_imports_and_reads_state() {
+    let oracle = start("real");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    // An empty spec path is the default dev spec under the tiny parameters.
+    // A live run names a file the runner wrote and the node under test also
+    // loads; here there is no node, so there is nothing to agree with.
+    let open = |stream: &mut UnixStream, holds: Vec<u16>| match ask(
+        stream,
+        Message::Open {
+            spec_path: String::new(),
+            holds,
+        },
+    ) {
+        Message::Opened {
+            session,
+            genesis_hash,
+            genesis_slot,
+        } => (session, genesis_hash, genesis_slot),
+        other => panic!("expected Opened, got {other:?}"),
+    };
+
+    // Holds nothing, so it never authors: it only receives.
+    let (importer, genesis_hash, genesis_slot) = open(&mut stream, vec![]);
+    // Holds every key, so some slot in the first epoch is its to claim.
+    let (author, author_genesis, _) = open(&mut stream, (0..6).collect());
+    assert_eq!(
+        author_genesis, genesis_hash,
+        "two sessions on one spec share a genesis"
+    );
+    assert!(importer < author, "the importer was opened first");
+
+    // Both heads start at genesis.
+    for session in [importer, author] {
+        match ask(&mut stream, Message::Head(session)) {
+            Message::HeadIs { hash, slot } => {
+                assert_eq!(hash, genesis_hash, "head is genesis");
+                assert_eq!(slot, genesis_slot);
+            }
+            other => panic!("expected HeadIs, got {other:?}"),
+        }
+    }
+
+    // Which slot wins the lottery is not this test's business: it holds
+    // every key, so some slot is authorable, and `Authored(None)` for a
+    // given one is an answer rather than a failure.
+    let mut authored = None;
+    for slot in genesis_slot + 1..genesis_slot + 13 {
+        match ask(
+            &mut stream,
+            Message::AuthorBlock {
+                session: author,
+                slot,
+            },
+        ) {
+            Message::Authored(Some(block)) => {
+                authored = Some(block);
+                break;
+            }
+            Message::Authored(None) => continue,
+            other => panic!("authoring slot {slot}: {other:?}"),
+        }
+    }
+    let block = authored.expect("some slot in the first epoch is authorable with every key held");
+
+    // Authoring imports into the authoring chain, so that head has moved.
+    let authored_hash = match ask(&mut stream, Message::Head(author)) {
+        Message::HeadIs { hash, slot } => {
+            assert!(slot > genesis_slot, "the authoring head advanced");
+            assert_ne!(hash, genesis_hash);
+            hash
+        }
+        other => panic!("expected HeadIs, got {other:?}"),
+    };
+
+    // The importer has not seen it yet.
+    match ask(&mut stream, Message::Head(importer)) {
+        Message::HeadIs { hash, .. } => assert_eq!(hash, genesis_hash, "still at genesis"),
+        other => panic!("expected HeadIs, got {other:?}"),
+    }
+
+    // This is the live path: a block from elsewhere, executed on import.
+    let root = match ask(&mut stream, Message::ImportBlock(block)) {
+        Message::StateRoot(root) => root,
+        other => panic!("expected StateRoot, got {other:?}"),
+    };
+    assert_ne!(root, [0u8; 32], "an imported block has a state root");
+
+    match ask(&mut stream, Message::Head(importer)) {
+        Message::HeadIs { hash, slot } => {
+            assert_eq!(hash, authored_hash, "the importer adopted the block");
+            assert!(slot > genesis_slot);
+        }
+        other => panic!("expected HeadIs, got {other:?}"),
+    }
+
+    // The same block, reached two ways: the authoring session computed this
+    // root, the importing one re-executed for it. They agree or the two
+    // chains have diverged.
+    match ask(
+        &mut stream,
+        Message::StateRootOf {
+            session: author,
+            hash: authored_hash,
+        },
+    ) {
+        Message::StateRoot(theirs) => assert_eq!(theirs, root, "the two chains agree"),
+        other => panic!("expected StateRoot, got {other:?}"),
+    }
+
+    // State at the new head: non-empty, and every key the right width.
+    match ask(&mut stream, Message::GetState(authored_hash)) {
+        Message::State(pairs) => {
+            assert!(!pairs.is_empty(), "the state has entries");
+            for (key, _) in &pairs {
+                assert_eq!(key.len(), 31, "a state key is 31 bytes");
+            }
+        }
+        other => panic!("expected State, got {other:?}"),
+    }
+
+    // And the chain reads back genesis plus the one block, in that order.
+    match ask(&mut stream, Message::ChainBlocks(importer)) {
+        Message::Blocks(blocks) => assert_eq!(blocks.len(), 2, "genesis and one block"),
+        other => panic!("expected Blocks, got {other:?}"),
+    }
+
+    for session in [importer, author] {
+        match ask(&mut stream, Message::Close(session)) {
+            Message::Done => {}
+            other => panic!("expected Done, got {other:?}"),
+        }
+        match ask(&mut stream, Message::Head(session)) {
+            Message::OracleFault(m) => assert!(m.contains("no session"), "{m}"),
+            other => panic!("a closed session is gone, got {other:?}"),
+        }
+    }
+}
+
+/// The ticket path, against a real keystore.
+///
+/// Ring-VRF proving is the harness's one expensive operation, so this asks
+/// for one author and two attempts rather than the whole set. What it is
+/// really checking is that the proofs come back signed over the entropy
+/// `TicketCtx` handed out and over the attempt that was asked for -- the
+/// two things that go wrong silently, because a ticket proved over the
+/// wrong entropy is a well-formed ticket that simply never verifies.
+#[test]
+fn tickets_are_proved_over_the_context_the_oracle_gave() {
+    let oracle = start("tickets");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    let session = match ask(
+        &mut stream,
+        Message::Open {
+            spec_path: String::new(),
+            holds: (0..6).collect(),
+        },
+    ) {
+        Message::Opened { session, .. } => session,
+        other => panic!("expected Opened, got {other:?}"),
+    };
+
+    let (pks, entropy) = match ask(&mut stream, Message::TicketCtx(session)) {
+        Message::TicketContext { pks, entropy } => (pks, entropy),
+        other => panic!("expected TicketContext, got {other:?}"),
+    };
+    assert_eq!(pks.len(), 6, "the tiny validator set");
+    assert_ne!(entropy, [0u8; 32], "genesis entropy is not zero");
+
+    let tickets = match ask(
+        &mut stream,
+        Message::SignTickets {
+            session,
+            author: Some(1),
+            // One past the per-validator cap among them: the fault rows need
+            // a proof genuinely signed over an attempt the node must refuse.
+            attempts: Some(vec![0, 99]),
+            pks: pks.clone(),
+            entropy,
+        },
+    ) {
+        Message::Tickets(tickets) => tickets,
+        other => panic!("expected Tickets, got {other:?}"),
+    };
+    assert_eq!(tickets.len(), 2, "one per attempt asked for");
+    assert_eq!(tickets[0].attempt, 0);
+    assert_eq!(tickets[1].attempt, 99);
+    assert_ne!(
+        tickets[0].id, tickets[1].id,
+        "the attempt is part of the signed message, so it changes the id"
+    );
+    for t in &tickets {
+        assert_eq!(t.author, 1);
+        assert_eq!(t.proof.len(), 784, "32 + 752");
+        assert!((t.proxy as usize) < pks.len(), "proxy is an index");
+    }
+
+    // Submitting them is a request that answers `Done` rather than a value.
+    // The pool files by epoch and drops duplicates, so this says the oracle
+    // took them, not that a block will carry them.
+    let envelopes = tickets
+        .iter()
+        .map(|t| {
+            let mut bytes = vec![t.attempt];
+            bytes.extend_from_slice(&t.proof);
+            bytes
+        })
+        .collect();
+    match ask(&mut stream, Message::SubmitTickets { session, envelopes }) {
+        Message::Done => {}
+        other => panic!("expected Done, got {other:?}"),
+    }
+
+    // A session that does not hold the key proves nothing, and says so by
+    // answering with no tickets rather than by failing: a session holds only
+    // some validators, and being asked for one it does not hold is ordinary.
+    let narrow = match ask(
+        &mut stream,
+        Message::Open {
+            spec_path: String::new(),
+            holds: vec![0],
+        },
+    ) {
+        Message::Opened { session, .. } => session,
+        other => panic!("expected Opened, got {other:?}"),
+    };
+    match ask(
+        &mut stream,
+        Message::SignTickets {
+            session: narrow,
+            author: Some(1),
+            attempts: Some(vec![0]),
+            pks,
+            entropy,
+        },
+    ) {
+        Message::Tickets(none) => assert!(none.is_empty(), "no key, no tickets"),
+        other => panic!("expected Tickets, got {other:?}"),
+    }
+}
+
+/// Building a package, and guaranteeing one.
+///
+/// `BuildPackage`'s `authorized` flag is the interesting part: both arms
+/// produce a well-formed package, and the unauthorized one differs only in
+/// carrying `Authorizer::any()`, whose code hash is zero so that no core
+/// authorizes it. A row built on it tests the node's authorization check
+/// rather than its decoder, which is only true if the two packages are
+/// otherwise alike -- so this asserts they are both decodable and that they
+/// differ.
+#[test]
+fn packages_are_built_authorized_and_not() {
+    let oracle = start("packages");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    let (session, genesis_slot) = match ask(
+        &mut stream,
+        Message::Open {
+            spec_path: String::new(),
+            holds: (0..6).collect(),
+        },
+    ) {
+        Message::Opened {
+            session,
+            genesis_slot,
+            ..
+        } => (session, genesis_slot),
+        other => panic!("expected Opened, got {other:?}"),
+    };
+
+    let item = WireItem {
+        service: 0,
+        payload: vec![1, 2, 3, 4],
+        ref_gas: 10_000_000,
+        acc_gas: 10_000_000,
+        xts: vec![vec![0xab; 8]],
+        imports: vec![],
+        export_count: 0,
+    };
+
+    let build = |stream: &mut UnixStream, authorized: bool| match ask(
+        stream,
+        Message::BuildPackage {
+            session,
+            items: vec![item.clone()],
+            authorized,
+        },
+    ) {
+        Message::Package {
+            package,
+            extrinsics,
+        } => (package, extrinsics),
+        other => panic!("expected Package, got {other:?}"),
+    };
+
+    let (authorized, xts) = build(&mut stream, true);
+    assert!(!authorized.is_empty(), "a package has bytes");
+    assert_eq!(xts, vec![vec![0xab; 8]], "the item's extrinsic comes back");
+
+    let (unauthorized, other_xts) = build(&mut stream, false);
+    assert_eq!(other_xts, xts, "only the authorizer differs");
+    assert_ne!(
+        authorized, unauthorized,
+        "the unauthorized package carries a different authorizer"
+    );
+
+    // Guaranteeing needs a chain under it. Composing a report picks a
+    // lookup anchor out of recent history, and a chain still at genesis has
+    // nothing recent to pick -- "lookup anchor too old", in the engine's
+    // words. It also needs virtual time in the chain's epoch: a session
+    // opens with its clock at the wall-clock slot, which is what makes a
+    // live run author in real time, and the dev spec's genesis sits at slot
+    // 0 some 800,000 slots behind it. Authoring forward from genesis fixes
+    // both at once, because each authored slot also moves the clock to the
+    // slot after it.
+    //
+    // A live run meets neither problem: the runner anchors its spec's
+    // genesis to the current epoch, and by the time anything is guaranteed
+    // the chain has been authoring for a while.
+    let mut authored = 0;
+    for slot in genesis_slot + 1..genesis_slot + 13 {
+        match ask(&mut stream, Message::AuthorBlock { session, slot }) {
+            Message::Authored(Some(_)) => authored += 1,
+            Message::Authored(None) => continue,
+            other => panic!("authoring slot {slot}: {other:?}"),
+        }
+    }
+    assert!(authored >= 6, "holding every key, most slots are claimable");
+
+    // Guaranteeing is the whole N3 front half in one request: build, compose
+    // a report over a core, and sign a guarantee for it.
+    match ask(
+        &mut stream,
+        Message::GuaranteeWork {
+            session,
+            items: vec![item],
+            core: 0,
+        },
+    ) {
+        Message::GuaranteedWork {
+            package,
+            extrinsics,
+            report,
+            bundle,
+            guarantee,
+        } => {
+            assert!(!package.is_empty());
+            assert_eq!(extrinsics, xts);
+            assert!(!report.is_empty(), "a report was composed");
+            assert!(
+                bundle.len() > package.len(),
+                "the bundle carries the package and its extrinsics"
+            );
+            assert!(!guarantee.is_empty(), "the guarantee was signed");
+        }
+        other => panic!("expected GuaranteedWork, got {other:?}"),
+    }
+}
+
+/// The two core-assignment views, and the epoch probe.
+///
+/// The views exist because they disagree. `storage.core_assignments_for`
+/// reads the entropy entry its own epoch relation picks; the cached
+/// `EpochInfo` reads entry 1. Which one a caller wants depends on what it
+/// is about to do -- sign a guarantee, or check one it received -- and the
+/// run that mixed them up spent a session being told "Wrong core
+/// assignment" by a node that was right.
+///
+/// This does not assert they differ, which depends on where the chain is.
+/// It asserts both answer, that an out-of-reach slot is `None` rather than
+/// an empty cohort, and that the probe reports both entropy entries.
+#[test]
+fn both_assignment_views_answer_and_say_when_they_cannot() {
+    // The oracle applies the tiny parameters when it opens a dev-spec
+    // session; this process has to apply them too, or `core_count()` here
+    // is the full 341 against the oracle's 2. The parameters are
+    // process-wide globals, so they do not travel over the socket.
+    jam_types::ProtocolParameters::tiny()
+        .apply()
+        .expect("the tiny parameters apply");
+
+    let oracle = start("assignment");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    let (session, genesis_slot) = match ask(
+        &mut stream,
+        Message::Open {
+            spec_path: String::new(),
+            holds: (0..6).collect(),
+        },
+    ) {
+        Message::Opened {
+            session,
+            genesis_slot,
+            ..
+        } => (session, genesis_slot),
+        other => panic!("expected Opened, got {other:?}"),
+    };
+
+    let table = |stream: &mut UnixStream, slot: u32, view| match ask(
+        stream,
+        Message::CoreAssignment {
+            session,
+            slot,
+            view,
+        },
+    ) {
+        Message::Assignment(table) => table,
+        other => panic!("expected Assignment, got {other:?}"),
+    };
+
+    let cores = jam_types::core_count() as usize;
+    for view in [AssignmentView::Storage, AssignmentView::Epoch] {
+        let assignment = table(&mut stream, genesis_slot, view);
+        assert_eq!(assignment.len(), cores, "one entry per core");
+        let holders: Vec<u16> = assignment.iter().flatten().flatten().copied().collect();
+        assert!(!holders.is_empty(), "{view:?} resolves at genesis");
+        for v in &holders {
+            assert!((*v as usize) < 6, "a validator index");
+        }
+    }
+
+    // A slot many epochs away is outside the two epochs the chain holds, so
+    // the epoch view cannot resolve it. Answering `None` is the point: an
+    // empty cohort would read as "nobody holds this core".
+    let far = genesis_slot + jam_types::epoch_period() * 50;
+    let unreachable = table(&mut stream, far, AssignmentView::Epoch);
+    assert!(
+        unreachable.iter().all(|core| core.is_none()),
+        "an out-of-reach slot resolves to nothing, not to an empty cohort: {unreachable:?}"
+    );
+
+    // The probe reads both entropy entries, which is the whole reason it
+    // exists: the cached epoch's assignment is built from entry 1 and the
+    // storage view's from entry 2, and seeing both is how a run tells which
+    // of them a node agreed with.
+    match ask(&mut stream, Message::EpochProbe(session)) {
+        Message::EpochProbed {
+            cached_index,
+            head_epoch,
+            entropy_1,
+            entropy_2,
+        } => {
+            assert_eq!(head_epoch, genesis_slot / jam_types::epoch_period());
+            assert_eq!(cached_index, head_epoch, "at genesis the two agree");
+            assert_ne!(entropy_1, [0u8; 32], "genesis entropy is not zero");
+            assert_ne!(entropy_2, [0u8; 32]);
+        }
+        other => panic!("expected EpochProbed, got {other:?}"),
+    }
 }

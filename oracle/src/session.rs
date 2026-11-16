@@ -34,26 +34,45 @@ pub struct Sessions {
 impl Sessions {
     /// Open a session over the spec at `spec_path`, holding `holds`.
     ///
+    /// An empty `spec_path` opens the default dev spec under the tiny
+    /// parameters, which is what the lane's own tests want.
+    ///
     /// The spec comes from a file rather than over the wire: the runner
     /// writes one and both the oracle and the node under test load it, which
     /// is the only way to be sure they start from the same bytes. The reply
     /// carries the genesis hash so the runner can check that.
     pub fn open(&mut self, spec_path: &str, holds: &[u16]) -> Result<SessionId, String> {
-        // The spec file carries its own parameters and applies them, so the
-        // oracle does not guess at tiny-versus-full: both it and the node
-        // under test load the same file and get the same configuration.
-        // `jam_node::ChainSpec`, not `jam_chainspec`'s: the node has its own
-        // and `AuthoringHarness` takes that one. They look alike and are not
-        // interchangeable.
+        // Read the way the runner writes it. The runner emits `spec.json`
+        // with `ChainSpec::to_file`, and the matching reader is
+        // `load_from_file_and_apply_parameters` -- which decodes the file's
+        // `protocol_parameters` and applies them process-wide *before*
+        // decoding anything else, then rebuilds the genesis state from the
+        // file's own `genesis_state` entries.
         //
-        // Loaded the way the runner writes it: `ChainSpec::to_file` emits a
-        // config, so the round trip is config in, spec out. Both the oracle
-        // and the node under test read this one file, which is the only way
-        // to be sure they start from the same genesis bytes.
-        let config = jam_node::ChainSpecConfig::from_file(std::path::Path::new(spec_path))
-            .map_err(|e| format!("loading {spec_path}: {e}"))?;
-        let chain_spec = jam_node::ChainSpec::from_config(config)
-            .map_err(|e| format!("building a spec from {spec_path}: {e}"))?;
+        // Not `ChainSpecConfig::from_file` + `ChainSpec::from_config`: that
+        // pair reads the other file -- a spec *config*, the recipe the
+        // runner builds a spec from -- and `from_config` does not apply the
+        // parameters, it checks them and fails when they disagree. The two
+        // file shapes are both JSON and look alike enough to swap by
+        // accident.
+        //
+        // `jam_node::ChainSpec`, not `jam_chainspec`'s: the node has its own
+        // and `AuthoringHarness` takes that one. They look alike too.
+        //
+        // An empty path means the default dev spec, which is what the lane's
+        // own tests run on. Its validator set is sized from the process-wide
+        // parameters, so tiny has to be applied before it is built, not
+        // after.
+        let chain_spec = if spec_path.is_empty() {
+            jam_types::ProtocolParameters::tiny()
+                .apply()
+                .map_err(|e| format!("applying the tiny parameters: {e}"))?;
+            jam_node::hazmat::default_dev_spec()
+        } else {
+            jam_node::ChainSpec::load_from_file_and_apply_parameters(spec_path)
+                .map_err(|e| format!("loading {spec_path}: {e}"))?
+                .1
+        };
 
         let genesis_hash = chain_spec.genesis_header.hash().0;
         let genesis_slot = chain_spec.genesis_header.slot;

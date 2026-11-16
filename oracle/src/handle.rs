@@ -66,13 +66,12 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             Err(e) => Message::OracleFault(e),
         },
 
+        // Closing a session that is not open is not an error: a runner
+        // tearing down after a fault should not have to know which of its
+        // sessions survived.
         Message::Close(session) => {
             sessions.close(session);
-            Message::Opened {
-                session,
-                genesis_hash: [0; 32],
-                genesis_slot: 0,
-            }
+            Message::Done
         }
 
         Message::AuthorBlock { session, slot } => with(sessions, session, |s| {
@@ -83,11 +82,28 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             if slot <= head_slot {
                 return Message::Error(format!("slot {slot} is not past the head at {head_slot}"));
             }
-            s.harness.next_slot = slot;
-            match s.harness.author.author_block(slot) {
+            let hash = match s.harness.author.author_block(slot) {
+                Ok(Some(hash)) => hash,
+                Ok(None) => {
+                    s.harness.next_slot = slot + 1;
+                    return Message::Authored(None);
+                }
+                Err(e) => return Message::Error(format!("authoring slot {slot}: {e}")),
+            };
+            // Past the slot just authored, not at it: the next call has to
+            // be able to claim `slot + 1`.
+            s.harness.next_slot = slot + 1;
+            // `author_block` answers with the hash and keeps the block --
+            // it authors *and* imports -- so the block itself comes back out
+            // of the chain. Encoding the hash instead produces 32 bytes that
+            // fail to decode as a header, which is a confusing way to find
+            // this out.
+            match s.harness.chain().block(&hash) {
                 Ok(Some(block)) => Message::Authored(Some(block.encode())),
-                Ok(None) => Message::Authored(None),
-                Err(e) => Message::Error(format!("authoring slot {slot}: {e}")),
+                Ok(None) => {
+                    Message::Error(format!("authored {} is not in the chain", hex8(&hash.0)))
+                }
+                Err(e) => Message::Error(format!("reading authored {}: {e}", hex8(&hash.0))),
             }
         }),
 
@@ -183,14 +199,18 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             let cores = jam_types::core_count();
             let table = (0..cores)
                 .map(|core| match view {
+                    // The on-chain rule's own view: the assignment the
+                    // storage for `slot` carries.
                     AssignmentView::Storage => s
                         .harness
                         .storage(None)
                         .core_assignments_for(slot)
                         .ok()
                         .and_then(|a| a.core_to_vals(core))
-                        .map(|v| v.to_vec())
-                        .unwrap_or_default(),
+                        .map(|v| v.to_vec()),
+                    // What a sharing guarantor uses. The chain holds two
+                    // epochs; a slot outside both resolves to nothing, and
+                    // that is an answer -- `None`, not an empty cohort.
                     AssignmentView::Epoch => {
                         let chain = s.harness.chain();
                         let (index, current, next) = chain.current_and_next_epochs();
@@ -204,7 +224,6 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
                         };
                         info.and_then(|e| e.core_assignments(slot).core_to_vals(core))
                             .map(|v| v.to_vec())
-                            .unwrap_or_default()
                     }
                 })
                 .collect();
@@ -233,17 +252,20 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
         Message::SignTickets {
             session,
             author,
+            attempts,
             pks,
             entropy,
         } => with(sessions, session, |s| {
-            let attempts = jam_types::tickets_per_validator(jam_types::max_val_count());
+            let attempts = attempts.unwrap_or_else(|| {
+                (0..jam_types::tickets_per_validator(jam_types::max_val_count())).collect()
+            });
             let authors: Vec<u16> = match author {
                 Some(one) => vec![one],
                 None => (0..pks.len() as u16).collect(),
             };
             let mut proved = Vec::new();
             for author in authors {
-                match sign_for(s, &pks, entropy, author, attempts) {
+                match sign_for(s, &pks, entropy, author, &attempts) {
                     Ok(mut tickets) => proved.append(&mut tickets),
                     Err(e) => return Message::Error(e),
                 }
@@ -269,7 +291,10 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             items,
             authorized,
         } => with(sessions, session, |s| {
-            let items: Vec<_> = items.iter().map(build_item).collect();
+            let items = match items.iter().map(build_item).collect::<Result<Vec<_>, _>>() {
+                Ok(items) => items,
+                Err(e) => return Message::Error(e),
+            };
             let (package, extrinsics) = if authorized {
                 s.harness.build_package(items)
             } else {
@@ -295,7 +320,10 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             items,
             core,
         } => with(sessions, session, |s| {
-            let items: Vec<_> = items.iter().map(build_item).collect();
+            let items = match items.iter().map(build_item).collect::<Result<Vec<_>, _>>() {
+                Ok(items) => items,
+                Err(e) => return Message::Error(e),
+            };
             let (package, xts) = s.harness.build_package(items);
             let wire = package.clone();
             let (report, bundle, _) = match s.harness.try_compose_report(package, &xts, core) {
@@ -347,7 +375,7 @@ fn sign_for(
     pks: &[[u8; 32]],
     entropy: [u8; 32],
     author: u16,
-    attempts: u8,
+    attempts: &[u8],
 ) -> Result<Vec<m2_oracle_proto::WireTicket>, String> {
     use jam_node::hazmat::KeystoreSigner as _;
     use jam_std_common::{
@@ -355,8 +383,7 @@ fn sign_for(
         Entropy,
     };
 
-    let keys: Vec<bandersnatch::Public> =
-        pks.iter().map(|p| bandersnatch::Public(*p)).collect();
+    let keys: Vec<bandersnatch::Public> = pks.iter().map(|p| bandersnatch::Public(*p)).collect();
     let Some(pk) = keys.get(author as usize).copied() else {
         return Ok(Vec::new());
     };
@@ -368,7 +395,7 @@ fn sign_for(
     }
     let prover = ring_vrf::RingContext::prover(&keys, author as usize);
     let mut tickets = Vec::new();
-    for attempt in 0..attempts {
+    for &attempt in attempts {
         let message = bandersnatch::Message::TicketSeal(Entropy(entropy), attempt);
         let signature = keystore
             .bandersnatch_ring_sign(&pk, &message, &[], &prover)
@@ -396,16 +423,32 @@ fn proxy_index(id: &[u8; 32], val_count: usize) -> u16 {
 }
 
 /// Turn a wire item back into the engine's own.
-fn build_item(item: &m2_oracle_proto::WireItem) -> jam_node::hazmat::BuildItem {
-    jam_node::hazmat::BuildItem::new(
+fn build_item(item: &m2_oracle_proto::WireItem) -> Result<jam_node::hazmat::BuildItem, String> {
+    // `ImportSpec` has a hand-written codec -- the root is a two-case
+    // enum, not a plain hash -- so the specs cross the wire encoded and
+    // are decoded here rather than mirrored field by field.
+    let mut imports = Vec::with_capacity(item.imports.len());
+    for (i, encoded) in item.imports.iter().enumerate() {
+        let mut cursor = &encoded[..];
+        let spec = jam_types::ImportSpec::decode(&mut cursor)
+            .map_err(|e| format!("import spec {i} did not decode: {e}"))?;
+        if !cursor.is_empty() {
+            return Err(format!(
+                "import spec {i} has {} trailing bytes",
+                cursor.len()
+            ));
+        }
+        imports.push(spec);
+    }
+    Ok(jam_node::hazmat::BuildItem::new(
         item.service,
         jam_types::WorkPayload(item.payload.clone()),
         item.ref_gas,
         item.acc_gas,
         item.xts.clone(),
-        Vec::new(),
+        imports,
         item.export_count,
-    )
+    ))
 }
 
 fn with(
