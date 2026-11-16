@@ -156,17 +156,26 @@ forwarding window, and an unknown-epoch probe that was never scheduled.
 
 ## Dependency wiring
 
-Polkajam's library crates (`jam-types`, `jam-std-common`, `jam-node` with
-`hazmat`, `polkajam-fuzz` declared/unused) are ordinary **git dependencies**
-pinned to a commit in the root `Cargo.toml` (DESIGN.md §8). Nothing from
-polkajam is vendored into this repository.
+The workspace takes two polkajam crates, `jam-types` and `jam-std-common`, as
+ordinary **git dependencies** pinned to a commit in the root `Cargo.toml`
+(DESIGN.md §8). It does not take `jam-node`: `cargo tree -i jam-node` finds
+nothing here, because the engine runs out of process. Nothing from polkajam
+is vendored into this repository.
+
+Not from crates.io, though both are published at the same 0.1.29 the pin
+carries. They are different code -- the published `ServiceActivityRecord` has
+`provided_count: u16` where the pin has `u32`, in a struct that derives
+`Encode` -- so a harness built against one and an oracle built against the
+other would disagree about bytes in the state a lane diffs. polkajam
+publishes 0.1.x from a moving trunk, so a version number does not identify a
+revision; findings.md §6 has the diff and the check to repeat on a re-pin.
 
 The reference oracle (`oracle/`) is **outside the workspace** and pins the
 same revision in its own `oracle/Cargo.toml`. `prepare-nut.sh` reads the pin
-from there -- the oracle's manifest is the one that will still name polkajam
-once the workspace no longer does -- and refuses to build if the two
-manifests disagree. It produces both binaries, from one revision, so the node
-under test and the engine that grades it are the same build:
+from there -- the oracle's manifest is the one that still names `jam-node` --
+and refuses to build if the two manifests disagree. It produces both
+binaries, from one revision, so the node under test and the engine that
+grades it are the same build:
 
 ```sh
 ./scripts/prepare-nut.sh        # third_party/bin/{polkajam,m2-oracle}
@@ -196,7 +205,7 @@ and pins `PvmBackend::Interpreter`.
 | Phase | Content | Status |
 |---|---|---|
 | P0 | `jamnp-s`, runner skeleton, N0 | ✅ implemented |
-| P1 | `m2-reference` wrapper, N1 authoring, N2 tickets | ✅ implemented |
+| P1 | `m2-reference` (now an oracle client), N1 authoring, N2 tickets | ✅ implemented |
 | P2 | N3 guaranteeing, N4 availability (erasure export) | ⏳ next |
 | P3 | N5 auditing/disputes, N6 preimages | ⏳ |
 | P4 | N7 adversarial, index rotation, IPv6, web UI | ⏳ |

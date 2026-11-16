@@ -284,3 +284,58 @@ Worth establishing before this is called a defect:
    out one slot after a run's own submissions, so the node may still be busy
    with one of those.
 3. Seen once. Reproduce before filing.
+
+## 6. crates.io 0.1.29 is not the pinned 0.1.29, and the difference is on the wire
+
+**Status:** open, and it settles a planned step rather than describing node
+behaviour. Found 2026-11-16, while moving the workspace off its git
+dependencies.
+
+The polkajam split's last step was to stop depending on polkajam by git and
+take `jam-types` and `jam-std-common` from crates.io instead. Both are
+published at **0.1.29**, which is the workspace version at the pinned
+revision `e3d216c2`, so the swap looked like a formality.
+
+They are different code. Unpacking the published crates and diffing them
+against the checkout at the pin:
+
+```
+jam-std-common/src/state.rs
+  #[derive(Clone, Encode, Decode, Debug, Eq, PartialEq, Default)]
+  pub struct ServiceActivityRecord {
+-     pub provided_count: u32,     // the pin
++     pub provided_count: u16,     // crates.io 0.1.29
+-     pub provided_size: u64,
++     pub provided_size: u32,
+-     pub extrinsic_size: u64,
++     pub extrinsic_size: u32,
+```
+
+`ServiceActivityRecord` derives `Encode` and `Decode`, so those three widths
+are a **wire format**, and that struct is in the state the N1 lane diffs. A
+harness built against the published crate and an oracle built against the pin
+would disagree about the bytes of a state value while agreeing about
+everything else -- which is the failure this whole split exists to make
+impossible, reintroduced at the last step.
+
+The two are not simply older and newer, either. The published crate has a
+`ProtocolParameters::large()` the pin does not; the pin has a
+`max_refine_gas * core_count` overflow check and a `bundle_size_constants_match_gp`
+test the published crate does not. They are points on different lines, both
+calling themselves 0.1.29.
+
+**What this means.** The version number is not a safe way to match a
+published crate to a revision, because polkajam publishes 0.1.x from a moving
+trunk and a crates.io version is immutable once published while the trunk is
+not. So:
+
+- `jam-types` and `jam-std-common` stay git dependencies on the pin. The
+  rest of phase 4 -- dropping `jam-node` and `polkajam-fuzz` and the
+  `jam-node` profile override -- stands, and is what the phase was for: the
+  workspace no longer compiles the node.
+- A re-pin must check this again rather than assume the published version
+  caught up. The check is cheap: unpack
+  `~/.cargo/registry/cache/*/jam-types-<v>.crate` and diff its `src` against
+  the checkout under `~/.cargo/git/checkouts/polkajam-*/<short rev>/crates/`.
+- Worth asking upstream whether a published version can be tagged, so a
+  revision and a release can be matched without diffing them.

@@ -16,20 +16,32 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/paritytech/jam-m2-conformance"
 
-# Polkajam reference-engine crates are git dependencies pinned to a commit
-# (DESIGN.md §8). Nothing from polkajam is vendored into this repository.
+# Two polkajam crates, as git dependencies pinned to a commit (DESIGN.md §8).
+# Nothing from polkajam is vendored into this repository.
 #
-# This pin is the single source of the polkajam revision: `scripts/prepare-nut.sh`
-# reads it from here to build the NUT *binary* into the gitignored `third_party/`,
-# so the node under test and the engine that grades it are the same build.
-# Re-pinning is deliberate -- upstream HEAD has broken this workspace three times
-# in four weeks -- so move it at most once per milestone, in a commit of its own
-# that records what changed in the genesis writer and the hazmat exports.
+# `jam-node` is **not** here. The reference engine runs out of process, in
+# `oracle/`, which is outside this workspace and is the only thing that
+# depends on the node crate and its `hazmat` feature -- whose own docs say
+# its interfaces may change at any time. What is left here are the types and
+# the codecs, which the harness needs to read what comes off the wire.
+#
+# Not from crates.io, though both are published at 0.1.29 and the pin's
+# workspace version is 0.1.29 too. They are different code: the published
+# `ServiceActivityRecord` has `provided_count: u16` where the pin has `u32`,
+# and that struct derives `Encode`, so the two disagree about bytes in the
+# state the N1 lane diffs. polkajam publishes 0.1.x from a moving trunk, so a
+# version number does not identify a revision. findings.md §6 has the diff
+# and the check to repeat on a re-pin.
+#
+# This pin is the single source of the polkajam revision for the workspace;
+# `oracle/Cargo.toml` carries the same one and `scripts/prepare-nut.sh` reads
+# it from there to build both binaries, so the node under test and the engine
+# that grades it are the same build. Re-pinning is deliberate -- upstream HEAD
+# has broken this workspace three times in four weeks -- so move it at most
+# once per milestone, in a commit of its own that records what changed.
 [workspace.dependencies]
 jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
 jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
-jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a", features = ["hazmat"] }
-polkajam-fuzz = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
 
 async-trait = "0.1"
 quinn = { version = "0.11", features = ["rustls", "runtime-tokio", "log"] }
@@ -51,20 +63,10 @@ rand = "0.8"
 [profile.release]
 opt-level = 2
 
-# `jam-node`'s build script embeds the `jam-bootstrap-service` blob only when the
-# profile says `debug = false`; otherwise it defers the build to the first call at
-# runtime, which resolves the workspace from the *caller's* working directory. For
-# a test that is its own crate root, so the lookup lands in this workspace, where
-# no such package exists. Building jam-node without debug info keeps the blob
-# baked in and every `RefChain` test runnable.
-[profile.dev.package.jam-node]
-debug = false
-
-# Ring-VRF proving is the harness's one hot path: twenty proofs take 46 s
-# unoptimized, which is 7.7 of an epoch's 12 slots under the tiny parameters.
-# A run that starts more than a slot or two into an epoch then finishes proving
-# after the ticket submission window has closed, and both ticket lanes measure
-# nothing. Optimizing the dependencies -- our own crates keep full debug info --
-# brings it back under a slot.
+# Ring-VRF proving was the harness's one hot path, and it is now the oracle's:
+# `oracle/Cargo.toml` carries this override for itself. What is left in this
+# workspace is signature *verification* and the codecs, which are not free
+# either -- a lane verifies every ticket it was sent -- so the dependencies
+# stay optimized while our own crates keep full debug info.
 [profile.dev.package."*"]
 opt-level = 3
