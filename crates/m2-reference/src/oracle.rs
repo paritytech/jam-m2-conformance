@@ -88,7 +88,7 @@ impl Oracle {
         let binary = oracle_binary()?;
         std::fs::create_dir_all(dir)
             .map_err(|e| ChainError::Oracle(format!("creating {}: {e}", dir.display())))?;
-        let socket = dir.join(format!("oracle-{}.sock", std::process::id()));
+        let socket = socket_path(dir);
         let _ = std::fs::remove_file(&socket);
 
         // The oracle exits when this pipe closes, which is the only thing
@@ -318,6 +318,27 @@ impl Drop for Oracle {
             let _ = std::fs::remove_file(&self.socket);
         }
     }
+}
+
+/// Longest unix socket path this will try to bind.
+///
+/// `sun_path` is 108 bytes on Linux and the kernel refuses anything that
+/// does not fit, nul included. The margin is for the rest of the name.
+const MAX_SOCKET_PATH: usize = 100;
+
+/// Where to put the socket for a session directory.
+///
+/// Beside the run's other artefacts, which is where someone looking for it
+/// would look -- unless that path is too long to bind, in which case the
+/// temp directory, because a run that cannot start is worse than a socket
+/// in an unexpected place. Session directories are caller-supplied and can
+/// be arbitrarily deep; this one failed under a scratchpad path.
+fn socket_path(dir: &Path) -> PathBuf {
+    let preferred = dir.join(format!("oracle-{}.sock", std::process::id()));
+    if preferred.as_os_str().len() <= MAX_SOCKET_PATH {
+        return preferred;
+    }
+    std::env::temp_dir().join(format!("m2-oracle-{}.sock", std::process::id()))
 }
 
 /// Where the oracle binary is.
