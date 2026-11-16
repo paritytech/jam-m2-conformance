@@ -311,35 +311,49 @@ mod tests {
         })
     }
 
-    /// The oracle grades the node under test, so both must be built from the
-    /// same polkajam revision unless a run deliberately compares revisions.
-    /// The workspace manifest holds the pin and `scripts/prepare-nut.sh` reads
-    /// it from there; the copy the script used to carry drifted three
-    /// revisions behind before anyone noticed, because nothing compared them.
-    #[test]
-    fn the_nut_binary_is_built_from_the_pinned_revision() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
-
-        let revs: Vec<&str> = manifest
+    /// Every polkajam revision named anywhere in the tree.
+    fn pinned_revisions(manifest: &str) -> Vec<&str> {
+        manifest
             .lines()
             .filter(|l| l.contains("polkajam.git"))
             .filter_map(|l| l.split("rev = \"").nth(1))
             .filter_map(|r| r.split('"').next())
-            .collect();
+            .collect()
+    }
+
+    /// The oracle grades the node under test, so both must be built from the
+    /// same polkajam revision unless a run deliberately compares revisions.
+    /// `scripts/prepare-nut.sh` reads the pin out of a manifest rather than
+    /// carrying its own; the copy it used to carry drifted three revisions
+    /// behind before anyone noticed, because nothing compared them.
+    ///
+    /// Two manifests pin polkajam now -- the workspace's and the oracle's --
+    /// and they have to name the same revision, or the reference is built
+    /// from one engine and the oracle from another. The workspace's is on
+    /// its way out; the oracle's is not, which is why the script reads that
+    /// one. This checks whichever are present.
+    #[test]
+    fn the_nut_binary_is_built_from_the_pinned_revision() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let oracle = std::fs::read_to_string(root.join("oracle/Cargo.toml")).unwrap();
+
+        let mut revs = pinned_revisions(&manifest);
+        let oracle_revs = pinned_revisions(&oracle);
         assert!(
-            !revs.is_empty(),
-            "the workspace must pin polkajam by revision, not by branch"
+            !oracle_revs.is_empty(),
+            "the oracle must pin polkajam by revision, not by branch"
         );
+        revs.extend(oracle_revs);
         assert!(
             revs.windows(2).all(|w| w[0] == w[1]),
-            "every polkajam dependency must name one revision; got {revs:?}"
+            "every polkajam dependency in the tree must name one revision; got {revs:?}"
         );
 
         let script = std::fs::read_to_string(root.join("scripts/prepare-nut.sh")).unwrap();
         assert!(
-            script.contains("Cargo.toml"),
-            "prepare-nut.sh must read the revision out of the manifest"
+            script.contains("oracle/Cargo.toml"),
+            "prepare-nut.sh must read the revision out of the oracle's manifest"
         );
         let copies: Vec<&str> = script
             .lines()

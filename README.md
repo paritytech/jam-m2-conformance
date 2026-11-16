@@ -40,8 +40,8 @@ cargo test --workspace
 cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/m2-dry
 
 # Real surface against the polkajam NUT:
-# (binary built from third_party/polkajam by scripts/prepare-nut.sh)
-PATH="$PWD/third_party/polkajam/target/release:$PATH" \
+# (the NUT and the oracle, both built by scripts/prepare-nut.sh)
+PATH="$PWD/third_party/bin:$PATH" \
 cargo run -p m2-runner -- --seed 1 --validator-index 5 --base-port 40000 \
   --preset polkajam --session-dir sessions/p0 --startup-timeout 60 --observe-secs 90
 ```
@@ -154,13 +154,16 @@ Polkajam's library crates (`jam-types`, `jam-std-common`, `jam-node` with
 pinned to a commit in the root `Cargo.toml` (DESIGN.md §8). Nothing from
 polkajam is vendored into this repository.
 
-That pin is the **single source** of the polkajam revision. `prepare-nut.sh`
-reads it from the manifest to build the `polkajam` **binary** used as the node
-under test, so the node and the engine that grades it are the same build:
+The reference oracle (`oracle/`) is **outside the workspace** and pins the
+same revision in its own `oracle/Cargo.toml`. `prepare-nut.sh` reads the pin
+from there -- the oracle's manifest is the one that will still name polkajam
+once the workspace no longer does -- and refuses to build if the two
+manifests disagree. It produces both binaries, from one revision, so the node
+under test and the engine that grades it are the same build:
 
 ```sh
-./scripts/prepare-nut.sh
-export PATH="$PWD/third_party/polkajam/target/release:$PATH"
+./scripts/prepare-nut.sh        # third_party/bin/{polkajam,m2-oracle}
+export PATH="$PWD/third_party/bin:$PATH"
 ```
 
 `third_party/` is gitignored. The harness's own networking (`jamnp-s`) is an

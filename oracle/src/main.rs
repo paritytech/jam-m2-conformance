@@ -35,9 +35,18 @@ pub fn wall_clock_slot() -> u32 {
 
 fn main() {
     let path = match std::env::args().nth(1) {
+        // The revision this binary was built from, on stdout and nothing
+        // else, so a build script can compare it with the pin. Checking it
+        // there costs a process start; discovering a mismatch from a
+        // handshake costs whatever the run had done by then.
+        Some(flag) if flag == "--revision" => {
+            println!("{}", handle::POLKAJAM_REVISION);
+            return;
+        }
         Some(path) => path,
         None => {
             eprintln!("usage: m2-oracle <socket-path>");
+            eprintln!("       m2-oracle --revision");
             std::process::exit(2);
         }
     };
