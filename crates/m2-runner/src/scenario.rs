@@ -497,6 +497,7 @@ pub(crate) fn fabricated_run_ctx(
     let fab_co_guarantors = vec![n0::PEER_1, n0::PEER_1 + 1];
     const FAB_REPORT_HASH: [u8; 32] = [0x77; 32];
     const FAB_INCLUDED_HASH: [u8; 32] = [0x88; 32];
+    const FAB_SHARED_HASH: [u8; 32] = [0x6b; 32];
     let n3 = N3Ctx {
         nut_index: FAB_NUT_INDEX,
         submissions: vec![m2_scenario::scenarios::n3::SubmittedPackage {
@@ -507,6 +508,7 @@ pub(crate) fn fabricated_run_ctx(
             sent_at_wall_ms: submitted_at,
             refused: false,
             reset_code: None,
+            fault: None,
             co_guarantors: fab_co_guarantors.clone(),
         }],
         shares: fab_co_guarantors
@@ -541,6 +543,19 @@ pub(crate) fn fabricated_run_ctx(
         emulated_peers: fab_co_guarantors.clone(),
         // A reference-guaranteed report distributed before the node's block,
         // and carried in it.
+        // A bundle shared to the node, answered with the reference's hash.
+        shared_to_nut: vec![m2_scenario::scenarios::n3::SharedToNut {
+            peer: n0::PEER_1,
+            core: 0,
+            slot: fab_block_slot,
+            shard_count: 6,
+            expected_report_hash: FAB_SHARED_HASH,
+            reply: Some((FAB_SHARED_HASH, [0u8; 64])),
+            refused: false,
+            reset_code: None,
+            fault: None,
+            sent_at_wall_ms: submitted_at,
+        }],
         distributed: vec![m2_scenario::scenarios::n3::DistributedReport {
             peer: n0::PEER_1,
             core: 1,

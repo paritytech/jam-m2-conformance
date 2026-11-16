@@ -59,6 +59,10 @@ pub struct ScheduledSubmission {
     pub package_hash: [u8; 32],
     /// Extrinsic bodies, in the order the package declares them.
     pub extrinsics: Vec<Vec<u8>>,
+    /// What is deliberately wrong with this submission, carried through so
+    /// the sender can apply the wire-level faults and the lane can say which
+    /// rule it posed.
+    pub fault: Option<SubmissionFault>,
     /// The validators that hold `core` at `slot` alongside the NUT.
     ///
     /// Computed here, off the engine's assignment, because it is the set the
@@ -120,6 +124,12 @@ pub fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
     )
 }
 
+/// Payload that carries a package past the CE 133 initial-message cap.
+///
+/// The cap is `2 + 200 * 1024` on the whole message; a payload this size
+/// clears it without relying on the rest of the package's overhead.
+const OVERSIZED_PAYLOAD: usize = 2 + 200 * 1024;
+
 /// When and where to submit, with no package attached.
 ///
 /// The package is built a few slots before the slot, not when the run is
@@ -135,6 +145,128 @@ pub struct SubmissionSchedule {
     pub core: u16,
     /// Validators holding `core` at `slot` besides the NUT.
     pub co_guarantors: Vec<u16>,
+    /// What is deliberately wrong with this submission, if anything.
+    pub fault: Option<SubmissionFault>,
+}
+
+/// A deliberate defect in a CE 133 submission (DESIGN §11 N3).
+///
+/// Each names one rule and nothing else. A submission that broke two would
+/// prove neither: a node refusing it could be refusing the other one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionFault {
+    /// Message 1 over `2 + 200 * 1024` bytes (`simple.md:362-364`).
+    ///
+    /// Oversized by payload rather than by padding. A padded package stops
+    /// decoding, and a node that refuses one has refused a malformed
+    /// message, not an oversized one -- which is a different rule.
+    Oversized,
+    /// Addressed to a core the NUT does not hold at the slot.
+    NotAGuarantor,
+    /// Built against an authorizer no core will accept.
+    Unauthorized,
+    /// Message 2 is not the sum of the declared extrinsic lengths.
+    ///
+    /// Applied on the wire, not here: the package is well-formed and only
+    /// the bytes that follow it are wrong.
+    ExtrinsicSizeMismatch,
+}
+
+impl SubmissionFault {
+    /// Whether the node is expected to reset the stream rather than accept.
+    ///
+    /// DESIGN §11 N3 asks for a reset on the oversized message and the
+    /// extrinsic mismatch, and for silence on the other two: a package for a
+    /// core the node does not hold is ignored, and an unauthorized one is
+    /// accepted onto the stream and then not shared. So "refused" is the
+    /// wrong question for half of these, and the lane asks a different one
+    /// of each.
+    pub fn expects_reset(&self) -> bool {
+        matches!(self, Self::Oversized | Self::ExtrinsicSizeMismatch)
+    }
+
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Oversized => "a first message over the CE 133 size cap",
+            Self::NotAGuarantor => "a core the NUT does not hold",
+            Self::Unauthorized => "an authorizer no core accepts",
+            Self::ExtrinsicSizeMismatch => "an extrinsic message of the wrong size",
+        }
+    }
+}
+
+/// A CE 134 share the harness opens *to* the NUT, so the node does the
+/// refining and the lane grades its answer (`simple.md:406-458`).
+///
+/// The other direction from the CE 134 the node opens after a CE 133. Here
+/// the harness is the sharing guarantor and the node is the receiving one,
+/// which is the only N3 row where the node's own refinement is the thing
+/// measured.
+#[derive(Debug, Clone)]
+pub struct ScheduledShare {
+    pub slot: u32,
+    pub core: u16,
+    pub shard_count: u16,
+    pub mappings: Vec<(jam_types::WorkPackageHash, [u8; 32])>,
+    /// The work-package bundle, message 2.
+    pub bundle: Vec<u8>,
+    /// What the reference refined from the same bundle, which the node's
+    /// answer must equal.
+    pub expected_report_hash: [u8; 32],
+    pub fault: Option<ShareFault>,
+}
+
+/// A deliberate defect in a CE 134 share (DESIGN §11 N3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareFault {
+    /// A shard count that is not the active validator count.
+    ///
+    /// `simple.md:432-436`: acceptable means matching the validators active
+    /// at a slot the report could be included in. With a static set that is
+    /// one number, so anything else is rejectable.
+    WrongShardCount,
+}
+
+impl RefChain {
+    /// Build a share to send the NUT at `slot`, on a core it holds.
+    ///
+    /// The package carries a payload of its own so it cannot collide with
+    /// the one the submission path builds: two identical packages in one run
+    /// are one package, and the node refuses whichever arrives second.
+    pub fn share_to_nut(
+        &self,
+        nut: u16,
+        slot: u32,
+        fault: Option<ShareFault>,
+    ) -> Result<Option<ScheduledShare>, ChainError> {
+        let Some(core) = self.core_for_in_epoch(nut, slot) else {
+            return Ok(None);
+        };
+        let work = self.guarantee_work(
+            vec![work_item_with_payload(b"n3-shared-to-nut".to_vec())],
+            core,
+        )?;
+        let validators = jam_types::max_val_count();
+        let shard_count = match fault {
+            // One below the active count: acceptable is exactly the active
+            // count, so this is rejectable without being absurd.
+            Some(ShareFault::WrongShardCount) => validators.saturating_sub(1),
+            None => validators,
+        };
+        Ok(Some(ScheduledShare {
+            slot,
+            core,
+            shard_count,
+            // No imported segments, so no mappings. The spec lets a
+            // guarantor either refuse or trust unverifiable mappings
+            // (`simple.md:443-445`), so a bad-mapping row could not fail
+            // either way and the lane does not pose one.
+            mappings: Vec::new(),
+            bundle: work.bundle,
+            expected_report_hash: work.report.hash().0,
+            fault,
+        }))
+    }
 }
 
 /// A guaranteed work-report the harness distributes over CE 135, so the node
@@ -262,7 +394,38 @@ impl RefChain {
         &self,
         schedule: &SubmissionSchedule,
     ) -> Result<(ScheduledSubmission, SharingAnswer), ChainError> {
-        let work = self.guarantee_work(vec![trivial_work_item()], schedule.core)?;
+        let items = match schedule.fault {
+            // Big enough to clear the cap on its own, with the package's own
+            // overhead on top.
+            Some(SubmissionFault::Oversized) => {
+                vec![work_item_with_payload(vec![0x5a; OVERSIZED_PAYLOAD])]
+            }
+            _ => vec![trivial_work_item()],
+        };
+        let work = match schedule.fault {
+            Some(SubmissionFault::Unauthorized) => {
+                let built = self.build_unauthorized_package(items);
+                // An unauthorized package is never refined: the node is
+                // expected to take the submission and then not share it, so
+                // the harness needs the package and no report at all.
+                return Ok((
+                    ScheduledSubmission {
+                        slot: schedule.slot,
+                        core: schedule.core,
+                        package: jam_types::Encode::encode(&built.package),
+                        package_hash: package_hash(&built.package).0,
+                        extrinsics: built.extrinsics,
+                        fault: schedule.fault,
+                        co_guarantors: schedule.co_guarantors.clone(),
+                    },
+                    SharingAnswer {
+                        report_hash: [0u8; 32],
+                        signatures: Vec::new(),
+                    },
+                ));
+            }
+            _ => self.guarantee_work(items, schedule.core)?,
+        };
         let answer = work.sharing_answer_for(&schedule.co_guarantors);
         Ok((
             ScheduledSubmission {
@@ -271,6 +434,7 @@ impl RefChain {
                 package: jam_types::Encode::encode(&work.package),
                 package_hash: package_hash(&work.package).0,
                 extrinsics: work.extrinsics,
+                fault: schedule.fault,
                 co_guarantors: schedule.co_guarantors.clone(),
             },
             answer,

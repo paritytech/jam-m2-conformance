@@ -48,6 +48,8 @@ pub(crate) struct RealRunData {
     pub(crate) sharing_answer: Arc<Mutex<Option<m2_reference::reports::SharingAnswer>>>,
     /// Reports the emulator distributed to the NUT, for the inclusion rows.
     pub(crate) distributed: Arc<Mutex<Vec<DistributedReport>>>,
+    /// CE 134 shares the emulator opened to the NUT, with its answers.
+    pub(crate) shared_to_nut: Arc<Mutex<Vec<m2_scenario::scenarios::n3::SharedToNut>>>,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
@@ -206,6 +208,7 @@ pub(crate) fn build_real_run_ctx(
             .map(|answer| answer.report_hash),
         emulated_peers: data.emu_indices.iter().map(|i| *i as u16).collect(),
         distributed: lock(&data.distributed).clone(),
+        shared_to_nut: lock(&data.shared_to_nut).clone(),
         // Report hashes the node put on chain, with the slot of the block
         // that carried them. Read off the blocks it announced: a report it
         // included is one it actually authored into a block, not one it

@@ -14,16 +14,18 @@ use jamnp_s::{
     codec::ce131_136::{
         GuaranteedWorkReport, SharingBundle, SharingContext, SharingReply, WorkPackageSubmission,
     },
-    framing::{frame, frame_message, CE133, CE135},
+    framing::{frame, frame_message, CE133, CE134, CE135},
     trace::{wall_ts, Direction as TraceDir, Trace},
     transport::{Conn, ReadError, SendHalf},
 };
-use m2_reference::reports::{ScheduledSubmission, SharingAnswer};
+use m2_reference::reports::{ScheduledSubmission, SharingAnswer, SubmissionFault};
 use m2_scenario::dsl::{ObsKind, ObsLog};
-use m2_scenario::scenarios::n3::{DistributedReport, ReportSeen, SharingSeen, SubmittedPackage};
+use m2_scenario::scenarios::n3::{
+    DistributedReport, ReportSeen, SharedToNut, SharingSeen, SubmittedPackage,
+};
 use m2_scenario::scenarios::obs::{
-    EMU_ANSWERED_134, EMU_SENT_133, EMU_SENT_135, NUT_SENT_BAD_REPORT, NUT_SENT_BAD_SHARING,
-    PACKAGE_REFUSED,
+    EMU_ANSWERED_134, EMU_SENT_133, EMU_SENT_134, EMU_SENT_135, NUT_ANSWERED_134,
+    NUT_SENT_BAD_REPORT, NUT_SENT_BAD_SHARING, PACKAGE_REFUSED,
 };
 
 use crate::emu::{record, slot_start_ms, StreamReader};
@@ -179,7 +181,15 @@ pub async fn spawn_package_sender(
     };
 
     let first = frame(CE133, &submission.encode_initial());
-    let second = frame_message(&submission.encode_extrinsics());
+    // The extrinsic-mismatch fault lives here and nowhere else: the package
+    // is well-formed and only the bytes that follow it are wrong. One byte
+    // too many makes the message size differ from the sum of the lengths the
+    // package declares, which is the rule `simple.md:373` states.
+    let mut bodies = submission.encode_extrinsics();
+    if plan.fault == Some(SubmissionFault::ExtrinsicSizeMismatch) {
+        bodies.push(0xff);
+    }
+    let second = frame_message(&bodies);
     crate::emu::trace_record(peer, CE133, send.id(), &first, &trace, TraceDir::Rx);
     crate::emu::trace_record(peer, CE133, send.id(), &second, &trace, TraceDir::Rx);
     record(&obs, peer, ObsKind::Other(EMU_SENT_133));
@@ -198,6 +208,7 @@ pub async fn spawn_package_sender(
             // Not known until the node answers, below.
             refused: false,
             reset_code: None,
+            fault: lane_fault(plan.fault),
             co_guarantors: plan.co_guarantors.clone(),
         });
         recorded.len() - 1
@@ -286,6 +297,120 @@ pub async fn spawn_report_sender(
         sent_at_wall_ms: wall_ts(),
     });
     send.finish();
+}
+
+/// Open a CE 134 share to the NUT and read the answer it gives
+/// (`simple.md:406-458`).
+///
+/// The harness is the sharing guarantor here. Two messages then FIN, and the
+/// node answers with the hash of the report it refined and a signature over
+/// it -- or resets, which is its way of refusing to refine at all.
+pub async fn spawn_share_sender(
+    connection: Conn,
+    plan: m2_reference::reports::ScheduledShare,
+    trace: Arc<Mutex<Trace>>,
+    obs: Arc<Mutex<ObsLog>>,
+    shared_to_nut: Arc<Mutex<Vec<SharedToNut>>>,
+    peer: u16,
+) {
+    sleep_until_slot(plan.slot).await;
+
+    let Ok((mut send, mut recv)) = connection.open_bi().await else {
+        return;
+    };
+    let context = SharingContext {
+        core_index: plan.core,
+        shard_count: plan.shard_count,
+        mappings: plan.mappings.clone(),
+    };
+    let first = frame(CE134, &context.encode());
+    let second = frame_message(
+        &SharingBundle {
+            bundle: plan.bundle.clone(),
+        }
+        .encode(),
+    );
+    crate::emu::trace_record(peer, CE134, send.id(), &first, &trace, TraceDir::Rx);
+    record(&obs, peer, ObsKind::Other(EMU_SENT_134));
+    if send.write_all(&first).await.is_err() || send.write_all(&second).await.is_err() {
+        return;
+    }
+    send.finish();
+
+    // The answer, or a reset. Both are the node's verdict; a connection that
+    // died for its own reasons is neither, so it is recorded as no reply
+    // rather than as a refusal.
+    // We opened the stream, so the answer is a bare message under CE 134.
+    let mut reader = jamnp_s::framing::FrameReader::with_kind(CE134);
+    let mut buf = [0u8; 4096];
+    let mut reply = None;
+    let mut refused = false;
+    let mut reset_code = None;
+    loop {
+        if let Ok(Some((_, content))) = reader.next_frame() {
+            if let Ok(answer) = SharingReply::decode(&mut &content[..]) {
+                reply = Some((answer.report_hash.0, answer.signature));
+                record(&obs, peer, ObsKind::Other(NUT_ANSWERED_134));
+            } else {
+                record(&obs, peer, ObsKind::Other(NUT_SENT_BAD_SHARING));
+            }
+            break;
+        }
+        match recv.read(&mut buf).await {
+            Ok(Some(n)) => reader.push(&buf[..n]),
+            // A clean end with no answer: the node neither refused nor
+            // refined, which the lane reports as its own thing.
+            Ok(None) => break,
+            // Only a reset is a refusal. A connection that died for its own
+            // reasons is not the node's verdict on the bundle.
+            Err(ReadError::Reset(code)) => {
+                refused = true;
+                reset_code = Some(code);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    crate::emu::lock(&shared_to_nut).push(SharedToNut {
+        peer,
+        core: plan.core,
+        slot: plan.slot,
+        shard_count: plan.shard_count,
+        expected_report_hash: plan.expected_report_hash,
+        reply,
+        refused,
+        reset_code,
+        fault: lane_share_fault(plan.fault),
+        sent_at_wall_ms: wall_ts(),
+    });
+}
+
+/// Map the reference's share fault onto the lane's copy.
+fn lane_share_fault(
+    fault: Option<m2_reference::reports::ShareFault>,
+) -> Option<m2_scenario::scenarios::n3::ShareFault> {
+    use m2_scenario::scenarios::n3::ShareFault as Lane;
+    fault.map(|f| match f {
+        m2_reference::reports::ShareFault::WrongShardCount => Lane::WrongShardCount,
+    })
+}
+
+/// Map the reference's fault onto the lane's own copy.
+///
+/// Two enums rather than a shared one, as the ticket faults already do: the
+/// reference knows how to pose a fault and the lane describes what was
+/// posed, and neither crate depends on the other.
+fn lane_fault(
+    fault: Option<SubmissionFault>,
+) -> Option<m2_scenario::scenarios::n3::SubmissionFault> {
+    use m2_scenario::scenarios::n3::SubmissionFault as Lane;
+    fault.map(|f| match f {
+        SubmissionFault::Oversized => Lane::Oversized,
+        SubmissionFault::NotAGuarantor => Lane::NotAGuarantor,
+        SubmissionFault::Unauthorized => Lane::Unauthorized,
+        SubmissionFault::ExtrinsicSizeMismatch => Lane::ExtrinsicSizeMismatch,
+    })
 }
 
 /// Slots before its distribution at which the report is composed.

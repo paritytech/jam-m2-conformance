@@ -326,6 +326,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             }
             match plan_package_for_this_run(&ref_chain, nut_index) {
                 Ok(plan) => {
+                    // The honest submission leads the plan; the report is
+                    // distributed in its slot.
+                    let honest_slot = plan.first().map(|p| p.slot).unwrap_or_default();
                     // The report to be included rides the same slot plan: it
                     // is guaranteed on a core the NUT does not hold, so the
                     // two never collide.
@@ -336,7 +339,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         // second as a duplicate.
                         vec![work_item_with_payload(b"n3-distributed".to_vec())],
                         nut_index as u16,
-                        plan.slot,
+                        honest_slot,
                     ) {
                         Ok(Some(report)) => {
                             eprintln!(
@@ -350,11 +353,31 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         Ok(None) => eprintln!(
                             "[assignment] no report to distribute: the NUT holds no core at \
                              slot {} in the epoch view, or there is only one core",
-                            plan.slot
+                            honest_slot
                         ),
                         Err(e) => conn_findings.push(no_package_plan_finding(&e)),
                     }
                     phase("plan_package.report_to_distribute", t_dist);
+                    // The harness also shares a bundle *to* the node, so
+                    // the node does the refining for once. A rotation after
+                    // the last submission, so the two never contend.
+                    let share_base = honest_slot + SUBMISSION_SPACING_SLOTS * 6;
+                    let mut shares = Vec::new();
+                    for (i, fault) in [
+                        None,
+                        Some(m2_reference::reports::ShareFault::WrongShardCount),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let slot = share_base + SUBMISSION_SPACING_SLOTS * i as u32;
+                        match ref_chain.share_to_nut(nut_index as u16, slot, fault) {
+                            Ok(Some(share)) => shares.push(share),
+                            Ok(None) => {}
+                            Err(e) => conn_findings.push(no_package_plan_finding(&e)),
+                        }
+                    }
+                    emu.set_share_plan(shares);
                     emu.set_submission_plan(plan);
                     // CE 133 is builder -> guarantor, so it goes out over a
                     // builder connection of its own rather than riding an
@@ -379,6 +402,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         let submissions = emu.submissions();
         let sharing_answer = emu.sharing_answer();
         let distributed = emu.distributed();
+        let shared_to_nut = emu.shared_to_nut();
         let sharing_seen = emu.sharing_seen();
         let reports_seen = emu.reports_seen();
         let ce128_probes = emu.ce128_probes();
@@ -398,6 +422,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             reports_seen,
             sharing_answer,
             distributed,
+            shared_to_nut,
         };
         (
             ObsSource::Emulator {
@@ -747,7 +772,7 @@ const SUBMISSION_MARGIN_SLOTS: u32 = 2;
 fn plan_package_for_this_run(
     ref_chain: &RefChain,
     nut_index: usize,
-) -> Result<m2_reference::reports::SubmissionSchedule, m2_reference::chain::ChainError> {
+) -> Result<Vec<m2_reference::reports::SubmissionSchedule>, m2_reference::chain::ChainError> {
     // Into the *next* epoch, not the next slot.
     //
     // The two core assignments read different entries of the entropy buffer.
@@ -838,11 +863,60 @@ fn plan_package_for_this_run(
             ref_chain.guarantors_for_in_epoch(core, plan.slot),
         );
     }
-    Ok(m2_reference::reports::SubmissionSchedule {
+    // The honest submission first, then one per fault, a slot apart. A fault
+    // sharing a slot with the honest submission would be graded against a
+    // node already busy with it; a slot is six seconds, which is far more
+    // than the node needs, since it opens CE 134 within milliseconds.
+    use m2_reference::reports::SubmissionFault::*;
+    let mut plans = vec![m2_reference::reports::SubmissionSchedule {
         slot: plan.slot,
         core: plan.core,
-        co_guarantors: plan.co_guarantors,
-    })
+        co_guarantors: plan.co_guarantors.clone(),
+        fault: None,
+    }];
+    for (i, fault) in [
+        Oversized,
+        Unauthorized,
+        ExtrinsicSizeMismatch,
+        NotAGuarantor,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let slot = plan.slot + SUBMISSION_SPACING_SLOTS * (i as u32 + 1);
+        // Each fault needs the assignment at *its own* slot: the rotation
+        // can turn between two of them, and a package aimed at the core the
+        // NUT held before is the not-a-guarantor fault by accident.
+        let Some(core) = ref_chain.core_for_in_epoch(nut_index as u16, slot) else {
+            // Past the epoch the view can resolve. Said out loud: this used
+            // to drop submissions silently, and the rows then reported
+            // themselves unexercised with no way to tell that from a node
+            // that was never asked.
+            eprintln!(
+                "[assignment] dropping the {fault:?} submission: slot {slot} is past the \
+                 epoch the view resolves"
+            );
+            continue;
+        };
+        let addressed = if fault == NotAGuarantor {
+            // Deliberately the core it does *not* hold.
+            (core + 1) % jam_types::core_count()
+        } else {
+            core
+        };
+        plans.push(m2_reference::reports::SubmissionSchedule {
+            slot,
+            core: addressed,
+            co_guarantors: ref_chain
+                .guarantors_for_in_epoch(addressed, slot)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| *v != nut_index as u16)
+                .collect(),
+            fault: Some(fault),
+        });
+    }
+    Ok(plans)
 }
 
 /// A work item with a distinguishing payload, so two packages built in one
@@ -929,10 +1003,28 @@ async fn submit_as_builder(
     genesis_hash: [u8; 32],
     shared: m2_emu::emu::EmuShared,
 ) {
-    let Some(schedule) = shared.take_submission_plan() else {
+    let plan = shared.take_submission_plan();
+    if plan.is_empty() {
         eprintln!("[builder] no submission plan to claim");
         return;
-    };
+    }
+    for schedule in plan {
+        submit_one(addr, &expected_san, genesis_hash, &shared, schedule).await;
+    }
+}
+
+/// Submit one scheduled package, honest or faulty.
+///
+/// A connection of its own per submission. They are a rotation apart, which
+/// is far longer than QUIC holds an idle one open, and a builder that
+/// submits twice on one connection would be relying on it surviving the gap.
+async fn submit_one(
+    addr: SocketAddr,
+    expected_san: &str,
+    genesis_hash: [u8; 32],
+    shared: &m2_emu::emu::EmuShared,
+    schedule: m2_reference::reports::SubmissionSchedule,
+) {
     sleep_until_slot(schedule.slot.saturating_sub(PACKAGE_BUILD_LEAD_SLOTS)).await;
     let (plan, answer) = match shared.ref_chain.submission_now(&schedule) {
         Ok(built) => built,
@@ -941,12 +1033,17 @@ async fn submit_as_builder(
             return;
         }
     };
-    // In place before the node can share, which it does within milliseconds
-    // of accepting.
-    *shared
-        .sharing_answer
-        .lock()
-        .expect("the sharing answer lock is never poisoned") = Some(answer);
+    // Only the honest submission's answer. Set for every submission, each
+    // overwrote the last, so the hash the lane compared the node's report
+    // against was whichever fault happened to be built last -- and the
+    // harness was offering a co-guarantor signature for packages it had
+    // deliberately broken.
+    if schedule.fault.is_none() {
+        *shared
+            .sharing_answer
+            .lock()
+            .expect("the sharing answer lock is never poisoned") = Some(answer);
+    }
     eprintln!(
         "[builder] built for slot {} against head {}",
         schedule.slot,
@@ -965,7 +1062,7 @@ async fn submit_as_builder(
                 builder: true,
             },
             ed25519_consensus::SigningKey::from(seed),
-            expected_san,
+            expected_san.to_string(),
             addr,
         )
         .await;
@@ -1001,6 +1098,18 @@ async fn sleep_until_slot(slot: u32) {
             .await;
     }
 }
+
+/// Slots between one scheduled CE 133 submission or CE 134 share and the
+/// next.
+///
+/// Everything the lane schedules has to fit inside one epoch: it aims at the
+/// start of `cached + 1`, and the epoch view resolves only that epoch, so a
+/// slot past its end has no assignment to plan against and is dropped
+/// silently. A rotation apart put the fourth submission at +12 of a
+/// twelve-slot epoch, and two faults and both shares fell off the end --
+/// they never went out and their rows reported themselves unexercised with
+/// nothing to say why.
+const SUBMISSION_SPACING_SLOTS: u32 = 1;
 
 /// Slots to let an epoch settle before submitting into it.
 ///

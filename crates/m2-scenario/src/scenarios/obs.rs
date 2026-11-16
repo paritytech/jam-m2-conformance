@@ -19,6 +19,8 @@
 //! | 53 | NUT refused a CE 133 submission: it reset the stream |
 //! | 54 | emulator answered a CE 134 share with a hash and signature |
 //! | 55 | emulator distributed a guaranteed work-report over CE 135 |
+//! | 56 | emulator opened a CE 134 share to the NUT |
+//! | 57 | NUT answered a CE 134 share with a hash and signature |
 //!
 //! Code 44 is retired. It meant two unrelated things -- the NUT refusing a
 //! ticket, and the NUT sending a frame the harness could not decode -- and
@@ -85,3 +87,11 @@ pub const EMU_ANSWERED_134: u8 = 54;
 
 /// The emulator distributed a reference-guaranteed work-report over CE 135.
 pub const EMU_SENT_135: u8 = 55;
+
+/// The emulator opened a CE 134 share to the NUT, as a sharing guarantor.
+pub const EMU_SENT_134: u8 = 56;
+/// The NUT answered a CE 134 share (`simple.md:456`).
+///
+/// Its absence, where the stream was not reset either, is a node that took
+/// the bundle and said nothing -- neither refusing nor refining.
+pub const NUT_ANSWERED_134: u8 = 57;
