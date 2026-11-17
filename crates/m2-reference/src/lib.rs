@@ -20,6 +20,7 @@
 //! it (`hazmat::erasure`, `hazmat::availability`).
 #![deny(unsafe_code)]
 
+pub mod assurance;
 pub mod chain;
 pub mod import;
 pub mod oracle;
