@@ -104,6 +104,7 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             // of the chain. Encoding the hash instead produces 32 bytes that
             // fail to decode as a header, which is a confusing way to find
             // this out.
+            advance_finality(s);
             match s.harness.chain().block(&hash) {
                 Ok(Some(block)) => Message::Authored(Some(block.encode())),
                 Ok(None) => {
@@ -194,13 +195,19 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             // but does mean the chain knows the parent in the case where it
             // has just learned it.
             let parent_root = chain.state_root(&parent).ok().flatten().map(|r| r.0);
+            let root = chain.state_root(&hash).ok().flatten().map(|r| r.0);
+            // Only when the head actually moved: a refused block leaves the
+            // chain where it was and there is nothing new to finalize.
+            if outcome.is_ok() {
+                advance_finality(s);
+            }
             match outcome {
                 // A block the chain already had imports as `Ok`, which is
                 // what the lane wants: it asked whether the block is
                 // acceptable, not whether it was new.
                 Ok(_) => Message::Imported {
                     ok: true,
-                    root: chain.state_root(&hash).ok().flatten().map(|r| r.0),
+                    root,
                     parent_root,
                     error: None,
                 },
@@ -521,6 +528,60 @@ fn sign_for(
 }
 
 /// Turn a wire item back into the engine's own.
+/// Advance finality just far enough to keep the cached epoch view on the
+/// head's epoch.
+///
+/// Without this a session never finalizes anything past genesis, because
+/// `AuthoringHarness` builds a `JamChain` and nothing else: the worker that
+/// drives finality (`finality::dummy_run`) belongs to the node. And
+/// `current_and_next_epochs` is only ever written in the finalization path,
+/// so the cached epoch view froze at genesis and stayed there for a whole
+/// run while the head walked away from it. Every lane asking which
+/// validators hold a core then got an answer computed from genesis entropy,
+/// or no answer at all once the head was more than one epoch out -- which is
+/// what left the N3 lane reporting every row unexercised. See findings.md §1.
+///
+/// **Not** `dummy_run`'s rule of one slot behind the head. The harness is
+/// asked to import blocks a node announced late, and a block older than the
+/// finalized head cannot be imported at all; at a one-slot lag a block two
+/// slots late is already refused, which turns a node's late announcement
+/// into a harness-side failure on a row about whether the block is
+/// well-formed. So this finalizes the *earliest* block still in the head's
+/// epoch, which is the least that moves the epoch index, and leaves the rest
+/// of the epoch open to import.
+fn advance_finality(session: &mut crate::session::Session) {
+    let chain = session.harness.chain();
+    let (best_hash, current_slot) = chain.best_block();
+    let epoch_start = (current_slot / jam_types::epoch_period()) * jam_types::epoch_period();
+    let (_, finalized_slot) = chain.finalized_block();
+    if finalized_slot >= epoch_start {
+        // The view already names the head's epoch; finalizing more would
+        // only cost import headroom.
+        return;
+    }
+    // Walk back to the oldest block of this epoch that is not the head.
+    // Keeping the head unfinalized matters just after a boundary, when it is
+    // the only block of its epoch: finalizing it would leave no headroom at
+    // all, and the view naming the previous epoch for a slot or two is what
+    // a node's own view does.
+    let mut parent = best_hash;
+    let mut earliest = None;
+    while let Ok(Some(header)) = chain.header(&parent) {
+        if header.slot < epoch_start || header.slot <= finalized_slot {
+            break;
+        }
+        if header.hash() != best_hash {
+            earliest = Some(header.hash());
+        }
+        parent = header.parent;
+    }
+    if let Some(hash) = earliest {
+        // A failure is not fatal: the head stays unfinalized and the next
+        // call tries again from further along.
+        let _ = chain.finalize_block(&hash, None);
+    }
+}
+
 fn build_item(item: &m2_oracle_proto::WireItem) -> Result<jam_node::hazmat::BuildItem, String> {
     // `ImportSpec` has a hand-written codec -- the root is a two-case
     // enum, not a plain hash -- so the specs cross the wire encoded and

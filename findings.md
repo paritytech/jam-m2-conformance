@@ -5,85 +5,96 @@ observed, what it is not, and what would close it.
 
 ---
 
-## 1. Two core assignments, reading different entropy entries
+## 1. The reference chain never finalized, so its epoch view froze — CLOSED 2026-11-17
 
-**Status:** worked around, root cause not established. Opened 2026-11-11.
+**Status:** root cause found and fixed. Opened 2026-11-11 as "two core
+assignments, reading different entropy entries", which was wrong; what it
+recorded was a symptom. The correction is below.
 
-polkajam computes the core assignment two ways, and for a slot in the chain
-head's own epoch they disagree.
-
-| source | entropy used |
-|---|---|
-| `storage.core_assignments_for(slot)` | the entry `epoch_relation` selects: **2** for a slot in the head's epoch, **1** for the next |
-| `EpochInfo::core_assignments(slot)` (cached, via `current_and_next_epochs`) | **entry 1**, whatever the slot |
-
-Measured against a live node:
+**What this was recorded as.** That polkajam computes the core assignment two
+ways and they disagree — `storage.core_assignments_for(slot)` shuffling with
+entropy entry 2 while the cached `EpochInfo::core_assignments(slot)` uses
+entry 1 — measured against a live node as:
 
 ```
 cached ee155ace9c402920  best-block[1] ee155ace9c402920
                          best-block[2] bb30a42c1e62f0af
 ```
 
-So the two agree for a slot in the *next* epoch and disagree for one in the
-head's own. A guarantor choosing who to share a work-package with uses the
-cached view (`chain/guarantors/guarantor.rs`, `epoch.core_assignments(slot)`),
-while the on-chain rule for a guarantee shuffles with entry 2
-(`chain/exec/reports.rs`).
+**What it actually was.** `current_and_next_epochs` reads a cache that
+polkajam writes in exactly one place: the finalization path
+(`chain/mod.rs:1175`, "Publish the new finalized head"). Finality in dummy
+mode is driven by `finality::dummy_run`, an async worker the **node** spawns
+(`node/mod.rs:377`). `AuthoringHarness::new` builds a `JamChain` and spawns
+nothing, so a harness session finalized once — at genesis — and never again.
 
-**Observed effect.** N3's CE 133 sharing row passed in one run and failed in
-the next with no code change between them: the submission slot landed in the
-head's epoch or the next one depending only on where in the epoch the run
-started. Where they disagreed the node shared with one co-guarantor instead
-of two and its guaranteed report carried two signatures rather than three.
+The cached view was not lagging. It was **frozen at genesis for the whole
+run**, while the head walked away from it. Authoring a `tiny` chain across
+two boundaries, with no node involved at all:
 
-**What it is not.** Not a stale cache. The cached epoch index matched the
-best-block state epoch exactly (815264 against 815264) in the run that
-produced the numbers above; the difference is which entry is read, not which
-block. An earlier hypothesis that the cache lags finalization was tested and
-refuted.
+```
+period 12, genesis slot 0
+slot  1 (epoch 0) cached_idx 0 state_idx 0 | cached ee155ace9c402920 entry1 ee155ace9c402920 entry2 bb30a42c1e62f0af
+slot 12 (epoch 1) cached_idx 0 state_idx 1 | cached ee155ace9c402920 entry1 c782837d5e696d6c entry2 ee155ace9c402920
+slot 24 (epoch 2) cached_idx 0 state_idx 2 | cached ee155ace9c402920 entry1 0c4e24ca0c0d8e0f entry2 c782837d5e696d6c
+```
 
-**Current workaround.** `plan_package_for_this_run` aims the submission into
-the next epoch, where both sides provably read the same entropy, and aims it
-from the *cached* epoch index rather than from the head. The epoch view
-resolves the cached epoch and the one after it, so `cached + 1` is
-resolvable by construction.
+The first line reproduces the original measurement byte for byte. `cached`
+never changes; the entries rotate past it. It equals entry 1 at slot 1, entry
+**2** at slot 12 and neither at slot 24 — so "the cached view reads entry 1"
+was a coincidence of *when* the measurement was taken, not a rule.
 
-Waiting for the cache to catch up and then reading the head again is not
-enough, and was the first attempt: a head that crosses an epoch in the gap
-between the wait and the read puts the target two epochs past the cache,
-which resolves to nothing and leaves the lane unexercised. Three runs in
-five did exactly that, all near a boundary. Aiming from the cached index
-closes the race -- five consecutive runs after it, all planning and all
-clean. The second half matters because the view resolves only the cached
-epoch and the next, so a cache more than one epoch behind cannot answer for
-a slot an epoch ahead and no plan is made at all.
+**Why the stale-cache hypothesis was wrongly refuted.** The finding said the
+cache was not stale because "the cached epoch index matched the best-block
+state epoch exactly (815264 against 815264)". Those indices agree for as long
+as the run is still inside the genesis epoch, which is where that measurement
+was taken — a frozen cache and a healthy one are indistinguishable there. The
+test could not have told the two apart.
 
-Measured over four consecutive runs after that wait was added: **every run
-exercised the lane**, where before roughly one in three had planned nothing.
-Three scored 30 of 30; the fourth failed only the inclusion row, with both
-views agreeing, which is a separate residual and not this one.
+**Why the lane went quiet.** The epoch view answers only for the cached epoch
+and the one after it. With the cache stuck at genesis, every slot more than
+one epoch out resolved to nothing, so `submission_slot_for` found no slot and
+N3 reported all four rows unexercised. `wait_for_the_epoch_view_to_catch_up`
+made it worse: it waited up to half the observation window for a cache that
+could never move, and the head drifted further away while it waited.
 
-This is a workaround, not a resolution. It removes the lane's dependence on
-a lagging cache without settling which view is authoritative.
+**The fix.** `advance_finality` in the oracle, called after authoring and
+after a successful import. Not `dummy_run`'s rule of one slot behind the head:
+the harness is asked to import blocks a node announced late, a block older
+than the finalized head cannot be imported at all, and at a one-slot lag a
+block two slots late is refused — which turned a late announcement into a
+harness-side failure on `n1_header_seal_import_ok`, a row about whether the
+block is well formed. It finalizes the *earliest block still in the head's
+epoch*, the least that moves the epoch index, leaving the rest of the epoch
+open to import; and it skips the head, so a fresh boundary does not leave
+zero headroom.
 
-**To close it, a follow-up session should establish:**
+**Measured after the fix**, on a live run:
 
-1. Which view is authoritative for a slot in the head's own epoch. The STF
-   also computes `old_assignments` (`chain/exec/reports.rs`), so it may accept
-   more than one rotation — in which case both views are valid inputs and
-   nothing is wrong. That has not been checked.
-2. If the STF accepts only entry 2, whether a guarantee formed over the
-   cached entry-1 cohort can actually be included. If it cannot, a node
-   sharing by the cached view is building guarantees the chain will reject,
-   which is a polkajam defect and belongs upstream.
-3. Whether the harness should then grade the sharing row against the on-chain
-   rule and report the divergence as a finding, rather than working around it
-   by choice of slot.
+```
+[assignment] entropy: cached ee155ace9c402920  best-block[1] 4f739a0703289dcc
+             best-block[2] ee155ace9c402920  -> cached matches entry 2 (the on-chain rule)
+[assignment] cached epoch view 822125, best-block state epoch 822125
+[assignment] slot 9865512 core 0: storage Ok(Some([2, 3, 4])) epoch Ok(Some([2, 3, 4]))
+[assignment] slot 9865512 core 1: storage Ok(Some([0, 1, 5])) epoch Ok(Some([0, 1, 5]))
+```
 
-The diagnostics that produced this are `RefChain::epoch_views` and
-`RefChain::assignment_entropy`, printed by the runner on every N3 plan.
+**The two views agree, on both cores.** There is no divergence to choose
+between, so the three questions this finding left open — which view is
+authoritative, whether a guarantee over the cached cohort can be included,
+whether the harness should grade against the on-chain rule — do not arise.
+Nor was there anything to raise upstream: the defect was ours.
 
----
+N3 went from four unexercised rows to eleven running, nine of them passing.
+
+**Pinned by** `the_cached_epoch_view_follows_the_chain` in `m2-reference`,
+which authors across two boundaries and asserts the cached view has moved off
+genesis and sits within one epoch of the head.
+
+**One caution.** In the run above the cached entropy also equals entry 2, but
+the chain was only a few epochs old and entry 2 may still hold genesis
+entropy at that age. The cohorts agreeing is the direct evidence; the entropy
+line is consistent with it rather than independent proof.
 
 ## 2. A distributed report is never included — CLOSED 2026-11-12
 
@@ -389,3 +400,38 @@ version out of its own `Cargo.lock` -- the oracle's already reads its manifest
 for the polkajam revision -- and the handshake compares them, the way it
 already compares the protocol version. About fifteen lines, and it turns a
 silent divergence into a refusal to start.
+
+## 8. The node accepts a CE 133 extrinsic message of the wrong size
+
+**Status:** open, observed once, and it may be a change in the node rather
+than a standing defect. Seen 2026-11-17.
+
+CE 133's second message carries the extrinsic data, and `simple.md:373` gives
+its size as the sum of the lengths the work-package declares. polkajam itself
+reads it with `read_exact(saturated_extrinsic_size())`, so that equality is
+the rule, and DESIGN §11 N3 lists "extrinsic size mismatch" as a fault the
+node must reset the stream for.
+
+The fault row sends a message whose size does not match the declared sum. The
+node accepted it and did not reset.
+
+**What makes this worth a second look rather than a filing.** The same row
+passed at the previous pin (`e3d216c2`) in earlier sessions, and failed on
+the first run after re-pinning to `5ef954fb1`. Twenty-seven commits separate
+them, several touching block import and work-package handling. It is equally
+possible that the row only now ran to completion: the N3 lane was reporting
+every row unexercised before §1 was fixed, so "passed before" may mean
+"passed in an older session under different conditions" rather than "passed
+on this code path yesterday".
+
+**Before filing anything upstream**, establish:
+
+1. Whether it reproduces. One run is not a pattern, and the N3 lane has only
+   just started exercising again.
+2. Whether it reproduces at the *old* pin with the current harness, which
+   separates a node change from a harness change.
+3. Which of polkajam's read paths handles this message now, and whether the
+   `saturated_extrinsic_size` read survived the re-pin range.
+
+Related: §4, the oversized first message, which is the same shape — a size
+rule the node does not enforce — and which also failed in this run.

@@ -310,7 +310,17 @@ fn tickets_are_proved_over_the_context_the_oracle_gave() {
     };
 
     let (pks, entropy) = match ask(&mut stream, Message::TicketCtx(session)) {
-        Message::TicketContext { pks, entropy } => (pks, entropy),
+        Message::TicketContext {
+            pks,
+            entropy,
+            epoch,
+        } => {
+            // The context names the epoch its entropy seals, read from the
+            // same storage as the entropy. A session opened on the dev spec
+            // has its head at genesis, in epoch 0, so this is epoch 1.
+            assert_eq!(epoch, 1, "the epoch follows the head, not a clock");
+            (pks, entropy)
+        }
         other => panic!("expected TicketContext, got {other:?}"),
     };
     assert_eq!(pks.len(), 6, "the tiny validator set");
