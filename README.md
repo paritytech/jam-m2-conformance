@@ -221,8 +221,8 @@ was checked", and the lanes are asked for by name so that distinction is
 never made silently.
 
 **The pin is on an unmerged branch.** `Cargo.toml` and `oracle/Cargo.toml`
-point at polkajam `43689c3de` (branch `jv-export-n4`), which exports
-`hazmat::merkle`. Checking a CE 137 justification needs `merkle_root`, and
+point at polkajam `43689c3de` (branch `jv-export-n4`, open as
+polkajam#1401), which exports `hazmat::merkle`. Checking a CE 137 justification needs `merkle_root`, and
 building one at all — which is what lets a simulated node serve shards —
 needs `merkle_proofs` and `pack_erasure_tree_entry`. The pin goes back to a
 merge commit once that PR lands; see `findings.md` §9.

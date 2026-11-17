@@ -478,16 +478,19 @@ checks nobody knows are checks, and this harness has already paid for that
 twice. With the pin moved, `m2-sim` holds a real coded bundle and
 `n4_sim_it` drives eleven faults through it.
 
-**Proposed upstream**, on polkajam branch `jv-export-n4`: `util::merkle`
-becomes `pub(crate)` and `hazmat::merkle` re-exports `merkle_proofs`,
-`merkle_root`, `pack_erasure_tree_entry` and the proof types. The same shape
-as #1378 -- a re-export and a visibility bump, no behaviour change.
+**Open upstream** as polkajam#1401, from branch `jv-export-n4`:
+`util::merkle` becomes `pub(crate)` and `hazmat::merkle` re-exports
+`merkle_proofs`, `merkle_root`, `pack_erasure_tree_entry` and the proof
+types. The same shape as #1378 -- a re-export and a visibility bump, no
+behaviour change.
 
-The pin moved to that branch (`43689c3de`) on 2026-11-17, ahead of the PR:
-`merkle_root` is needed to check a CE 137 justification at all, since that
-protocol takes its segment root from the shards rather than from the
-justification (§11b). The pin goes back to a merge commit once the PR
-lands.
+The pin moved to that branch (`43689c3de`) on 2026-11-17, ahead of the PR
+being opened, for two reasons. `merkle_root` is needed to *check* a CE 137
+justification at all, since that protocol takes its segment root from the
+shards rather than from the justification (§11b). And `merkle_proofs` with
+`pack_erasure_tree_entry` are needed to *build* one, without which no
+simulated node can serve shards and none of N4's serve rows could be shown
+to fail. The pin goes back to a merge commit once #1401 lands.
 
 ## 10. DESIGN had the erasure recovery threshold wrong
 
