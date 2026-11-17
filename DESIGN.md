@@ -41,7 +41,7 @@ measurement (M3/M4); testing more than one NUT per run.
 |---|---|---|
 | JAMNP-S spec | `jam-np/simple.md` (HEAD 2026-09-02, untagged) | Only file in the repo. ALPN protocol version `1`. Line numbers below refer to it. |
 | Graypaper | `graypaper/` v0.8.0 | Off-chain duties: `text/work_packages_and_reports.tex:15` (Honest Behavior), `guaranteeing.tex`, `assurance.tex`, `auditing.tex`, `best_chain.tex`, `safrole.tex`. |
-| Reference engine | `polkajam/crates/polkajam-fuzz` (lib + bin), `polkajam/crates/node` (`hazmat` feature) | Authoring engine, STF import, state diff, mutation engine. |
+| Reference engine | `polkajam/crates/node` (`hazmat` feature), reached over a socket from `oracle/` | Authoring engine, STF import, state diff. `polkajam-fuzz` is read for its trace framing and mutation vocabulary (§8), not depended on. |
 | Tiny parameters | `w3f/jamtestvectors` README | V=6, C=2, E=12, Y=10, N=3, rotation R=4, EC recovery 2 shards. |
 
 Tiny derived numbers used throughout: grid width W=⌊√6⌋=2 (rows {0,1},{2,3},{4,5}; columns
@@ -65,27 +65,45 @@ content` messages (`:122-130`). Stream kinds: UP 0; CE 128, 129, 131, 132, 133, 
  │        │ spawns NUT (cmd template / docker preset)   │ drives                                        │
  │        ▼                                             ▼                                               │
  │  ┌───────────┐    QUIC/JAMNP-S     ┌──────────────────────────────┐    ┌────────────────────────┐    │
- │  │    NUT    │◄───────────────────►│ jamnp-s (lib)                │    │ m2-reference (lib)      │    │
- │  │ validator │  5 endpoints, one   │ - endpoint/cert/ALPN         │◄──►│ polkajam-fuzz + jam-node│    │
- │  │  index k  │  Ed25519 id each    │ - UP/CE stream codecs        │    │  (hazmat): STF import,  │    │
- │  └───────────┘                     │ - per-peer reactive handlers │    │  authoring tables,      │    │
- │                                    │ - message trace recorder     │    │  signing for emulated   │    │
- │                                    └──────────────────────────────┘    │  keys, refine, EC       │    │
- │                                                                        └────────────────────────┘    │
- └──────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ │  │    NUT    │◄───────────────────►│ jamnp-s (lib)                │    │ m2-reference (lib)     │    │
+ │  │ validator │  5 endpoints, one   │ - endpoint/cert/ALPN         │◄──►│  a client: one session │    │
+ │  │  index k  │  Ed25519 id each    │ - UP/CE stream codecs        │    │  per chain, no engine  │    │
+ │  └───────────┘                     │ - per-peer reactive handlers │    └───────────┬────────────┘    │
+ │        ▲                           │ - message trace recorder     │                │ m2-oracle-proto │
+ │        │                           └──────────────────────────────┘                │ (unix socket)   │
+ └────────┼────────────────────────────────────────────────────────────────────────── │ ────────────────┘
+          │ both built from one polkajam revision                                     ▼
+          │                                                   ┌──────────────────────────────────────┐
+          └─────────────────────── same revision ────────────►│ m2-oracle (bin, outside the workspace)│
+                                                              │  jam-node (hazmat): STF import,       │
+                                                              │  authoring, signing for emulated      │
+                                                              │  keys, refine, the assignment tables  │
+                                                              └──────────────────────────────────────┘
 ```
 
 | crate | responsibility |
 |---|---|
 | `jamnp-s` | Independent JAMNP-S: QUIC endpoint (quinn 0.11 + rustls), Ed25519 self-signed cert and SAN derivation, ALPN, preferred-initiator rule, stream-kind byte, `u32 LE` framing, typed codecs for every UP/CE message (GP codec via `jam-types`/`codec`), request/response helpers, full message trace recording, and the transport and clock boundaries below. No policy. |
-| `m2-reference` | Wrapper over `polkajam-fuzz` (lib) + `jam-node` (`hazmat`): reference chain state for the 6-validator net; authors blocks for emulated slots; signs tickets/guarantees/assurances/judgments/audit announcements with the five emulated keysets; refines work packages; erasure-codes bundles and builds justifications; imports NUT blocks and diffs state. |
+| `m2-oracle-proto` | The wire protocol between the harness and the reference engine: a 4-byte LE length prefix and a JAM-codec message. The fuzz protocol's tags keep their numbers so a fuzz client can speak to the same socket; M2's start above them. Also the home of anything both sides must compute identically -- `proxy_index`, the dev bootstrap service id -- because a second implementation of such a rule is a divergence nothing will catch. |
+| `m2-reference` | A **client** of the reference engine: one connection, one session per chain. Reference chain state for the 6-validator net; authors blocks for emulated slots; signs tickets/guarantees with the five emulated keysets; refines work packages; imports NUT blocks and diffs state. Every one of those is a request; this crate holds no engine and does not depend on `jam-node`. |
+| `m2-oracle` (`oracle/`) | **Outside the workspace.** The reference engine behind a unix socket: the only crate that depends on `jam-node` and its `hazmat` feature, whose own documentation says its interfaces may change at any time. Built by `scripts/prepare-nut.sh` from the same polkajam revision as the node under test -- which is the whole basis for trusting its answers -- and it states that revision in its handshake. |
 | `m2-emu` | The five emulated validators plus an optional builder / non-validator peer. One `jamnp-s` endpoint each; reactive handlers (serve CE 128/129/137/138/139/140/147/148/136/143; accept UP 0, CE 131/132/134/135/141/142/144/145/133/146); every inbound and outbound message goes to the observation log. Behaviour is data-driven by the scenario: `m2-emu` executes **no core protocol logic** — every value (report results, segments, shards, proofs) and every decision (audit verdicts, assurance bits) is computed once by `m2-reference` and injected; `m2-emu` only keeps per-peer state, frames, and signs. |
 | `m2-scenario` | Scenario model and scheduler: steps keyed by `(slot_rel, offset_ms)`; actions (emulated side) and expectations (NUT side) with severity; lanes are scenario collections. |
 | `m2-runner` | CLI: generates spec and keys, launches the NUT (command template / preset), runs the scenario, writes report and traces, sets the exit code. |
 | `m2-sim` | A simulated node under test: an in-process stand-in the harness can grade, honest or deliberately broken. Not a node — it keeps no state machine and validates nothing — but node-shaped enough for a lane to grade, which is what makes a check's ability to fail testable. |
 
-Dependencies on polkajam are git dependencies pinned to a commit (see §8 for the small changes
-polkajam needs first).
+The workspace depends on two polkajam crates, `jam-types` and `jam-std-common`, as git
+dependencies pinned to a commit (see §8). It does **not** depend on `jam-node`: the engine is
+the oracle's, and `cargo tree -i jam-node` finds nothing here.
+
+**Why the engine is out of process.** `hazmat` is an escape hatch whose interfaces may change
+at any time, and it was reaching into six crates. Behind a socket it reaches into one, roughly
+five hundred lines, so a breaking change upstream lands there instead of across the harness.
+The harness also stops compiling the node to run its own tests. What the split costs is a
+round trip per request -- about 5 to 14 ms measured over a live run, against a 6-second slot --
+and one rule: anything both sides must compute identically lives in `m2-oracle-proto`, because
+the two defects this split introduced were both a second implementation of a rule that already
+existed.
 
 **The transport boundary.** `jamnp_s::transport` is what everything above `jamnp-s` sees of a
 connection: open a bidirectional stream, accept one, write, finish, reset, read, stop. Two
@@ -355,13 +373,36 @@ the NUT must be able to *initiate* connections under the preferred-initiator rul
 (`polkajam --chain {spec} run --key-seed-file … --listen-ip … --port … --mode validator`, once the
 spec adapter exists).
 
-## 8. Reference engine: reuse and required polkajam changes
+## 8. Reference engine: how it is reached, and required polkajam changes
 
-`polkajam-fuzz` is a library (`crates/polkajam-fuzz/src/lib.rs:14-50`) re-exporting
-`jam_node::hazmat::{AuthoringHarness, ImportBlockParams, ImportBlockResult, …}`, `Report` and
-`StateDiff`. Importing a foreign block is `Chain::import_block(.., ImportParams::new_exec(hash))`
-(`node/src/chain/mod.rs:765`), already used by the fuzzer's local target path. The following small
-changes in polkajam are prerequisites:
+The engine is `jam_node::hazmat::AuthoringHarness`, and it runs **out of process**. `oracle/` is
+a binary outside this workspace that owns it and answers requests on a unix socket;
+`m2-reference` is a client with a session per chain. Importing a foreign block is still
+`Chain::import_block(.., ImportParams::new_exec(hash))` (`node/src/chain/mod.rs:765`), now behind
+an `ImportInto` request.
+
+**The same-revision rule.** The oracle's answers are a standard to grade a node by only if the
+two are the same engine. `scripts/prepare-nut.sh` builds `third_party/bin/{polkajam,m2-oracle}`
+from one revision, read from `oracle/Cargo.toml`; the oracle reports that revision in its
+handshake and `--revision`, and the script refuses to finish if the binary disagrees with the
+pin.
+
+**What the protocol crate is for.** `m2-oracle-proto` holds the messages and, more importantly,
+every rule both sides must compute identically. Two defects found while building this were each
+a second implementation of a rule that already existed on the other side -- a `proxy_index` that
+folded the wrong bytes, and a session clock seeded from the oracle's own `SystemTime::now()`
+instead of the caller's. Neither failed to compile and neither tripped an assertion; they were
+found by comparing a run's numbers against the pre-split ones. Anything of that kind belongs in
+the protocol crate, defined once.
+
+**Version numbers do not identify revisions.** `jam-types` and `jam-std-common` are published on
+crates.io at the same 0.1.29 the pin carries, and they are different code: the published
+`ServiceActivityRecord` has `provided_count: u16` where the pin has `u32`, inside a struct that
+derives `Encode`. Both stay git dependencies on the pin. findings.md §6 has the diff and the
+check to repeat on a re-pin.
+
+`polkajam-fuzz` is no longer a dependency of anything here. The following small changes in
+polkajam remain prerequisites:
 
 1. Make the provisioners `tickets`, `guarantees`, `assurances`, `preimages`, `disputes`, `builder`
    public (`lib.rs:21-31`) and parameterise them on an explicit RNG instead of the global
@@ -372,9 +413,13 @@ changes in polkajam are prerequisites:
 3. Return signed artefacts instead of submitting them to the pool: `compose_guarantee`,
    `try_compose_assurances`, `table_tickets` (`harness.rs:352,574,621`) for a chosen validator index.
    The harness sends them over JAMNP and optionally feeds the reference pool.
-4. Hazmat export for "bundle → erasure shards + justifications + segment proofs" (today inside
-   `jam-node` `availability` / `util::erasure`), needed to serve CE 137/138/139/140/147/148 byte-exactly.
-   The exact surface still needs inspection.
+4. ~~Hazmat export for "bundle → erasure shards + justifications + segment proofs"~~ **done**:
+   merged as polkajam `57ff7a31c` (#1378) and carried by the pin. `hazmat::erasure` gives
+   `erasure_shards`, `reconstruct`, `reconstruct_segment`, `recovery_threshold`, `segments_shards`
+   and `shard_len`; `hazmat::availability` gives `bundle_justification`, `segment_justification`,
+   `check_bundle_proof`, `check_segment_proof`, `decode_segment_justification` and the two
+   `max_*_justification_bytes`. That is what CE 137/138/139/140/147/148 need served byte-exactly,
+   and it is the last thing that blocked N4.
 5. Keep the `ark-vrf` `test-vectors` feature (`polkajam-fuzz/Cargo.toml:35-37`) for deterministic
    RingVRF proofs on the harness side.
 
@@ -384,7 +429,8 @@ tickets, guarantees, assurances, judgments, audit s₀/sₙ); refine (PVM) of sc
 into report, exported segments and bundle bytes; authorizer evaluation; erasure coding (6 shards,
 recovery 2), `M_B`, co-paths `T`, segment proofs; guarantor-assignment, author-per-slot, grid and
 proxy calculators; a delivery ledger (item, peer, timestamp) to derive inclusion/exclusion. These
-run exactly once in `m2-reference`; `m2-emu` consumes the outputs and never recomputes them.
+are computed exactly once, in the oracle, and reach a lane through `m2-reference`; `m2-emu`
+consumes the outputs and never recomputes them.
 
 **Relationship to `polkajam-fuzz` (what is and is not reused).** The M1 fuzzer is a seed-driven
 generator and white-box mutator, not a repository of named test cases: its "cases" are produced on
@@ -393,7 +439,8 @@ socket (synchronous `Initialize`/`ImportBlock`/`GetState` requests). Neither map
 surface, so the harness does **not** replay fuzzer sessions and does **not** adopt fuzzer-generated
 scenarios. Reuse is limited to:
 
-- the `hazmat` reference engine as the **oracle** (§3 above);
+- the `hazmat` reference engine as the **oracle** (§3 above), now behind a socket of its own
+  whose framing and low tag numbers follow the fuzz protocol's, so a fuzz client can speak to it;
 - the mutation vocabulary (`mutator.rs`) as the primitives behind `inject_fault` (§5);
 - the `FUZZ_PROTOCOL_TRACE_DIR` framing for `trace/jamnp.bin` and the
   `TraceStep { pre_state, block, post_state }` shape for per-block records (§9);

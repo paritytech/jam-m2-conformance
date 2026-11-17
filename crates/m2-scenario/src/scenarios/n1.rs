@@ -772,7 +772,8 @@ mod tests {
     /// moment it included one of its own.
     #[test]
     fn n1_extrinsic_allows_the_nodes_own_tickets() -> Result<(), m2_reference::chain::ChainError> {
-        let chain = m2_reference::chain::RefChain::tiny(0)?;
+        let chain =
+            m2_reference::chain::RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let tctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&tctx)?;
         let env = |t: &m2_reference::tickets::EmulatedTicket| TicketEnvelope {
@@ -811,7 +812,8 @@ mod tests {
     #[test]
     fn n1_extrinsic_pass_and_missing() -> Result<(), m2_reference::chain::ChainError> {
         // Real reference-generated tickets: distinct, valid ring-VRF ids.
-        let chain = m2_reference::chain::RefChain::tiny(0)?;
+        let chain =
+            m2_reference::chain::RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let tctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&tctx)?;
         let env = |t: &m2_reference::tickets::EmulatedTicket| TicketEnvelope {
@@ -912,7 +914,8 @@ mod tests {
     #[test]
     fn n1_extrinsic_inclusion_is_capped_and_carries_over(
     ) -> Result<(), m2_reference::chain::ChainError> {
-        let chain = m2_reference::chain::RefChain::tiny(0)?;
+        let chain =
+            m2_reference::chain::RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let tctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&tctx)?;
         let env = |t: &m2_reference::tickets::EmulatedTicket| TicketEnvelope {
@@ -976,7 +979,8 @@ mod tests {
     #[test]
     fn n1_extrinsic_respects_the_tail_and_the_target_epoch(
     ) -> Result<(), m2_reference::chain::ChainError> {
-        let chain = m2_reference::chain::RefChain::tiny(0)?;
+        let chain =
+            m2_reference::chain::RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let tctx = chain.ticket_ctx()?;
         let tickets = chain.generate_tickets(&tctx)?;
         let t = &tickets[0];

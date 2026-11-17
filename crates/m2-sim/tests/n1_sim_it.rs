@@ -43,8 +43,14 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
 
     // Two chains over one genesis: the harness's, which never authors the
     // node's slots, and the node's, which can.
-    let harness_chain = Arc::new(RefChain::tiny(NUT_INDEX).expect("the harness chain"));
-    let node_chain = Arc::new(RefChain::tiny_for(NUT_INDEX).expect("the node's chain"));
+    let harness_chain = Arc::new(
+        RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), NUT_INDEX)
+            .expect("the harness chain"),
+    );
+    let node_chain = Arc::new(
+        RefChain::tiny_for(&m2_reference::oracle::Oracle::for_tests(), NUT_INDEX)
+            .expect("the node's chain"),
+    );
     let genesis = harness_chain.genesis_hash();
     assert_eq!(
         genesis,
@@ -84,7 +90,9 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
             // An emulated validator's slot: the node learns it the way a node
             // does, by importing what it is told about.
             Ok(Some(block)) => {
-                node_chain.import_nut_block(&block);
+                node_chain
+                    .import_nut_block(&block)
+                    .expect("the node\'s chain imports the block");
             }
             // The node's own slot.
             Ok(None) => {
@@ -102,7 +110,8 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
 
     let nut_blocks = emu.nut_blocks();
     let nut_blocks = nut_blocks.lock().expect("the NUT blocks").clone();
-    let ctx = m2_runner::real::build_n1_ctx(&harness_chain, &nut_blocks, &[], Vec::new());
+    let ctx = m2_runner::real::build_n1_ctx(&harness_chain, &nut_blocks, &[], Vec::new())
+        .expect("the N1 facts build");
     let rows = n1::all(&ctx)
         .into_iter()
         .flat_map(|check| (check.run)(&m2_scenario::dsl::ObsLog::new()))

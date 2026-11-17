@@ -411,7 +411,8 @@ mod tests {
 
         let eval = crate::scenario::evaluate(
             &log,
-            &crate::scenario::fabricated_run_ctx(3).expect("fabricated run ctx builds"),
+            &crate::scenario::fabricated_run_ctx(&m2_reference::oracle::Oracle::for_tests(), 3)
+                .expect("fabricated run ctx builds"),
             LaneSet::parse("n0,n1,n2").expect("lanes parse"),
         );
         assert!(

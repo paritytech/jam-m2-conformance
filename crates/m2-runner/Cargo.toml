@@ -19,10 +19,10 @@ tokio = { workspace = true }
 futures = { workspace = true }
 jam-types = { workspace = true }
 jam-std-common = { workspace = true }
-jam-node = { workspace = true }
-codec = { package = "jam-codec", version = "0.1.1", default-features = false, features = ["derive", "max-encoded-len"] }
+codec = { package = "jam-codec", version = "0.1.2", default-features = false, features = ["derive", "max-encoded-len"] }
 ed25519-consensus = { workspace = true }
 m2-scenario = { path = "../../crates/m2-scenario" }
 m2-emu = { path = "../../crates/m2-emu" }
+m2-oracle-proto = { path = "../../crates/m2-oracle-proto" }
 m2-reference = { path = "../../crates/m2-reference" }
 jamnp-s = { path = "../../crates/jamnp-s" }

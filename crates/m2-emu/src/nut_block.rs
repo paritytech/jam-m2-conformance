@@ -29,10 +29,18 @@ pub fn should_fetch(
     ref_chain: &RefChain,
     nut_blocks: &Mutex<Vec<NutBlock>>,
 ) -> bool {
-    let known_locally = ref_chain
-        .chain_blocks()
-        .iter()
-        .any(|block| block.header.hash().0 == *hash);
+    // An unreachable oracle means we do not know what the reference chain
+    // holds, and fetching a block we already have is the cheaper of the two
+    // mistakes -- the other is never fetching a block the lane is waiting
+    // for. It is said out loud either way: this is a harness failure, not a
+    // node's.
+    let known_locally = match ref_chain.chain_blocks() {
+        Ok(blocks) => blocks.iter().any(|block| block.header.hash().0 == *hash),
+        Err(e) => {
+            eprintln!("[emu] deciding whether to fetch: could not read the reference chain: {e}");
+            false
+        }
+    };
     !known_locally && !already_fetched(nut_blocks, hash)
 }
 
@@ -165,8 +173,14 @@ mod tests {
 
     #[test]
     fn should_fetch_known_and_unknown() {
-        let ref_chain = RefChain::tiny(0).expect("tiny chain builds");
-        let known = ref_chain.chain_blocks()[0].header.hash().0;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)
+            .expect("tiny chain builds");
+        let known = ref_chain
+            .chain_blocks()
+            .expect("the reference chain reads back")[0]
+            .header
+            .hash()
+            .0;
         let store = Mutex::new(Vec::new());
         assert!(!should_fetch(&known, &ref_chain, &store));
         assert!(should_fetch(&[0xee; 32], &ref_chain, &store));
@@ -178,11 +192,19 @@ mod tests {
                 &Mutex::new(ObsLog::new()),
                 1,
                 &store,
-                ref_chain.chain_blocks()[0].clone(),
+                ref_chain
+                    .chain_blocks()
+                    .expect("the reference chain reads back")[0]
+                    .clone(),
             ),
             "the first sighting is recorded"
         );
-        let fetched = ref_chain.chain_blocks()[0].header.hash().0;
+        let fetched = ref_chain
+            .chain_blocks()
+            .expect("the reference chain reads back")[0]
+            .header
+            .hash()
+            .0;
         assert!(
             !should_fetch(&fetched, &ref_chain, &store),
             "a block already fetched is not fetched again"
@@ -197,7 +219,10 @@ mod tests {
                 &Mutex::new(ObsLog::new()),
                 2,
                 &store,
-                ref_chain.chain_blocks()[0].clone(),
+                ref_chain
+                    .chain_blocks()
+                    .expect("the reference chain reads back")[0]
+                    .clone(),
             ),
             "a second sighting is not recorded again"
         );
@@ -206,8 +231,12 @@ mod tests {
 
     #[test]
     fn fetch_decodes_served_block() {
-        let ref_chain = RefChain::tiny(0).expect("tiny chain builds");
-        let block = ref_chain.chain_blocks()[0].clone();
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)
+            .expect("tiny chain builds");
+        let block = ref_chain
+            .chain_blocks()
+            .expect("the reference chain reads back")[0]
+            .clone();
         let response = BlockResponse {
             blocks: vec![block.clone()],
         };
@@ -228,8 +257,12 @@ mod tests {
 
     #[test]
     fn nut_blocks_store_records_authors() {
-        let ref_chain = RefChain::tiny(0).expect("tiny chain builds");
-        let block = ref_chain.chain_blocks()[0].clone();
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)
+            .expect("tiny chain builds");
+        let block = ref_chain
+            .chain_blocks()
+            .expect("the reference chain reads back")[0]
+            .clone();
         let obs = Mutex::new(ObsLog::new());
         let nut_blocks = Mutex::new(Vec::new());
         record_block(&obs, 1, &nut_blocks, block.clone());

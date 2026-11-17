@@ -208,9 +208,10 @@ pub(crate) fn fabricated_obs_log(reference_block_count: usize) -> ObsLog {
 /// that block; the N2 lane carries a conforming emulator plan and verified NUT
 /// ticket facts.
 pub(crate) fn fabricated_run_ctx(
+    oracle: &std::sync::Arc<m2_reference::oracle::Oracle>,
     reference_block_count: usize,
 ) -> Result<RunCtx, m2_reference::chain::ChainError> {
-    let chain = RefChain::tiny(0)?;
+    let chain = RefChain::tiny(oracle, 0)?;
     let start = chain.next_slot();
     // Two blocks, the second built on the first: one NUT block on its own can
     // never witness its own posterior state root, which only the header of a
@@ -230,8 +231,8 @@ pub(crate) fn fabricated_run_ctx(
 
     // Everything up to and including `first` is reference history; `second` is
     // the block under test, so its parent is the reference best at its slot.
-    let history: Vec<(u32, [u8; 32])> = chain
-        .chain_blocks()
+    let blocks = chain.chain_blocks()?;
+    let history: Vec<(u32, [u8; 32])> = blocks
         .iter()
         .take_while(|block| block.header.slot <= first.header.slot)
         .map(|block| (block.header.slot, block.header.hash().0))
@@ -245,8 +246,7 @@ pub(crate) fn fabricated_run_ctx(
     // the harness treats as history here; the node is allowed to be ahead.
     let genesis = chain.genesis_hash();
     let reference_chain: Vec<[u8; 32]> = history.iter().skip(1).map(|(_, hash)| *hash).collect();
-    let probed_blocks: Vec<n0::ProbedBlock> = chain
-        .chain_blocks()
+    let probed_blocks: Vec<n0::ProbedBlock> = blocks
         .iter()
         .skip(1)
         .map(|block| n0::ProbedBlock {
@@ -630,7 +630,8 @@ mod tests {
 
     #[test]
     fn evaluate_reports_lanes() {
-        let run_ctx = fabricated_run_ctx(3).expect("fabricated run ctx builds");
+        let run_ctx = fabricated_run_ctx(&m2_reference::oracle::Oracle::for_tests(), 3)
+            .expect("fabricated run ctx builds");
         let log = fabricated_obs_log(3);
         let eval = evaluate(&log, &run_ctx, ALL_LANES);
 

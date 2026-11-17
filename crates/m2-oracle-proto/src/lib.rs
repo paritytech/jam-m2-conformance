@@ -30,10 +30,52 @@ use codec::{Decode, Encode};
 /// Bumped whenever a message changes shape. The client refuses a mismatch
 /// rather than guessing, because a silently misread response is a wrong
 /// conformance verdict rather than an error.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Largest frame either side will read, matching the fuzz protocol's.
 pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
+
+/// The dev chain spec's bootstrap service, which is what every work item
+/// this harness builds is addressed to.
+///
+/// A copy of `jam_node::DEV_BOOTSTRAP_SERVICE_ID`, kept here so that a crate
+/// with no node dependency can name the service. The oracle holds both and
+/// asserts they are equal, which is where a re-pin that moved it would be
+/// caught -- the same arrangement as the revision pin, and for the same
+/// reason: one source, one guard, no second copy to forget.
+pub const DEV_BOOTSTRAP_SERVICE_ID: u32 = 0;
+
+/// Index of the validator designated as proxy for a ticket.
+///
+/// polkajam's rule: the big-endian last four bytes of the ticket id, modulo
+/// the validator count.
+///
+/// Here rather than in either crate that needs it, because both do: the
+/// oracle stamps each proved ticket with its proxy, and the lanes read that
+/// stamp. A second implementation of this on the oracle side folded the
+/// *first* sixteen bytes instead, which is a well-formed-looking rule that
+/// produces a different answer for almost every ticket -- every delivery in
+/// a simulated run went to the wrong peer, and the lane reported a node that
+/// had forwarded nothing.
+pub fn proxy_index(ticket_id: &[u8; 32], val_count: usize) -> usize {
+    let last4 = &ticket_id[28..32];
+    u32::from_be_bytes([last4[0], last4[1], last4[2], last4[3]]) as usize % val_count
+}
+
+/// A chain's storage at one block: the trie root, and every key it holds.
+///
+/// The root travels with the pairs rather than being fetched separately.
+/// They are read from one storage view in the oracle, and two round trips
+/// could land either side of an import and describe different states -- a
+/// root that does not belong to the keys beside it is the one failure the
+/// N1 state diff cannot detect, because disagreeing is exactly what it
+/// expects to find.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct WireState {
+    pub root: [u8; 32],
+    /// 31-byte key, value.
+    pub keyvals: Vec<(Vec<u8>, Vec<u8>)>,
+}
 
 /// A work item, mirrored.
 ///
@@ -51,6 +93,22 @@ pub struct WireItem {
     /// Imported segment specs, encoded as the engine encodes them.
     pub imports: Vec<Vec<u8>>,
     pub export_count: u16,
+}
+
+/// A ticket an emulated validator proved.
+///
+/// Mirrors `m2_reference::tickets::EmulatedTicket`, which cannot cross the
+/// wire: it is built from a hazmat keystore.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct WireTicket {
+    /// Ring-VRF output, which is the ticket id and its score.
+    pub id: [u8; 32],
+    pub author: u16,
+    pub attempt: u8,
+    /// Ring signature, 32 + 752 bytes.
+    pub proof: Vec<u8>,
+    /// Proxy index over the validator set.
+    pub proxy: u16,
 }
 
 /// Which view of the core assignment a request wants.
@@ -95,6 +153,17 @@ pub enum Message {
         spec_path: String,
         /// Validator indices whose secrets this session holds.
         holds: Vec<u16>,
+        /// The slot to seed the session's virtual clock to.
+        ///
+        /// Sent rather than read, because the oracle's own wall clock is the
+        /// wrong one. The harness is virtual-time and a simulation runs on
+        /// an installed clock that can start anywhere; an oracle reading
+        /// `SystemTime::now()` seeded a session months away from the run
+        /// around it, and the ticket pool -- which files by the epoch of the
+        /// session's next slot -- then filed every ticket under an epoch no
+        /// block would ever ask for. The blocks still came out at the right
+        /// slots and carried nothing, which is a hard thing to see.
+        now_slot: u32,
     } = 16,
     /// A session was opened.
     Opened {
@@ -126,6 +195,142 @@ pub enum Message {
         session: SessionId,
         hash: [u8; 32],
     } = 25,
+    /// The ring context a target epoch's tickets are proved against.
+    TicketCtx(SessionId) = 34,
+    /// Bandersnatch keys of the designated validators, and the entropy.
+    ///
+    /// Entry 2 of the buffer, which is what the reference reads. The
+    /// entries differ by an epoch and the confusion between them has cost
+    /// this project a session before: every emulated ticket comes back
+    /// "invalid ticket signature", and it goes unnoticed because the two
+    /// agree whenever an epoch boundary falls between proving and
+    /// delivery.
+    TicketContext {
+        pks: Vec<[u8; 32]>,
+        entropy: [u8; 32],
+        /// The epoch whose tickets this entropy seals, read from the same
+        /// storage view as the entropy itself.
+        ///
+        /// Sent rather than computed by the caller. A caller has only its own
+        /// clock to compute it from, and the chain head is not the clock: the
+        /// head lags whenever the driver has not authored the current slot,
+        /// which is most of the time and all of the time once the observation
+        /// window has closed. When the two sit on opposite sides of an epoch
+        /// boundary, a context sealing epoch E gets filed under E+1, and
+        /// every ticket checked against it fails with "did not verify against
+        /// that epoch's ring" -- every attempt, of every author, for that one
+        /// epoch, which is what it looked like.
+        epoch: u32,
+    } = 35,
+    /// Prove tickets for one author, or for every author the session holds.
+    ///
+    /// Ring-VRF proving is the harness's single most expensive operation --
+    /// five authors times four attempts runs to tens of seconds -- so the
+    /// request names an author where the caller wants one, rather than
+    /// paying for the whole set and discarding most of it.
+    SignTickets {
+        session: SessionId,
+        /// `None` proves for every author the session's keystore backs.
+        author: Option<u16>,
+        /// Which attempts to prove; `None` is every attempt up to the
+        /// per-validator cap.
+        ///
+        /// Named rather than implied because a fault row wants a ticket for
+        /// an attempt *past* the cap, proved over that attempt. Rewriting an
+        /// honest ticket's attempt afterwards will not do: the attempt is
+        /// part of the signed message, so the edit breaks the proof too and
+        /// the node then has two reasons to refuse it instead of the one
+        /// the row is testing.
+        attempts: Option<Vec<u8>>,
+        pks: Vec<[u8; 32]>,
+        entropy: [u8; 32],
+    } = 36,
+    /// The proved tickets.
+    Tickets(Vec<WireTicket>) = 37,
+    /// Put tickets into the session's pool, as a validator would.
+    SubmitTickets {
+        session: SessionId,
+        /// Encoded `TicketEnvelope`s.
+        envelopes: Vec<Vec<u8>>,
+    } = 38,
+    /// A request that needed no answer succeeded.
+    ///
+    /// Distinct from an empty `Error`: a caller has to be able to tell
+    /// "done" from "the oracle said nothing".
+    Done = 39,
+
+    /// Import a block into `session`, answered with `Imported`.
+    ///
+    /// Distinct from the fuzz protocol's `ImportBlock`, which names no
+    /// session and answers with a bare state root. The N1 lane compares
+    /// three different roots and needs a refusal's wording, none of which
+    /// fits in that answer, and it has to say which chain to import into
+    /// rather than take whichever session happened to open first.
+    ImportInto {
+        session: SessionId,
+        block: Vec<u8>,
+    } = 40,
+    /// What came of an import.
+    ///
+    /// The caller already holds the block, so the quantities it can read
+    /// off the header -- the block's hash, its parent, the prior root the
+    /// header declares -- are not repeated here. What it cannot compute is
+    /// everything below: all of it comes from the engine.
+    Imported {
+        /// True when the block was accepted, which includes a block the
+        /// chain already had.
+        ok: bool,
+        /// The block's posterior state root, when it was accepted.
+        root: Option<[u8; 32]>,
+        /// The reference's *own* posterior root for the block's parent,
+        /// when it knows the parent at all.
+        ///
+        /// Not the root the header declares. The lane compares the two, and
+        /// a header may declare a root for a parent this chain never had.
+        parent_root: Option<[u8; 32]>,
+        /// Why the block was refused, in the engine's words.
+        error: Option<String>,
+    } = 41,
+    /// A state root the chain may or may not have, answering `StateRootOf`.
+    ///
+    /// `None` means the chain does not know that block. Answering `Error`
+    /// for it -- as an earlier handler did -- makes "I have never seen this
+    /// block" indistinguishable from "the engine failed", and a caller that
+    /// cannot tell them apart treats a real failure as an absent block.
+    StateRootIs(Option<[u8; 32]>) = 42,
+    /// A session's full storage state at a block, answering `StateOf`.
+    StateOf {
+        session: SessionId,
+        hash: [u8; 32],
+    } = 43,
+    /// The state, or `None` where the session does not have that block.
+    StateIs(Option<WireState>) = 44,
+
+    /// The dev chain spec's genesis, for a runner to patch into its own.
+    ///
+    /// The bootstrap-service blob that genesis state is built around lives
+    /// inside the node crate, so this is the one thing a workspace without a
+    /// node dependency cannot produce for itself. It is about 280 KB, once
+    /// per run.
+    ///
+    /// Applies the tiny protocol parameters in the oracle before building,
+    /// the same as `Open` with an empty path: the validator set is sized
+    /// from the process-wide globals, so under the `full` default it would
+    /// try to fit 1023 validators into the tiny bound of 6.
+    DevSpec {
+        base_port: u16,
+    } = 45,
+    /// The dev genesis, in the pieces a spec file is written from.
+    DevSpecIs {
+        /// Encoded `Header`.
+        genesis_header: Vec<u8>,
+        /// 31-byte key, value.
+        keyvals: Vec<(Vec<u8>, Vec<u8>)>,
+        /// Encoded `ProtocolParameters`, which a spec file carries so that
+        /// whoever loads it is configured the way it was built.
+        protocol_parameters: Vec<u8>,
+    } = 46,
+
     /// Build a package, optionally against an authorizer no core accepts.
     BuildPackage {
         session: SessionId,
@@ -164,7 +369,15 @@ pub enum Message {
         view: AssignmentView,
     } = 30,
     /// Validators per core, indexed by core.
-    Assignment(Vec<Vec<u16>>) = 31,
+    ///
+    /// `None` for a core the view cannot resolve -- which for the epoch
+    /// view means the slot is outside the two epochs the chain holds, and
+    /// so is every core's answer at that slot. Kept apart from `Some(vec![])`
+    /// on purpose: "nobody holds this core" and "this slot is out of reach"
+    /// read the same if they both arrive empty, and the caller that cannot
+    /// tell them apart aims its submissions at a slot nothing will resolve
+    /// and then reports the node's silence as a failure.
+    Assignment(Vec<Option<Vec<u16>>>) = 31,
     /// The two epoch views and the entropy each shuffles with.
     ///
     /// Diagnostic, and the one message expected to be deleted: it exists
@@ -173,6 +386,11 @@ pub enum Message {
     EpochProbed {
         cached_index: u32,
         head_epoch: u32,
+        /// The entropy the *cached* epoch would shuffle with, which is the
+        /// quantity the two views disagree about. Equal to `entropy_1` means
+        /// the cache is an epoch behind; equal to neither entry means it was
+        /// built from a state the chain has since moved past.
+        cached_entropy: [u8; 32],
         /// Entries 1 and 2 of the best block's entropy buffer.
         entropy_1: [u8; 32],
         entropy_2: [u8; 32],
@@ -275,6 +493,7 @@ mod tests {
             Message::GetState([0x22; 32]),
             Message::Open {
                 spec_path: "/tmp/spec.json".into(),
+                now_slot: 10_711_224,
                 holds: vec![0, 4, 5],
             },
             Message::Opened {
@@ -321,16 +540,82 @@ mod tests {
                 bundle: vec![0x11; 64],
                 guarantee: vec![0x22; 24],
             },
+            Message::TicketCtx(1),
+            Message::TicketContext {
+                pks: vec![[0x01; 32], [0x02; 32]],
+                entropy: [0x03; 32],
+                epoch: 821_955,
+            },
+            Message::SignTickets {
+                session: 1,
+                author: Some(3),
+                attempts: Some(vec![9]),
+                pks: vec![[0x04; 32]],
+                entropy: [0x05; 32],
+            },
+            Message::SignTickets {
+                session: 1,
+                author: None,
+                attempts: None,
+                pks: vec![[0x04; 32]],
+                entropy: [0x05; 32],
+            },
+            Message::Tickets(vec![WireTicket {
+                id: [0x06; 32],
+                author: 3,
+                attempt: 2,
+                proof: vec![0x07; 784],
+                proxy: 4,
+            }]),
+            Message::SubmitTickets {
+                session: 1,
+                envelopes: vec![vec![0x08; 16]],
+            },
+            Message::Done,
+            Message::ImportInto {
+                session: 2,
+                block: vec![0x09; 32],
+            },
+            Message::Imported {
+                ok: true,
+                root: Some([0x0a; 32]),
+                parent_root: Some([0x0b; 32]),
+                error: None,
+            },
+            Message::StateRootIs(Some([0x0c; 32])),
+            Message::StateOf {
+                session: 3,
+                hash: [0x0d; 32],
+            },
+            Message::StateIs(Some(WireState {
+                root: [0x0e; 32],
+                keyvals: vec![(vec![0x0f; 31], vec![0x10, 0x11])],
+            })),
+            Message::StateIs(None),
+            Message::DevSpec { base_port: 40_000 },
+            Message::DevSpecIs {
+                genesis_header: vec![0x12; 8],
+                keyvals: vec![(vec![0x13; 31], vec![0x14, 0x15])],
+                protocol_parameters: vec![0x16; 4],
+            },
+            Message::StateRootIs(None),
+            Message::Imported {
+                ok: false,
+                root: None,
+                parent_root: None,
+                error: Some("obsolete".into()),
+            },
             Message::CoreAssignment {
                 session: 1,
                 slot: 9_780_003,
                 view: AssignmentView::Epoch,
             },
-            Message::Assignment(vec![vec![0, 4, 5], vec![1, 2, 3]]),
+            Message::Assignment(vec![Some(vec![0, 4, 5]), Some(vec![1, 2, 3])]),
             Message::EpochProbe(1),
             Message::EpochProbed {
                 cached_index: 815_083,
                 head_epoch: 815_083,
+                cached_entropy: [0xee; 32],
                 entropy_1: [0xee; 32],
                 entropy_2: [0xbb; 32],
             },

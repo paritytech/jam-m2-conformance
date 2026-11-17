@@ -1,26 +1,42 @@
 #!/usr/bin/env bash
-# Prepares the polkajam node-under-test binary.
+# Prepares the two binaries a real-surface run needs:
 #
-# The workspace depends on polkajam's library crates as ordinary git
-# dependencies (see the root Cargo.toml). This script is only needed to obtain
-# the `polkajam` *binary* used as the NUT.
+#   third_party/bin/polkajam    the node under test
+#   third_party/bin/m2-oracle   the reference oracle the run grades against
 #
-# The revision is read from Cargo.toml rather than repeated here. The oracle
-# grades the node under test, so unless a run deliberately sets out to compare
-# revisions, the two must be the same engine -- and a second copy of the
-# revision is a second thing to forget to update.
+# Both are built from one polkajam revision. That is the whole basis for
+# trusting a verdict: the oracle's answers are only a standard to grade the
+# node by if the two are the same engine. The oracle states the revision it
+# was built from in its handshake, and the runner checks it.
 #
-# The checkout lives in third_party/ which is gitignored: nothing from polkajam
+# The revision is read from oracle/Cargo.toml rather than repeated here --
+# a second copy is a second thing to forget to update. The oracle's manifest
+# is the source rather than the workspace root's because it is the one that
+# survives: the workspace is on its way to having no polkajam dependency at
+# all, and the oracle will still have one.
+#
+# Everything lives in third_party/ which is gitignored: nothing from polkajam
 # is committed to this repository.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 REPO=${POLKAJAM_REPO:-ssh://git@github.com/paritytech/polkajam.git}
 DEST=third_party/polkajam
+BIN=third_party/bin
 
-PINNED=$(sed -n 's/^jam-node = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml | head -1)
+PINNED=$(sed -n 's/^jam-node = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' oracle/Cargo.toml | head -1)
 if [ -z "$PINNED" ]; then
-    echo "could not read the polkajam revision from Cargo.toml" >&2
+    echo "could not read the polkajam revision from oracle/Cargo.toml" >&2
+    exit 1
+fi
+
+# While the workspace still carries its own polkajam dependencies, the two
+# pins have to agree: the reference would otherwise be built from one engine
+# and the oracle from another, and nothing downstream would notice.
+WORKSPACE_PIN=$(sed -n 's/^jam-node = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml | head -1)
+if [ -n "$WORKSPACE_PIN" ] && [ "$WORKSPACE_PIN" != "$PINNED" ]; then
+    echo "the workspace pins polkajam at ${WORKSPACE_PIN} and oracle/Cargo.toml" >&2
+    echo "pins ${PINNED}. Re-pin both before building." >&2
     exit 1
 fi
 
@@ -70,7 +86,28 @@ fi
 
 cargo build --release --manifest-path "$DEST/Cargo.toml" --bin polkajam
 
+# The oracle is outside the workspace and has its own lockfile and target
+# directory, so it is a separate build. It is pinned to $PINNED by its own
+# manifest; the agreement with the checkout above was already checked.
 echo
-echo "NUT binary: $DEST/target/release/polkajam"
+echo "building the oracle at $PINNED"
+cargo build --release --manifest-path oracle/Cargo.toml --bin m2-oracle
+
+mkdir -p "$BIN"
+cp -f "$DEST/target/release/polkajam" "$BIN/polkajam"
+cp -f oracle/target/release/m2-oracle "$BIN/m2-oracle"
+
+# Fail here rather than three hours into a run: a binary that cannot say
+# which revision it is cannot be trusted to grade one.
+STAMPED=$("$BIN/m2-oracle" --revision)
+if [ "$STAMPED" != "$PINNED" ]; then
+    echo "the oracle reports revision ${STAMPED}, not the pinned ${PINNED}" >&2
+    exit 1
+fi
+
+echo
+echo "both binaries are in $BIN, built from $PINNED:"
+echo "  $BIN/polkajam"
+echo "  $BIN/m2-oracle"
 echo "add it to PATH before a real-surface run:"
-echo "  export PATH=\"\$PWD/$DEST/target/release:\$PATH\""
+echo "  export PATH=\"\$PWD/$BIN:\$PATH\""

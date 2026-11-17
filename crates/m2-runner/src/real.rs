@@ -73,7 +73,12 @@ pub(crate) fn generate_tickets(
     ref_chain: &RefChain,
 ) -> Result<(TicketCtx, Vec<EmulatedTicket>, u32), m2_reference::chain::ChainError> {
     let ticket_ctx = ref_chain.ticket_ctx()?;
-    let target_epoch = ref_chain.next_slot() / jam_types::epoch_period() + 1;
+    // The epoch the context itself names, not one derived from the clock
+    // here. These were computed separately and could disagree: the context
+    // comes from the chain head and the clock does not, so a read taken while
+    // the two straddled an epoch boundary labelled the tickets with the epoch
+    // after the one they were sealed for.
+    let target_epoch = ticket_ctx.epoch;
     let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
     Ok((ticket_ctx, tickets, target_epoch))
 }
@@ -147,7 +152,7 @@ pub(crate) fn build_real_run_ctx(
     data: &RealRunData,
     trace: &Trace,
     n0: m2_scenario::scenarios::n0::N0Ctx,
-) -> RunCtx {
+) -> Result<RunCtx, m2_reference::chain::ChainError> {
     let nut_blocks = lock(&data.nut_blocks);
     let t = std::time::Instant::now();
     let contexts = ticket_contexts(data);
@@ -171,7 +176,7 @@ pub(crate) fn build_real_run_ctx(
         &nut_blocks,
         &lock(&data.deliveries),
         own_ticket_ids.clone(),
-    );
+    )?;
     crate::run::phase("ctx.build_n1", t);
     let t = std::time::Instant::now();
     let n2 = build_n2_ctx(
@@ -227,12 +232,12 @@ pub(crate) fn build_real_run_ctx(
         authored_slots: nut_blocks.iter().map(|n| n.block.header.slot).collect(),
     };
     crate::run::phase("ctx.build_n3", t);
-    RunCtx {
+    Ok(RunCtx {
         n0,
         n1: Some(n1),
         n2: Some(n2),
         n3: Some(n3),
-    }
+    })
 }
 
 /// Every ticket context the harness can verify a proof against, by the epoch
@@ -249,9 +254,14 @@ pub(crate) fn build_real_run_ctx(
 fn ticket_contexts(data: &RealRunData) -> TicketContexts {
     let mut by_epoch = vec![(data.target_epoch, data.ticket_ctx.clone())];
     by_epoch.extend(lock(&data.epoch_contexts).iter().cloned());
-    let late_epoch = data.ref_chain.next_slot() / jam_types::epoch_period() + 1;
+    // A last read, for an epoch the driver never reached -- it stops when the
+    // observation window closes while the node may keep generating. Filed
+    // under the epoch the context names: by this point the driver has been
+    // aborted for a while, so the head is further behind the clock here than
+    // anywhere else in the run, and a clock-derived label is most wrong
+    // exactly where it was being used.
     if let Ok(late) = data.ref_chain.ticket_ctx() {
-        by_epoch.push((late_epoch, late));
+        by_epoch.push((late.epoch, late));
     }
     // First entry per epoch wins, and the generation-time context leads, so a
     // later read never displaces the one the emulator's own tickets were
@@ -275,6 +285,16 @@ impl TicketContexts {
     ///
     /// Public for the same reason [`build_n1_ctx`] is: a simulated node is
     /// graded through the harness's own trace-to-facts path, not a copy of it.
+    ///
+    /// The epoch here is the caller's to choose, and a self-test's need not
+    /// be [`TicketCtx::epoch`]. A live run's must be -- see
+    /// [`ticket_contexts`] -- but a simulated node whose chain never leaves
+    /// genesis seals its tickets with genesis entropy while the virtual clock
+    /// is hundreds of thousands of epochs along, and the number is then only
+    /// a key: the lottery and the grading use the same context, so they agree
+    /// whatever it is called. Asserting the live-run invariant here fails
+    /// that setup for no gain; `the_context_names_the_epoch_its_entropy_seals`
+    /// in `m2-reference` pins it where it means something.
     pub fn from_epochs(by_epoch: Vec<(u32, TicketCtx)>) -> Self {
         Self { by_epoch }
     }
@@ -311,8 +331,8 @@ pub fn build_n1_ctx(
     nut_blocks: &[NutBlock],
     deliveries: &[DeliveredTicket],
     own_ticket_ids: Vec<[u8; 32]>,
-) -> N1Ctx {
-    let chain = ref_chain.chain_blocks();
+) -> Result<N1Ctx, m2_reference::chain::ChainError> {
+    let chain = ref_chain.chain_blocks()?;
     let reference_best = chain
         .last()
         .map(|block| block.header.hash().0)
@@ -326,8 +346,8 @@ pub fn build_n1_ctx(
     let imports = nut_blocks
         .iter()
         .map(|nut| {
-            let outcome = ref_chain.import_nut_block(&nut.block);
-            ImportFact {
+            let outcome = ref_chain.import_nut_block(&nut.block)?;
+            Ok(ImportFact {
                 header_root: outcome.header_root,
                 parent: outcome.parent,
                 declared_parent_root: outcome.declared_parent_root,
@@ -335,10 +355,10 @@ pub fn build_n1_ctx(
                 ok: outcome.ok,
                 root: outcome.root,
                 error: outcome.error,
-            }
+            })
         })
-        .collect();
-    N1Ctx {
+        .collect::<Result<Vec<_>, m2_reference::chain::ChainError>>()?;
+    Ok(N1Ctx {
         reference_best,
         reference_block_hashes,
         reference_chain,
@@ -350,7 +370,7 @@ pub fn build_n1_ctx(
         epoch_period: jam_types::epoch_period(),
         epoch_tail_start: jam_types::epoch_tail_start(),
         max_tickets_per_block: jam_types::max_tickets_per_block(),
-    }
+    })
 }
 
 /// N2 facts: the emulator's ticket plan plus every ticket the NUT distributed
@@ -577,7 +597,7 @@ mod tests {
 
     #[test]
     fn run_collect_nut_tickets() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let ticket = &tickets[0];
@@ -625,7 +645,7 @@ mod tests {
     /// node's ticket as a forged one.
     #[test]
     fn run_nut_tickets_for_an_uncovered_epoch_are_unjudged() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let ticket = &tickets[0];
@@ -653,7 +673,7 @@ mod tests {
         use jam_types::HeaderHash;
         use jamnp_s::codec::up0::Final;
 
-        let chain = RefChain::tiny(0)?;
+        let chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let start = chain.next_slot();
         let block = (start..start + 24)
             .find_map(|slot| chain.author_block(slot).ok().flatten())
@@ -695,7 +715,7 @@ mod tests {
     /// sent (`Rx`) must never be counted as NUT behaviour.
     #[test]
     fn run_collect_nut_tickets_ignores_harness_sent_frames() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let nut_ticket = &tickets[0];
@@ -739,7 +759,7 @@ mod tests {
 
     #[test]
     fn run_build_n1_from_nut_blocks() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let start = ref_chain.next_slot();
         let mut authored = None;
         for slot in start..start + 12 {
@@ -754,7 +774,7 @@ mod tests {
             block: block.clone(),
             announced_wall_ms: 1000,
         }];
-        let n1 = build_n1_ctx(&ref_chain, &nut_blocks, &[], Vec::new());
+        let n1 = build_n1_ctx(&ref_chain, &nut_blocks, &[], Vec::new())?;
 
         assert_eq!(n1.imports.len(), 1, "one import per NUT block");
         assert!(n1.imports[0].ok, "a re-authored block imports OK");
@@ -769,7 +789,7 @@ mod tests {
         assert_eq!(n1.slot_period_ms, SLOT_PERIOD_MS);
         assert_eq!(
             n1.reference_block_hashes.len(),
-            ref_chain.chain_blocks().len(),
+            ref_chain.chain_blocks()?.len(),
             "reference block hashes cover the whole chain"
         );
         assert_eq!(
@@ -794,7 +814,7 @@ mod tests {
     /// peer's tickets; every ticket must land in exactly one peer's plan.
     #[test]
     fn run_plans_split_by_author() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let period = jam_types::epoch_period();
@@ -826,7 +846,7 @@ mod tests {
 
     #[test]
     fn run_plan_maps_to_emu_tickets() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let nut_index = 5;
@@ -887,7 +907,7 @@ mod tests {
     /// used to key on picks out two entries at once.
     #[test]
     fn deliveries_are_matched_by_plan_index_not_by_ticket_id() -> Result<(), ChainError> {
-        let ref_chain = RefChain::tiny(0)?;
+        let ref_chain = RefChain::tiny(&m2_reference::oracle::Oracle::for_tests(), 0)?;
         let ticket_ctx = ref_chain.ticket_ctx()?;
         let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
         let plan = plan_tickets(&tickets, 5, 1001, 84);

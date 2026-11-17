@@ -284,3 +284,108 @@ Worth establishing before this is called a defect:
    out one slot after a run's own submissions, so the node may still be busy
    with one of those.
 3. Seen once. Reproduce before filing.
+
+## 6. crates.io 0.1.29 is not the pinned 0.1.29, and the difference is on the wire
+
+**Status:** open, and it settles a planned step rather than describing node
+behaviour. Found 2026-11-16, while moving the workspace off its git
+dependencies.
+
+The polkajam split's last step was to stop depending on polkajam by git and
+take `jam-types` and `jam-std-common` from crates.io instead. Both are
+published at **0.1.29**, which is the workspace version at the pinned
+revision `e3d216c2`, so the swap looked like a formality.
+
+They are different code. Unpacking the published crates and diffing them
+against the checkout at the pin:
+
+```
+jam-std-common/src/state.rs
+  #[derive(Clone, Encode, Decode, Debug, Eq, PartialEq, Default)]
+  pub struct ServiceActivityRecord {
+-     pub provided_count: u32,     // the pin
++     pub provided_count: u16,     // crates.io 0.1.29
+-     pub provided_size: u64,
++     pub provided_size: u32,
+-     pub extrinsic_size: u64,
++     pub extrinsic_size: u32,
+```
+
+`ServiceActivityRecord` derives `Encode` and `Decode`, so those three widths
+are a **wire format**, and that struct is in the state the N1 lane diffs. A
+harness built against the published crate and an oracle built against the pin
+would disagree about the bytes of a state value while agreeing about
+everything else -- which is the failure this whole split exists to make
+impossible, reintroduced at the last step.
+
+The two are not simply older and newer, either. The published crate has a
+`ProtocolParameters::large()` the pin does not; the pin has a
+`max_refine_gas * core_count` overflow check and a `bundle_size_constants_match_gp`
+test the published crate does not. They are points on different lines, both
+calling themselves 0.1.29.
+
+**What this means.** The version number is not a safe way to match a
+published crate to a revision, because polkajam publishes 0.1.x from a moving
+trunk and a crates.io version is immutable once published while the trunk is
+not. So:
+
+- `jam-types` and `jam-std-common` stay git dependencies on the pin. The
+  rest of phase 4 -- dropping `jam-node` and `polkajam-fuzz` and the
+  `jam-node` profile override -- stands, and is what the phase was for: the
+  workspace no longer compiles the node.
+- A re-pin must check this again rather than assume the published version
+  caught up. The check is cheap: unpack
+  `~/.cargo/registry/cache/*/jam-types-<v>.crate` and diff its `src` against
+  the checkout under `~/.cargo/git/checkouts/polkajam-*/<short rev>/crates/`.
+- Worth asking upstream whether a published version can be tagged, so a
+  revision and a release can be matched without diffing them.
+
+## 7. The harness and the oracle resolved different codec versions
+
+**Status:** fixed 2026-11-17, and worth a guard it does not yet have.
+
+`jam-codec` is the codec both sides of the oracle socket encode and decode
+with. The workspace and `oracle/` are separate cargo trees with separate
+lockfiles, and both asked for `"0.1.1"` -- a caret requirement. They resolved
+differently: the workspace to **0.1.1**, the oracle to **0.1.2**.
+
+Encoding is identical. A probe over 2,199 values -- every power-of-two
+boundary from 2^0 to 2^63, each ±1, plus a pseudorandom spread -- produced
+byte-identical output from both. On that evidence alone the skew looks
+cosmetic, and this finding nearly said so.
+
+Decoding is not identical. polkajam's own `8d9495219` ("Non-canonical compact
+lenghts are rejected", #1392) names the change:
+
+```
+input           0.1.1                  0.1.2
+80 00           Ok(0)                  Err(Codec error)
+c0 00 00 00     Ok(0), 1 byte left     Err(Codec error)
+80 01           Ok(1)                  Err(Codec error)
+00  canonical   Ok(0)                  Ok(0)
+```
+
+0.1.1 accepts a compact integer written in more bytes than it needs; 0.1.2
+rejects it. The harness decodes what the node under test sends, so on 0.1.1
+the harness was **laxer than the node it grades**: a node emitting a
+non-canonical length would have been accepted here while polkajam itself
+rejects it. That is a missed detection rather than a wrong verdict, which is
+the gentler of the two directions, but it is the wrong one for a conformance
+harness.
+
+Both trees are pinned to 0.1.2 now and the lockfiles agree.
+
+**The guard that is still missing.** Nothing checks that they agree. Two
+independently-resolved lockfiles can drift again on the next `cargo update`,
+and the symptom would be a decoder disagreement across the socket with no
+error anywhere -- the same shape as findings §6 and as the two defects the
+oracle split introduced. DESIGN §8 states the rule this breaks: anything both
+sides must compute identically belongs in one place. The codec is exactly
+that, and it cannot live in `m2-oracle-proto` because each tree resolves its
+own copy.
+
+The cheap version: each side's `build.rs` reads the resolved `jam-codec`
+version out of its own `Cargo.lock` -- the oracle's already reads its manifest
+for the polkajam revision -- and the handshake compares them, the way it
+already compares the protocol version. About fifteen lines, and it turns a
+silent divergence into a refusal to start.

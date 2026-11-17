@@ -1036,7 +1036,7 @@ have been failed for it.
 ## 6. Reproducing these results
 
 ```sh
-# Build the node under test from the pinned revision.
+# Build the node under test and the oracle from the pinned revision.
 ./scripts/prepare-nut.sh
 
 # Harness checks.
@@ -1049,15 +1049,15 @@ cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/m2-dry
 
 # Live surface: exit 1. Two node defects remain (§3); every harness-induced
 # failure was closed on 2026-10-29 (§3.1) and 2026-10-30 (§3.2).
-PATH="$PWD/third_party/polkajam/target/release:$PATH" \
+PATH="$PWD/third_party/bin:$PATH" \
 cargo run -p m2-runner -- --seed 1 --validator-index 5 --base-port 40000 \
   --preset polkajam --session-dir sessions/m0-verify \
   --startup-timeout 60 --observe-secs 90
 ```
 
-The polkajam revision is pinned in the root `Cargo.toml` and read from there by
-`scripts/prepare-nut.sh`, so the node under test and the engine that grades it are the same
-build.
+The polkajam revision is pinned in `oracle/Cargo.toml` and read from there by
+`scripts/prepare-nut.sh`, which also checks it against the workspace's pin, so the node
+under test and the engine that grades it are the same build.
 
 ---
 

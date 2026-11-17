@@ -6,7 +6,8 @@
 //! does the work; what this module adds is a surface that does not leak it,
 //! so a lane cannot reach past the oracle into the engine.
 
-use jam_types::CoreIndex;
+use jam_types::{CoreIndex, Decode};
+use m2_oracle_proto::{AssignmentView, Message, WireItem};
 
 use crate::chain::{ChainError, RefChain};
 
@@ -72,36 +73,9 @@ pub struct ScheduledSubmission {
     pub co_guarantors: Vec<u16>,
 }
 
-/// The epoch info `slot` belongs to, out of the two the chain holds.
-///
-/// `EpochInfo::core_assignments` requires the slot to be in that epoch, and
-/// the chain only ever holds the current one and the next. Asking the current
-/// epoch about a slot in the next gives an assignment for neither: a run
-/// whose reference head sat in epoch 815091 while the submission slot had
-/// crossed into 815092 graded the node against exactly that, and the sharing
-/// row failed for a split the node never made.
-///
-/// `None` for anything outside those two, which is the honest answer rather
-/// than a shuffle computed from the wrong entropy.
-fn epoch_info_for<'a, E>(
-    slot: u32,
-    current_index: u32,
-    current: &'a E,
-    next: &'a E,
-) -> Option<&'a E> {
-    let slot_epoch = slot / jam_types::epoch_period();
-    if slot_epoch == current_index {
-        Some(current)
-    } else if slot_epoch == current_index + 1 {
-        Some(next)
-    } else {
-        None
-    }
-}
-
 /// The smallest work item that refines: no payload, no imports, no
 /// extrinsics.
-pub fn trivial_work_item() -> jam_node::hazmat::BuildItem {
+pub fn trivial_work_item() -> WireItem {
     work_item_with_payload(Vec::new())
 }
 
@@ -112,16 +86,16 @@ pub fn trivial_work_item() -> jam_node::hazmat::BuildItem {
 /// the same template. Given the same payload they are byte-identical, and a
 /// node that has noted one refuses the other as already reported -- which
 /// reads as the submission being rejected, not as a duplicate.
-pub fn work_item_with_payload(payload: Vec<u8>) -> jam_node::hazmat::BuildItem {
-    jam_node::hazmat::BuildItem::new(
-        jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-        jam_types::WorkPayload(payload),
-        jam_types::max_refine_gas(),
-        jam_types::max_accumulate_gas(),
-        Vec::new(),
-        Vec::new(),
-        0,
-    )
+pub fn work_item_with_payload(payload: Vec<u8>) -> WireItem {
+    WireItem {
+        service: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+        payload,
+        ref_gas: jam_types::max_refine_gas(),
+        acc_gas: jam_types::max_accumulate_gas(),
+        xts: Vec::new(),
+        imports: Vec::new(),
+        export_count: 0,
+    }
 }
 
 /// Payload that carries a package past the CE 133 initial-message cap.
@@ -239,7 +213,7 @@ impl RefChain {
         slot: u32,
         fault: Option<ShareFault>,
     ) -> Result<Option<ScheduledShare>, ChainError> {
-        let Some(core) = self.core_for_in_epoch(nut, slot) else {
+        let Some(core) = self.core_for_in_epoch(nut, slot)? else {
             return Ok(None);
         };
         let work = self.guarantee_work(
@@ -404,7 +378,7 @@ impl RefChain {
         };
         let work = match schedule.fault {
             Some(SubmissionFault::Unauthorized) => {
-                let built = self.build_unauthorized_package(items);
+                let built = self.build_unauthorized_package(items)?;
                 // An unauthorized package is never refined: the node is
                 // expected to take the submission and then not share it, so
                 // the harness needs the package and no report at all.
@@ -442,12 +416,8 @@ impl RefChain {
     }
 
     /// Build `items` into an authorized package for a builder to submit.
-    pub fn build_work_package(&self, items: Vec<jam_node::hazmat::BuildItem>) -> BuiltPackage {
-        let (package, extrinsics) = self.harness().build_package(items);
-        BuiltPackage {
-            package,
-            extrinsics,
-        }
+    pub fn build_work_package(&self, items: Vec<WireItem>) -> Result<BuiltPackage, ChainError> {
+        self.build_package(items, true)
     }
 
     /// The same package, against an authorizer no core will accept.
@@ -459,17 +429,31 @@ impl RefChain {
     /// parse anything.
     pub fn build_unauthorized_package(
         &self,
-        items: Vec<jam_node::hazmat::BuildItem>,
-    ) -> BuiltPackage {
-        let (package, extrinsics) = self.harness().build_package_with_auth(
+        items: Vec<WireItem>,
+    ) -> Result<BuiltPackage, ChainError> {
+        self.build_package(items, false)
+    }
+
+    fn build_package(
+        &self,
+        items: Vec<WireItem>,
+        authorized: bool,
+    ) -> Result<BuiltPackage, ChainError> {
+        match self.ask(Message::BuildPackage {
+            session: self.session(),
             items,
-            jam_types::Authorizer::any(),
-            jam_node::DEV_BOOTSTRAP_SERVICE_ID,
-            jam_types::Authorization::new(),
-        );
-        BuiltPackage {
-            package,
-            extrinsics,
+            authorized,
+        })? {
+            Message::Package {
+                package,
+                extrinsics,
+            } => Ok(BuiltPackage {
+                package: decode(&package, "a work package")?,
+                extrinsics,
+            }),
+            other => Err(ChainError::Oracle(format!(
+                "BuildPackage answered {other:?}"
+            ))),
         }
     }
 
@@ -487,7 +471,12 @@ impl RefChain {
     ///
     /// `None` if no slot within one rotation of `from` qualifies, which can
     /// only happen if `margin` is at least the rotation period.
-    pub fn submission_slot_for(&self, nut: u16, from: u32, margin: u32) -> Option<SubmissionPlan> {
+    pub fn submission_slot_for(
+        &self,
+        nut: u16,
+        from: u32,
+        margin: u32,
+    ) -> Result<Option<SubmissionPlan>, ChainError> {
         let rotation = jam_types::rotation_period();
         let epoch = jam_types::epoch_period();
         for slot in from..from.saturating_add(rotation) {
@@ -513,22 +502,22 @@ impl RefChain {
                 // cannot answer for is not a reason to give up on the later
                 // ones. Returning here made one unanswerable slot look like
                 // a rotation with no usable slot in it at all.
-                let Some(core) = self.core_for_in_epoch(nut, slot) else {
+                let Some(core) = self.core_for_in_epoch(nut, slot)? else {
                     continue;
                 };
-                return Some(SubmissionPlan {
+                return Ok(Some(SubmissionPlan {
                     slot,
                     core,
                     co_guarantors: self
-                        .guarantors_for_in_epoch(core, slot)
+                        .guarantors_for_in_epoch(core, slot)?
                         .unwrap_or_default()
                         .into_iter()
                         .filter(|v| *v != nut)
                         .collect(),
-                });
+                }));
             }
         }
-        None
+        Ok(None)
     }
 
     /// A fully reference-guaranteed report for a core the NUT does *not*
@@ -544,11 +533,11 @@ impl RefChain {
     /// is more than one.
     pub fn report_to_distribute(
         &self,
-        items: Vec<jam_node::hazmat::BuildItem>,
+        items: Vec<WireItem>,
         nut: u16,
         slot: u32,
     ) -> Result<Option<ScheduledReport>, ChainError> {
-        let Some(nut_core) = self.core_for_in_epoch(nut, slot) else {
+        let Some(nut_core) = self.core_for_in_epoch(nut, slot)? else {
             return Ok(None);
         };
         let cores = jam_types::core_count();
@@ -563,7 +552,9 @@ impl RefChain {
         // assignment: with the two views apart it answered every distributed
         // report with `Invalid guarantee: Wrong core assignment`, in those
         // words. The same split, and the same fix, as the CE 134 answer.
-        let mut cohort = self.guarantors_for_in_epoch(core, slot).unwrap_or_default();
+        let mut cohort = self
+            .guarantors_for_in_epoch(core, slot)?
+            .unwrap_or_default();
         // Strictly ascending, which is what a guarantee's signatures must be.
         cohort.sort_unstable();
         cohort.dedup();
@@ -598,33 +589,42 @@ impl RefChain {
     /// adopting it would have no way to pose "guaranteed but never included".
     pub fn guarantee_work(
         &self,
-        items: Vec<jam_node::hazmat::BuildItem>,
+        items: Vec<WireItem>,
         core: CoreIndex,
     ) -> Result<GuaranteedWork, ChainError> {
-        let mut harness = self.harness();
-        let (package, xts) = harness.build_package(items);
-        let wire = package.clone();
-        let xts: Vec<Vec<u8>> = xts.into_iter().collect();
-        let (report, bundle, _) = harness
-            .try_compose_report(package, &xts, core)
-            .map_err(|e| ChainError::Chain(format!("compose report: {e}")))?;
-        let guarantee = harness
-            .try_compose_guarantee(report.clone())
-            .map_err(|e| ChainError::Chain(format!("compose guarantee: {e}")))?;
-        Ok(GuaranteedWork {
-            package: wire,
-            extrinsics: xts,
-            report,
-            bundle: bundle.to_vec(),
-            guarantee,
-        })
+        // One request for all four artefacts, because they are one
+        // computation. Building the package in a separate round trip would
+        // re-read the chain head and could refine a different package than
+        // the one handed back.
+        match self.ask(Message::GuaranteeWork {
+            session: self.session(),
+            items,
+            core,
+        })? {
+            Message::GuaranteedWork {
+                package,
+                extrinsics,
+                report,
+                bundle,
+                guarantee,
+            } => Ok(GuaranteedWork {
+                package: decode(&package, "a work package")?,
+                extrinsics,
+                report: decode(&report, "a work report")?,
+                bundle,
+                guarantee: decode(&guarantee, "a guarantee")?,
+            }),
+            other => Err(ChainError::Oracle(format!(
+                "GuaranteeWork answered {other:?}"
+            ))),
+        }
     }
 
     /// The validators assigned to `core` at `slot`.
     ///
     /// The assignment is a shuffle of validators across cores by the epoch's
-    /// entropy, rotated every `rotation_period` slots. The harness reads it
-    /// off the engine rather than recomputing it, so the rule it grades
+    /// entropy, rotated every `rotation_period` slots. The oracle reads it
+    /// off the engine rather than recomputing it, so the rule a lane grades
     /// against is the one the engine applies.
     ///
     /// Read from the *storage* for `slot`, which is the source
@@ -634,17 +634,16 @@ impl RefChain {
     /// soon as the slot is outside the epoch the chain happens to be in, and
     /// a guarantee's signers then look like validators that do not hold the
     /// core.
-    ///
-    /// Not factored into a shared helper: polkajam's `CoreAssignments` lives
-    /// behind a private module, so the value can be used but its type cannot
-    /// be named, and a helper returning one has nothing to return it as.
-    pub fn guarantors_for(&self, core: CoreIndex, slot: u32) -> Option<Vec<u16>> {
-        self.harness()
-            .storage(None)
-            .core_assignments_for(slot)
-            .ok()?
-            .core_to_vals(core)
-            .map(|vals| vals.to_vec())
+    pub fn guarantors_for(
+        &self,
+        core: CoreIndex,
+        slot: u32,
+    ) -> Result<Option<Vec<u16>>, ChainError> {
+        Ok(self
+            .assignment(AssignmentView::Storage, slot)?
+            .get(core as usize)
+            .cloned()
+            .flatten())
     }
 
     /// The epoch index the chain's cached epoch view currently names, and the
@@ -655,12 +654,9 @@ impl RefChain {
     /// `core_assignments_for` reads the state. When the cache lags, the
     /// "current" epoch is the previous one and its shuffle is a different
     /// shuffle.
-    pub fn epoch_views(&self) -> (u32, u32) {
-        let harness = self.harness();
-        let jam = harness.chain();
-        let (index, _current, _next) = jam.current_and_next_epochs();
-        let head = jam.best_block().1;
-        (index, head / jam_types::epoch_period())
+    pub fn epoch_views(&self) -> Result<(u32, u32), ChainError> {
+        let (cached, head, _, _, _) = self.epoch_probe()?;
+        Ok((cached, head))
     }
 
     /// The entropy each view would shuffle with: the cached epoch's, and
@@ -669,18 +665,23 @@ impl RefChain {
     /// The on-chain rule shuffles with entry 2 (`exec/reports.rs`), so a
     /// cached value equal to entry 1 is an epoch out, and one equal to
     /// neither came from a state the chain has moved past.
-    pub fn assignment_entropy(&self) -> (String, String, String) {
-        let harness = self.harness();
-        let jam = harness.chain();
-        let (_index, current, _next) = jam.current_and_next_epochs();
+    pub fn assignment_entropy(&self) -> Result<(String, String, String), ChainError> {
+        let (_, _, cached, one, two) = self.epoch_probe()?;
         let short =
             |bytes: &[u8]| -> String { bytes[..8].iter().map(|b| format!("{b:02x}")).collect() };
-        let cached = short(&current.core_assignment_entropy.0);
-        let storage = harness.storage(None);
-        let buffer = storage
-            .entropy()
-            .expect("the best block has an entropy buffer");
-        (cached, short(&buffer[1].0), short(&buffer[2].0))
+        Ok((short(&cached), short(&one), short(&two)))
+    }
+
+    /// Entries 1 and 2 of the best block's entropy buffer, full width.
+    ///
+    /// Entry 2 is what a submitted ticket is checked against and what
+    /// [`RefChain::ticket_ctx`](crate::tickets) seals with; entry 1 is what
+    /// entry 2 becomes after the next epoch change. They agree whenever an
+    /// epoch boundary falls between proving and delivery, which is why
+    /// sealing with the wrong one went unnoticed for as long as it did.
+    pub fn entropy_entries(&self) -> Result<([u8; 32], [u8; 32]), ChainError> {
+        let (_, _, _, one, two) = self.epoch_probe()?;
+        Ok((one, two))
     }
 
     /// The validators assigned to `core` at `slot`, as the *epoch view*
@@ -697,14 +698,16 @@ impl RefChain {
     /// same epoch. Where they do not, one of the two is being read from the
     /// wrong state, and the lane needs to know which before it grades a node
     /// against either.
-    pub fn guarantors_for_in_epoch(&self, core: CoreIndex, slot: u32) -> Option<Vec<u16>> {
-        let harness = self.harness();
-        let jam = harness.chain();
-        let (index, current, next) = jam.current_and_next_epochs();
-        epoch_info_for(slot, index, &current, &next)?
-            .core_assignments(slot)
-            .core_to_vals(core)
-            .map(|vals| vals.to_vec())
+    pub fn guarantors_for_in_epoch(
+        &self,
+        core: CoreIndex,
+        slot: u32,
+    ) -> Result<Option<Vec<u16>>, ChainError> {
+        Ok(self
+            .assignment(AssignmentView::Epoch, slot)?
+            .get(core as usize)
+            .cloned()
+            .flatten())
     }
 
     /// The core validator `index` guarantees at `slot`, as the epoch view
@@ -713,21 +716,92 @@ impl RefChain {
     /// The view that decides whether the node considers itself a guarantor
     /// of the core a package is addressed to, so it is the one a submission
     /// is aimed with.
-    pub fn core_for_in_epoch(&self, validator: u16, slot: u32) -> Option<CoreIndex> {
-        let harness = self.harness();
-        let jam = harness.chain();
-        let (index, current, next) = jam.current_and_next_epochs();
-        epoch_info_for(slot, index, &current, &next)?
-            .core_assignments(slot)
-            .val_to_core(validator)
+    pub fn core_for_in_epoch(
+        &self,
+        validator: u16,
+        slot: u32,
+    ) -> Result<Option<CoreIndex>, ChainError> {
+        Ok(core_holding(
+            &self.assignment(AssignmentView::Epoch, slot)?,
+            validator,
+        ))
     }
 
     /// The core validator `index` guarantees at `slot`.
-    pub fn core_for(&self, index: u16, slot: u32) -> Option<CoreIndex> {
-        self.harness()
-            .storage(None)
-            .core_assignments_for(slot)
-            .ok()?
-            .val_to_core(index)
+    pub fn core_for(&self, index: u16, slot: u32) -> Result<Option<CoreIndex>, ChainError> {
+        Ok(core_holding(
+            &self.assignment(AssignmentView::Storage, slot)?,
+            index,
+        ))
     }
+
+    /// The whole core-to-validators table at `slot` under one view.
+    ///
+    /// One request rather than one per core: the four public views above are
+    /// all slices of this table, and a round trip each would put four on the
+    /// slot-critical path.
+    fn assignment(
+        &self,
+        view: AssignmentView,
+        slot: u32,
+    ) -> Result<Vec<Option<Vec<u16>>>, ChainError> {
+        match self.ask(Message::CoreAssignment {
+            session: self.session(),
+            slot,
+            view,
+        })? {
+            Message::Assignment(table) => Ok(table),
+            other => Err(ChainError::Oracle(format!(
+                "CoreAssignment answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `(cached epoch, head epoch, cached entropy, entry 1, entry 2)`.
+    fn epoch_probe(&self) -> Result<(u32, u32, [u8; 32], [u8; 32], [u8; 32]), ChainError> {
+        match self.ask(Message::EpochProbe(self.session()))? {
+            Message::EpochProbed {
+                cached_index,
+                head_epoch,
+                cached_entropy,
+                entropy_1,
+                entropy_2,
+            } => Ok((
+                cached_index,
+                head_epoch,
+                cached_entropy,
+                entropy_1,
+                entropy_2,
+            )),
+            other => Err(ChainError::Oracle(format!("EpochProbe answered {other:?}"))),
+        }
+    }
+}
+
+/// The core whose cohort contains `validator`, if the table resolves at all.
+fn core_holding(table: &[Option<Vec<u16>>], validator: u16) -> Option<CoreIndex> {
+    table.iter().enumerate().find_map(|(core, cohort)| {
+        cohort
+            .as_ref()
+            .filter(|vals| vals.contains(&validator))
+            .map(|_| core as CoreIndex)
+    })
+}
+
+/// One engine value, decoded from the bytes the oracle sent.
+///
+/// Trailing bytes are a failure rather than something to ignore: the oracle
+/// encodes exactly one value per field, so anything left over means the two
+/// sides disagree about the encoding and every field read out of it is
+/// suspect.
+fn decode<T: Decode>(encoded: &[u8], what: &str) -> Result<T, ChainError> {
+    let mut cursor = encoded;
+    let value = T::decode(&mut cursor).map_err(|e| ChainError::Oracle(format!("{what}: {e}")))?;
+    if !cursor.is_empty() {
+        return Err(ChainError::Oracle(format!(
+            "{what} came back with {} trailing bytes",
+            cursor.len()
+        )));
+    }
+    Ok(value)
 }

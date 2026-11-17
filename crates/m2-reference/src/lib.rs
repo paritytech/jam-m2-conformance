@@ -13,14 +13,16 @@
 //! is [`reports`], which N3 puts on CE 133, CE 134 and CE 135.
 //!
 //! **Not here yet.** DESIGN §3 also describes this crate as signing
-//! assurances and judgments and erasure-coding bundles. None of that exists:
-//! those are N4's and N5's, and the export for bundle -> shards +
-//! justifications + segment proofs is the one DESIGN §8 prerequisite still
-//! outstanding.
+//! assurances and judgments and erasure-coding bundles. None of that exists
+//! yet -- those are N4's and N5's -- but nothing upstream blocks them any
+//! more: the export for bundle -> shards + justifications + segment proofs
+//! was the last outstanding DESIGN §8 prerequisite and the pin now carries
+//! it (`hazmat::erasure`, `hazmat::availability`).
 #![deny(unsafe_code)]
 
 pub mod chain;
 pub mod import;
+pub mod oracle;
 pub mod reports;
 pub mod state;
 pub mod tickets;
