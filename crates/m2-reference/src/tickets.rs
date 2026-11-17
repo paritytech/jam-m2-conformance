@@ -167,10 +167,7 @@ impl RefChain {
     /// The pool also rejects duplicates and keeps only the lowest ids, which
     /// is why an unsorted or repeated extrinsic cannot be produced this way.
     pub fn submit_tickets(&self, candidates: &[TicketEnvelope]) -> Result<(), ChainError> {
-        let envelopes = candidates
-            .iter()
-            .map(|t| jam_types::Encode::encode(t))
-            .collect();
+        let envelopes = candidates.iter().map(jam_types::Encode::encode).collect();
         match self.ask(Message::SubmitTickets {
             session: self.session(),
             envelopes,
