@@ -413,9 +413,13 @@ polkajam remain prerequisites:
 3. Return signed artefacts instead of submitting them to the pool: `compose_guarantee`,
    `try_compose_assurances`, `table_tickets` (`harness.rs:352,574,621`) for a chosen validator index.
    The harness sends them over JAMNP and optionally feeds the reference pool.
-4. Hazmat export for "bundle → erasure shards + justifications + segment proofs" (today inside
-   `jam-node` `availability` / `util::erasure`), needed to serve CE 137/138/139/140/147/148 byte-exactly.
-   The exact surface still needs inspection.
+4. ~~Hazmat export for "bundle → erasure shards + justifications + segment proofs"~~ **done**:
+   merged as polkajam `57ff7a31c` (#1378) and carried by the pin. `hazmat::erasure` gives
+   `erasure_shards`, `reconstruct`, `reconstruct_segment`, `recovery_threshold`, `segments_shards`
+   and `shard_len`; `hazmat::availability` gives `bundle_justification`, `segment_justification`,
+   `check_bundle_proof`, `check_segment_proof`, `decode_segment_justification` and the two
+   `max_*_justification_bytes`. That is what CE 137/138/139/140/147/148 need served byte-exactly,
+   and it is the last thing that blocked N4.
 5. Keep the `ark-vrf` `test-vectors` feature (`polkajam-fuzz/Cargo.toml:35-37`) for deterministic
    RingVRF proofs on the harness side.
 

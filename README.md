@@ -206,7 +206,7 @@ and pins `PvmBackend::Interpreter`.
 |---|---|---|
 | P0 | `jamnp-s`, runner skeleton, N0 | ✅ implemented |
 | P1 | `m2-reference` (now an oracle client), N1 authoring, N2 tickets | ✅ implemented |
-| P2 | N3 guaranteeing, N4 availability (erasure export) | ⏳ next |
+| P2 | N3 guaranteeing, N4 availability | ⏳ next — the erasure/justification export it waited on is merged and pinned |
 | P3 | N5 auditing/disputes, N6 preimages | ⏳ |
 | P4 | N7 adversarial, index rotation, IPv6, web UI | ⏳ |
 

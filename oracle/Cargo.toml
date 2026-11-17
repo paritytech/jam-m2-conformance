@@ -14,9 +14,9 @@ description = "Out-of-process polkajam reference oracle for the JAM M2 conforman
 
 [dependencies]
 m2-oracle-proto = { path = "../crates/m2-oracle-proto" }
-jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a", features = ["hazmat"] }
-jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
-jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
+jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "5ef954fb1045074493e6de6c234d56b9a8a0969f", features = ["hazmat"] }
+jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "5ef954fb1045074493e6de6c234d56b9a8a0969f" }
+jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "5ef954fb1045074493e6de6c234d56b9a8a0969f" }
 codec = { package = "jam-codec", version = "0.1.2", default-features = false, features = ["derive", "max-encoded-len"] }
 
 # `jam-node`'s build script embeds the `jam-bootstrap-service` blob only when

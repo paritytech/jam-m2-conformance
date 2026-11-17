@@ -495,7 +495,7 @@ dependencies = [
 [[package]]
 name = "cargo-jam-build"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=e3d216c24740be75a67339edf5842550821a940a#e3d216c24740be75a67339edf5842550821a940a"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=5ef954fb1045074493e6de6c234d56b9a8a0969f#5ef954fb1045074493e6de6c234d56b9a8a0969f"
 dependencies = [
  "anyhow",
  "blake2b_simd",
@@ -1491,7 +1491,7 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 [[package]]
 name = "jam-bootstrap-service-common"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=e3d216c24740be75a67339edf5842550821a940a#e3d216c24740be75a67339edf5842550821a940a"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=5ef954fb1045074493e6de6c234d56b9a8a0969f#5ef954fb1045074493e6de6c234d56b9a8a0969f"
 dependencies = [
  "bounded-collections",
  "jam-codec",
@@ -1533,7 +1533,7 @@ dependencies = [
 [[package]]
 name = "jam-node"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=e3d216c24740be75a67339edf5842550821a940a#e3d216c24740be75a67339edf5842550821a940a"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=5ef954fb1045074493e6de6c234d56b9a8a0969f#5ef954fb1045074493e6de6c234d56b9a8a0969f"
 dependencies = [
  "ark-vrf",
  "async-trait",
@@ -1591,12 +1591,12 @@ dependencies = [
 [[package]]
 name = "jam-null-authorizer-bin"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=e3d216c24740be75a67339edf5842550821a940a#e3d216c24740be75a67339edf5842550821a940a"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=5ef954fb1045074493e6de6c234d56b9a8a0969f#5ef954fb1045074493e6de6c234d56b9a8a0969f"
 
 [[package]]
 name = "jam-program-blob-common"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=e3d216c24740be75a67339edf5842550821a940a#e3d216c24740be75a67339edf5842550821a940a"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=5ef954fb1045074493e6de6c234d56b9a8a0969f#5ef954fb1045074493e6de6c234d56b9a8a0969f"
 dependencies = [
  "jam-codec",
  "polkavm",
@@ -1605,7 +1605,7 @@ dependencies = [
 [[package]]
 name = "jam-std-common"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=e3d216c24740be75a67339edf5842550821a940a#e3d216c24740be75a67339edf5842550821a940a"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=5ef954fb1045074493e6de6c234d56b9a8a0969f#5ef954fb1045074493e6de6c234d56b9a8a0969f"
 dependencies = [
  "ark-vrf",
  "arrayvec",
@@ -1631,7 +1631,7 @@ dependencies = [
 [[package]]
 name = "jam-types"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=e3d216c24740be75a67339edf5842550821a940a#e3d216c24740be75a67339edf5842550821a940a"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=5ef954fb1045074493e6de6c234d56b9a8a0969f#5ef954fb1045074493e6de6c234d56b9a8a0969f"
 dependencies = [
  "atomic-traits",
  "base64 0.22.1",
@@ -2185,9 +2185,9 @@ dependencies = [
 
 [[package]]
 name = "polkavm"
-version = "0.37.0"
+version = "0.38.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c40ac953a7396523af50f8f3523ac58d683f59a74a252a71690f778b494f824a"
+checksum = "2ad8d3c9f1c44aa8c596243b1525ef379a2fd2ca5b98b2170b5aaed092ace572"
 dependencies = [
  "libc",
  "log",
@@ -2199,18 +2199,18 @@ dependencies = [
 
 [[package]]
 name = "polkavm-assembler"
-version = "0.37.0"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6264b876711c7c921a87df3ffb2c152d91686050940253d30083782ab68f06f7"
+checksum = "c4307946f8468993c33899720975e1e8e5f6950bc6d41a9b95ac7ec090992519"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "polkavm-common"
-version = "0.37.0"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b44940b0d82ff491647139e045e026b98666be87770f72d48d6463fb65b866fd"
+checksum = "2ef35bc7f93dff55723e05cde93c618a2ba4bba2b92947136091220671fe8718"
 dependencies = [
  "log",
  "picosimd",
@@ -2219,9 +2219,9 @@ dependencies = [
 
 [[package]]
 name = "polkavm-linker"
-version = "0.37.0"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04b92b24fc2fa4319e3a7c6aee58db429da20e20d32c2c9a2a2aaa4b87edc16b"
+checksum = "8068b9b96e228d96c92ec1844eaa527e42015c9ba82b27414f5ea1ca4239c888"
 dependencies = [
  "dirs",
  "gimli",
@@ -2235,9 +2235,9 @@ dependencies = [
 
 [[package]]
 name = "polkavm-linux-raw"
-version = "0.37.0"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb9c5f2225abfe56ebf8e6681ebfef57d5dcb228c03da32d96a1fd50ed9bad24"
+checksum = "2ccde7555db1eb513da81c4bcc036ad0e2eca56aaff74fb477a04a3025883e26"
 
 [[package]]
 name = "powerfmt"
@@ -3299,7 +3299,7 @@ dependencies = [
 [[package]]
 name = "trie"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=e3d216c24740be75a67339edf5842550821a940a#e3d216c24740be75a67339edf5842550821a940a"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=5ef954fb1045074493e6de6c234d56b9a8a0969f#5ef954fb1045074493e6de6c234d56b9a8a0969f"
 dependencies = [
  "blake2b_simd",
  "parking_lot",
