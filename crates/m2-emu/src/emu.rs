@@ -20,7 +20,9 @@ use jamnp_s::{
     codec::ce128_129::{BlockRequest, BlockResponse, Direction, StateRequest, StateResponse},
     codec::up0::{Announcement, Final, Handshake},
     endpoint::{EndpointConfig, EndpointError},
-    framing::{frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE134, CE135, UP},
+    framing::{
+        frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE134, CE135, CE141, UP,
+    },
     trace::{mono_ts, wall_ts, Direction as TraceDir, Trace, TraceRecord},
     transport::{quic::QuicTransport, Conn, Listener, RecvHalf, SendHalf, Transport},
 };
@@ -112,6 +114,9 @@ pub struct Emulator {
     sharing_seen: Arc<Mutex<Vec<SharingSeen>>>,
     /// CE 135 report distributions the NUT sent.
     reports_seen: Arc<Mutex<Vec<ReportSeen>>>,
+    /// CE 141 assurances the NUT broadcast, as received. Judged by the N4
+    /// lane, which has the anchor and the reported cores to judge against.
+    assurances_seen: Arc<Mutex<Vec<crate::avail_io::RawAssurance>>>,
     sync_probe_pending: Arc<AtomicBool>,
     /// Highest finalized slot the NUT has advertised over UP 0; see
     /// [`EmuShared::nut_final_slot`].
@@ -183,6 +188,7 @@ pub struct EmuShared {
     pub sharing_seen: Arc<Mutex<Vec<SharingSeen>>>,
     /// CE 135 report distributions the NUT sent (`simple.md:460-485`).
     pub reports_seen: Arc<Mutex<Vec<ReportSeen>>>,
+    pub assurances_seen: Arc<Mutex<Vec<crate::avail_io::RawAssurance>>>,
     /// Cleared by whichever connection runs the sync probes, so they run once
     /// per run rather than once per peer.
     pub sync_probe_pending: Arc<AtomicBool>,
@@ -352,6 +358,7 @@ impl Emulator {
             ce129_probes: Arc::new(Mutex::new(Vec::new())),
             sharing_seen: Arc::new(Mutex::new(Vec::new())),
             reports_seen: Arc::new(Mutex::new(Vec::new())),
+            assurances_seen: Arc::new(Mutex::new(Vec::new())),
             sync_probe_pending: Arc::new(AtomicBool::new(true)),
             nut_final_slot: Arc::new(AtomicU32::new(NO_ADVERTISED_FINAL)),
             announce: broadcast::Sender::new(ANNOUNCE_BUFFER),
@@ -439,6 +446,10 @@ impl Emulator {
     }
 
     /// CE 135 report distributions the NUT sent.
+    pub fn assurances_seen(&self) -> Arc<Mutex<Vec<crate::avail_io::RawAssurance>>> {
+        Arc::clone(&self.assurances_seen)
+    }
+
     pub fn reports_seen(&self) -> Arc<Mutex<Vec<ReportSeen>>> {
         Arc::clone(&self.reports_seen)
     }
@@ -466,6 +477,7 @@ impl Emulator {
             ce129_probes: Arc::clone(&self.ce129_probes),
             sharing_seen: Arc::clone(&self.sharing_seen),
             reports_seen: Arc::clone(&self.reports_seen),
+            assurances_seen: Arc::clone(&self.assurances_seen),
             sync_probe_pending: Arc::clone(&self.sync_probe_pending),
             nut_final_slot: Arc::clone(&self.nut_final_slot),
         }
@@ -1020,6 +1032,14 @@ async fn handle_stream(
                 peer_index,
                 obs,
                 &shared.reports_seen,
+            );
+        }
+        CE141 => {
+            crate::avail_io::handle_inbound_assurance(
+                &content,
+                peer_index,
+                obs,
+                &shared.assurances_seen,
             );
         }
         // Spec-known kinds outside this subset: reset rather than drop, so the

@@ -6,6 +6,7 @@
 //! executes no core protocol logic.
 #![deny(unsafe_code)]
 
+pub mod avail_io;
 pub mod emu;
 pub mod nut_block;
 pub mod report_io;
