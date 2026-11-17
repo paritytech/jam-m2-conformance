@@ -381,6 +381,43 @@ pub enum Message {
         detail: Option<String>,
     } = 50,
 
+    /// Erasure-code a work package's exported segments into per-validator
+    /// segment shards, for CE 139/140.
+    ///
+    /// Each segment is `SEGMENT_LEN` (4104) bytes; anything else is an
+    /// error rather than a truncation, because a segment of the wrong
+    /// length codes into shards that are wrong in a way no later check
+    /// would attribute to this.
+    CodeSegments {
+        segments: Vec<Vec<u8>>,
+        shard_count: u16,
+    } = 51,
+    /// One shard per validator, each the concatenation of that validator's
+    /// slice of every segment, in segment order.
+    CodedSegments {
+        shards: Vec<Vec<u8>>,
+        /// The slice boundary within each shard: `SEGMENT_LEN / D(v)`, a
+        /// property of the coding rather than a protocol constant, so it
+        /// travels with the shards instead of being recomputed.
+        slice_len: u32,
+    } = 52,
+
+    /// Check a CE 139/140 segment-shard justification, answered with
+    /// `ShardChecked`.
+    ///
+    /// The justification is decoded by the engine's own
+    /// `decode_segment_justification`, which needs the slice length to know
+    /// where its elements end.
+    CheckSegmentShard {
+        erasure_root: [u8; 32],
+        shard_index: u16,
+        shard_count: u16,
+        segment_index: u16,
+        segment_count: u32,
+        segment_slice: Vec<u8>,
+        justification: Vec<u8>,
+    } = 53,
+
     /// Build a package, optionally against an authorizer no core accepts.
     BuildPackage {
         session: SessionId,
@@ -663,6 +700,23 @@ mod tests {
             Message::ShardChecked {
                 verified: Some(true),
                 detail: None,
+            },
+            Message::CodeSegments {
+                segments: vec![vec![0x1f; 4104]],
+                shard_count: 6,
+            },
+            Message::CodedSegments {
+                shards: vec![vec![0x20; 1368], vec![0x21; 1368]],
+                slice_len: 1368,
+            },
+            Message::CheckSegmentShard {
+                erasure_root: [0x23; 32],
+                shard_index: 1,
+                shard_count: 6,
+                segment_index: 0,
+                segment_count: 1,
+                segment_slice: vec![0x24; 1368],
+                justification: vec![0x25; 34],
             },
             Message::ShardChecked {
                 verified: None,

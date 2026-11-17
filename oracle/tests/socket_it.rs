@@ -985,3 +985,129 @@ fn a_bundle_codes_into_shards_and_a_bad_justification_is_refused() {
         other => panic!("expected ShardChecked, got {other:?}"),
     }
 }
+
+/// Segment shards, and what the engine's segment-justification decoder says.
+///
+/// The matrix shape is the thing to get right: coding `n` segments for `v`
+/// validators gives a `v x n` grid of slices, and one shard is a *row* --
+/// one validator's slice of every segment, concatenated in segment order.
+/// A lane that read a shard as "the segments for this validator" would
+/// compare the wrong bytes against the node's reply.
+#[test]
+fn segments_code_into_one_row_per_validator() {
+    let oracle = start("segments");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    // `SEGMENT_LEN` exactly: anything else is an error rather than a
+    // truncation, because a short segment codes into shards that are wrong
+    // in a way no later check would pin on this.
+    let segment = |fill: u8| vec![fill; jam_types::SEGMENT_LEN];
+    let segments = vec![segment(0xa1), segment(0xb2), segment(0xc3)];
+
+    let (shards, slice_len) = match ask(
+        &mut stream,
+        Message::CodeSegments {
+            segments: segments.clone(),
+            shard_count: 6,
+        },
+    ) {
+        Message::CodedSegments { shards, slice_len } => (shards, slice_len),
+        other => panic!("expected CodedSegments, got {other:?}"),
+    };
+
+    assert_eq!(shards.len(), 6, "one row per validator");
+    for shard in &shards {
+        assert_eq!(
+            shard.len() as u32,
+            slice_len * segments.len() as u32,
+            "a row is one slice per segment, concatenated"
+        );
+    }
+    // `SEGMENT_LEN / D(v)` = 4104 / 3.
+    assert_eq!(
+        slice_len,
+        (jam_types::SEGMENT_LEN / 3) as u32,
+        "the slice length follows the recovery threshold"
+    );
+
+    // A segment of the wrong length is refused by name.
+    match ask(
+        &mut stream,
+        Message::CodeSegments {
+            segments: vec![vec![0u8; 16]],
+            shard_count: 6,
+        },
+    ) {
+        Message::Error(why) => assert!(
+            why.contains("segment 0") && why.contains("16 bytes"),
+            "the refusal names the segment and its length: {why}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    // No segments is a legitimate package, and still yields a row each.
+    match ask(
+        &mut stream,
+        Message::CodeSegments {
+            segments: Vec::new(),
+            shard_count: 6,
+        },
+    ) {
+        Message::CodedSegments { shards, .. } => {
+            assert_eq!(
+                shards.len(),
+                6,
+                "a package exporting nothing still has rows"
+            );
+            assert!(
+                shards.iter().all(|s| s.is_empty()),
+                "and the rows are empty"
+            );
+        }
+        other => panic!("expected CodedSegments, got {other:?}"),
+    }
+
+    // A justification the engine's decoder cannot read is `None`, which is
+    // not the same answer as a proof that failed.
+    match ask(
+        &mut stream,
+        Message::CheckSegmentShard {
+            erasure_root: [0x11; 32],
+            shard_index: 0,
+            shard_count: 6,
+            segment_index: 0,
+            segment_count: segments.len() as u32,
+            segment_slice: shards[0][..slice_len as usize].to_vec(),
+            justification: vec![0x07],
+        },
+    ) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(verified, None, "undecodable is not `did not verify`");
+            assert!(
+                detail.is_some_and(|d| d.contains("did not decode")),
+                "and says so"
+            );
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // An empty justification decodes and proves nothing against a root that
+    // was never built from these shards.
+    match ask(
+        &mut stream,
+        Message::CheckSegmentShard {
+            erasure_root: [0x11; 32],
+            shard_index: 0,
+            shard_count: 6,
+            segment_index: 0,
+            segment_count: segments.len() as u32,
+            segment_slice: shards[0][..slice_len as usize].to_vec(),
+            justification: Vec::new(),
+        },
+    ) {
+        Message::ShardChecked { verified, .. } => {
+            assert_eq!(verified, Some(false), "nothing proves nothing")
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+}

@@ -333,6 +333,81 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             }
         }
 
+        Message::CodeSegments {
+            segments,
+            shard_count,
+        } => {
+            let mut fixed = Vec::with_capacity(segments.len());
+            for (i, segment) in segments.iter().enumerate() {
+                // Boxed: `segments_shards` takes `impl AsRef<[u8; SEGMENT_LEN]>`,
+                // which a bare array does not implement for itself but a
+                // `Box` does. Built from the slice first so a wrong length
+                // is an error rather than a panic.
+                let Ok(array) = <[u8; jam_types::SEGMENT_LEN]>::try_from(segment.as_slice()) else {
+                    return Message::Error(format!(
+                        "segment {i} is {} bytes, not {}",
+                        segment.len(),
+                        jam_types::SEGMENT_LEN
+                    ));
+                };
+                fixed.push(Box::new(array));
+            }
+            match jam_node::hazmat::erasure::segments_shards(&fixed, shard_count as usize) {
+                Ok(shards) => {
+                    // One slice length for the whole matrix; an empty set of
+                    // segments still yields one shard per validator, so the
+                    // length is read from the shards rather than guessed.
+                    let slice_len = shards.first().map(|s| s.slice_len()).unwrap_or(0) as u32;
+                    Message::CodedSegments {
+                        shards: shards.into_iter().map(|s| s.into_inner()).collect(),
+                        slice_len,
+                    }
+                }
+                Err(e) => Message::Error(format!(
+                    "coding {} segments into {shard_count} shards: {e:?}",
+                    segments.len()
+                )),
+            }
+        }
+
+        Message::CheckSegmentShard {
+            erasure_root,
+            shard_index,
+            shard_count,
+            segment_index,
+            segment_count,
+            segment_slice,
+            justification,
+        } => {
+            // The engine's own decoder, which needs the slice length to know
+            // where each element ends.
+            let Some(decoded) = jam_node::hazmat::availability::decode_segment_justification(
+                &justification,
+                segment_slice.len(),
+            ) else {
+                return Message::ShardChecked {
+                    verified: None,
+                    detail: Some(format!(
+                        "the justification did not decode against a {} byte slice",
+                        segment_slice.len()
+                    )),
+                };
+            };
+            let verified = jam_node::hazmat::availability::check_segment_proof(
+                erasure_root.into(),
+                shard_index,
+                shard_count as usize,
+                segment_index,
+                segment_count as usize,
+                &segment_slice,
+                &decoded,
+            );
+            Message::ShardChecked {
+                verified: Some(verified),
+                detail: None,
+            }
+        }
+
         Message::GetState(hash) => {
             let Some(session) = sessions.first() else {
                 return Message::OracleFault("no session is open".into());
