@@ -208,6 +208,19 @@ pub enum Message {
     TicketContext {
         pks: Vec<[u8; 32]>,
         entropy: [u8; 32],
+        /// The epoch whose tickets this entropy seals, read from the same
+        /// storage view as the entropy itself.
+        ///
+        /// Sent rather than computed by the caller. A caller has only its own
+        /// clock to compute it from, and the chain head is not the clock: the
+        /// head lags whenever the driver has not authored the current slot,
+        /// which is most of the time and all of the time once the observation
+        /// window has closed. When the two sit on opposite sides of an epoch
+        /// boundary, a context sealing epoch E gets filed under E+1, and
+        /// every ticket checked against it fails with "did not verify against
+        /// that epoch's ring" -- every attempt, of every author, for that one
+        /// epoch, which is what it looked like.
+        epoch: u32,
     } = 35,
     /// Prove tickets for one author, or for every author the session holds.
     ///
@@ -531,6 +544,7 @@ mod tests {
             Message::TicketContext {
                 pks: vec![[0x01; 32], [0x02; 32]],
                 entropy: [0x03; 32],
+                epoch: 821_955,
             },
             Message::SignTickets {
                 session: 1,

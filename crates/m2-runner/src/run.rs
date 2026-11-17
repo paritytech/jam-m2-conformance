@@ -761,8 +761,14 @@ async fn drive_slots(
         // previous epoch's and the context would be filed one epoch late.
         let epoch = next / jam_types::epoch_period();
         if captured_epoch != Some(epoch) {
+            // Once per epoch is the trigger; the epoch it is *filed* under
+            // comes from the context, which read it from the same storage as
+            // the entropy. The two agree here almost always -- the read
+            // follows the authoring immediately -- but "almost always" is how
+            // the other two sites looked too, and a NUT block adopted between
+            // the two lines is enough to part them.
             if let Ok(ctx) = chain.ticket_ctx() {
-                lock(&contexts).push((epoch + 1, ctx));
+                lock(&contexts).push((ctx.epoch, ctx));
             }
             captured_epoch = Some(epoch);
         }

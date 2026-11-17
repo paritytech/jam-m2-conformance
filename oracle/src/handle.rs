@@ -342,7 +342,17 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
                 Ok(buffer) => buffer[2].0,
                 Err(e) => return Message::Error(format!("entropy: {e}")),
             };
-            Message::TicketContext { pks, entropy }
+            // The epoch this entropy seals, from the same session and the
+            // same moment. Entry 2 at a head in epoch E is what a ticket for
+            // E + 1 is checked against, so that is what this reports; a
+            // caller computing it from its own clock gets the answer wrong
+            // whenever the head and the clock straddle a boundary.
+            let head_epoch = s.harness.chain().best_block().1 / jam_types::epoch_period();
+            Message::TicketContext {
+                pks,
+                entropy,
+                epoch: head_epoch + 1,
+            }
         }),
 
         Message::SignTickets {

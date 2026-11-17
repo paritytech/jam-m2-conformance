@@ -73,7 +73,12 @@ pub(crate) fn generate_tickets(
     ref_chain: &RefChain,
 ) -> Result<(TicketCtx, Vec<EmulatedTicket>, u32), m2_reference::chain::ChainError> {
     let ticket_ctx = ref_chain.ticket_ctx()?;
-    let target_epoch = ref_chain.next_slot() / jam_types::epoch_period() + 1;
+    // The epoch the context itself names, not one derived from the clock
+    // here. These were computed separately and could disagree: the context
+    // comes from the chain head and the clock does not, so a read taken while
+    // the two straddled an epoch boundary labelled the tickets with the epoch
+    // after the one they were sealed for.
+    let target_epoch = ticket_ctx.epoch;
     let tickets = ref_chain.generate_tickets(&ticket_ctx)?;
     Ok((ticket_ctx, tickets, target_epoch))
 }
@@ -249,9 +254,14 @@ pub(crate) fn build_real_run_ctx(
 fn ticket_contexts(data: &RealRunData) -> TicketContexts {
     let mut by_epoch = vec![(data.target_epoch, data.ticket_ctx.clone())];
     by_epoch.extend(lock(&data.epoch_contexts).iter().cloned());
-    let late_epoch = data.ref_chain.next_slot() / jam_types::epoch_period() + 1;
+    // A last read, for an epoch the driver never reached -- it stops when the
+    // observation window closes while the node may keep generating. Filed
+    // under the epoch the context names: by this point the driver has been
+    // aborted for a while, so the head is further behind the clock here than
+    // anywhere else in the run, and a clock-derived label is most wrong
+    // exactly where it was being used.
     if let Ok(late) = data.ref_chain.ticket_ctx() {
-        by_epoch.push((late_epoch, late));
+        by_epoch.push((late.epoch, late));
     }
     // First entry per epoch wins, and the generation-time context leads, so a
     // later read never displaces the one the emulator's own tickets were
@@ -275,6 +285,16 @@ impl TicketContexts {
     ///
     /// Public for the same reason [`build_n1_ctx`] is: a simulated node is
     /// graded through the harness's own trace-to-facts path, not a copy of it.
+    ///
+    /// The epoch here is the caller's to choose, and a self-test's need not
+    /// be [`TicketCtx::epoch`]. A live run's must be -- see
+    /// [`ticket_contexts`] -- but a simulated node whose chain never leaves
+    /// genesis seals its tickets with genesis entropy while the virtual clock
+    /// is hundreds of thousands of epochs along, and the number is then only
+    /// a key: the lottery and the grading use the same context, so they agree
+    /// whatever it is called. Asserting the live-run invariant here fails
+    /// that setup for no gain; `the_context_names_the_epoch_its_entropy_seals`
+    /// in `m2-reference` pins it where it means something.
     pub fn from_epochs(by_epoch: Vec<(u32, TicketCtx)>) -> Self {
         Self { by_epoch }
     }
