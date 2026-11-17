@@ -30,7 +30,7 @@ use codec::{Decode, Encode};
 /// Bumped whenever a message changes shape. The client refuses a mismatch
 /// rather than guessing, because a silently misread response is a wrong
 /// conformance verdict rather than an error.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Largest frame either side will read, matching the fuzz protocol's.
 pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
@@ -353,22 +353,38 @@ pub enum Message {
         shard_len: u32,
     } = 48,
 
-    /// Check a CE 137/138 bundle-shard justification against an erasure
-    /// root, the way a node checks one it was served.
+    /// Check a CE 137 or CE 138 reply the way a node checks one it was
+    /// served.
     ///
-    /// The justification travels as the bytes that came off the wire rather
-    /// than re-encoded through this harness's own type. Re-encoding would
-    /// hide exactly the disagreement worth finding: if `jamnp-s` and the
-    /// engine read that structure differently, the round trip through our
-    /// type would paper over it and the check would pass on bytes the node
+    /// The whole reply travels, as the bytes that came off the wire, and the
+    /// oracle does every step. Re-encoding the justification through this
+    /// harness's own type would hide exactly the disagreement worth finding:
+    /// if `jamnp-s` and the engine read that structure differently, the round
+    /// trip would paper over it and the check would pass on bytes the node
     /// never sent.
-    CheckBundleShard {
+    ///
+    /// `protocol` rides along because the two differ in *where the segment
+    /// root comes from*: CE 138 carries it as the last justification element,
+    /// while CE 137 omits it and the reader must take the Merkle root of the
+    /// segment shards instead. That is a rule both sides must apply
+    /// identically, so it is applied in one place rather than by whoever
+    /// happens to be calling.
+    CheckServedShard {
+        /// 137 or 138. Anything else is an error rather than a default.
+        protocol: u16,
         erasure_root: [u8; 32],
         shard_index: u16,
         shard_count: u16,
         /// Hashed here, so the hash is the engine's own.
         bundle_shard: Vec<u8>,
-        segment_root: [u8; 32],
+        /// CE 137's segment shards, as the raw concatenation the wire
+        /// carries. Empty for CE 138, which sends none.
+        ///
+        /// No slice length travels with them: the wire marks no boundary,
+        /// but `jam_types::segment_slice_len` derives one from the shard
+        /// count and both sides link it, so sending it would only create a
+        /// way for the caller to disagree with the engine.
+        segment_shards: Vec<u8>,
         justification: Vec<u8>,
     } = 49,
     /// Whether the justification proves that shard sits under that root.
@@ -689,13 +705,23 @@ mod tests {
                 recovery_threshold: 3,
                 shard_len: 8,
             },
-            Message::CheckBundleShard {
+            Message::CheckServedShard {
+                protocol: 137,
                 erasure_root: [0x1b; 32],
                 shard_index: 2,
                 shard_count: 6,
                 bundle_shard: vec![0x1c; 8],
-                segment_root: [0x1d; 32],
+                segment_shards: vec![0x1d; 16],
                 justification: vec![0x1e; 33],
+            },
+            Message::CheckServedShard {
+                protocol: 138,
+                erasure_root: [0x1b; 32],
+                shard_index: 2,
+                shard_count: 6,
+                bundle_shard: vec![0x1c; 8],
+                segment_shards: Vec::new(),
+                justification: vec![0x1e; 66],
             },
             Message::ShardChecked {
                 verified: Some(true),

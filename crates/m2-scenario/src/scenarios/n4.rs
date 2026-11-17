@@ -31,13 +31,42 @@ pub struct ShardServed {
     /// What the reference coded for that index, when the lane knows the
     /// bundle. `None` leaves the byte comparison unmade rather than passed.
     pub expected_bundle_shard: Option<Vec<u8>>,
-    /// Segment shards alongside, for CE 137.
-    pub segment_shards: Vec<Vec<u8>>,
+    /// CE 137's segment shards, as the raw concatenation the wire carries.
+    ///
+    /// Not split into one `Vec` per segment, because the wire does not split
+    /// them: the reply is one message of slices back to back, and where the
+    /// boundaries fall follows from the shard count. Splitting here would be
+    /// this harness's second opinion about that.
+    pub segment_shards: Vec<u8>,
+    /// How many messages the NUT sent before closing the stream.
+    ///
+    /// CE 137 owes three -- shard, segment shards, justification -- and CE
+    /// 138 owes two. A reply short of its count is a different complaint
+    /// from one whose justification does not verify.
+    pub messages: usize,
+    /// The justification exactly as it came off the wire.
+    ///
+    /// Kept as bytes rather than decoded here: whether it proves anything is
+    /// the engine's answer, and re-encoding it through this harness's own
+    /// type on the way would hide the disagreement worth finding.
+    pub justification: Vec<u8>,
     pub justification_verified: Option<bool>,
     /// Why a justification could not be read, when it could not.
     pub justification_detail: Option<String>,
     /// The NUT reset the stream instead of answering.
     pub refused: bool,
+}
+
+impl ShardServed {
+    /// Messages a well-formed reply carries: `simple.md:552-554` for CE 137,
+    /// `simple.md:577-578` for CE 138.
+    pub fn messages_owed(protocol: u16) -> usize {
+        if protocol == 137 {
+            3
+        } else {
+            2
+        }
+    }
 }
 
 /// A CE 139 or CE 140 response: segment shards for named indices.
@@ -49,11 +78,25 @@ pub struct SegmentShardsServed {
     pub shard_index: u16,
     /// The segment indices asked for, in request order.
     pub requested: Vec<u16>,
-    /// The shards the NUT returned, in reply order.
+    /// The slices the NUT returned, split at the slice length the shard
+    /// count fixes. One per index asked for, in the order asked: the reply
+    /// carries no indices of its own, so position is the only thing tying a
+    /// slice to its segment.
     pub shards: Vec<Vec<u8>>,
+    /// CE 140's justifications, one message per requested index, as they
+    /// arrived. Empty for CE 139, which sends none.
+    pub justifications: Vec<Vec<u8>>,
     /// Per-shard verification for CE 140; empty for CE 139, which carries
     /// no justification to check.
     pub justifications_verified: Vec<Option<bool>>,
+    /// Why a justification could not be read, by shard, when one could not.
+    pub justification_details: Vec<Option<String>>,
+    /// The NUT's one data message was not a whole number of slices.
+    ///
+    /// Kept apart from a short reply: a reply of the wrong *length* says the
+    /// two sides disagree about the slice width, which no count of shards
+    /// would show.
+    pub ragged: bool,
     pub refused: bool,
 }
 
@@ -158,21 +201,6 @@ pub fn n4_ce137_serve(ctx: &N4Ctx) -> Check {
         let mut results = Vec::new();
         for shard in served {
             results.extend(grade_served_shard(shard, "n4_ce137"));
-            // Only CE 137 carries segment shards beside the bundle shard.
-            results.push(log::check_detail(
-                "n4_ce137_carries_segment_shards",
-                !shard.segment_shards.is_empty(),
-                Severity::Hard,
-                || {
-                    format!(
-                        "CE 137 for root {} index {} returned a bundle shard and no segment \
-                         shards; `simple.md:552-554` is `Bundle Shard ++ [Segment Shard] ++ \
-                         Justification`",
-                        short(&shard.erasure_root),
-                        shard.shard_index
-                    )
-                },
-            ));
         }
         results
     })
@@ -223,6 +251,33 @@ fn grade_served_shard(shard: &ShardServed, prefix: &'static str) -> Vec<crate::d
     if shard.refused {
         return results;
     }
+
+    // The reply is a sequence of whole messages, and how many of them there
+    // are is the shape of the protocol: `Bundle Shard ++ [Segment Shard] ++
+    // Justification` for CE 137, and the same without the middle one for CE
+    // 138. A reply one message short is a different complaint from one whose
+    // justification does not verify -- it says the node stopped, not that it
+    // proved something untrue -- and the rows below would otherwise read the
+    // missing message as an empty one.
+    //
+    // This is the row that carries CE 137's segment shards. Counting them
+    // instead would fail a package that legitimately exports none: it still
+    // owes the message, empty.
+    let owed = ShardServed::messages_owed(shard.protocol);
+    results.push(log::check_detail(
+        leak(format!("{prefix}_reply_complete")),
+        shard.messages == owed,
+        Severity::Hard,
+        || {
+            format!(
+                "CE {} for root {} index {} sent {} message(s) and owes {owed}",
+                shard.protocol,
+                short(&shard.erasure_root),
+                shard.shard_index,
+                shard.messages
+            )
+        },
+    ));
 
     // Byte-for-byte against what the reference coded. Only when the lane
     // knows the bundle: a shard it cannot predict is not a shard the node
@@ -311,6 +366,29 @@ pub fn n4_ce139_140_serve(ctx: &N4Ctx) -> Check {
                 continue;
             }
 
+            // The slices arrive concatenated in one message, so the first
+            // thing to establish is that its length is a whole number of
+            // them. A ragged message means the two sides disagree about the
+            // slice width, and every count below it would then be counting
+            // the wrong thing.
+            results.push(log::check_detail(
+                "n4_ce139_140_slices_are_whole",
+                !served.ragged,
+                Severity::Hard,
+                || {
+                    format!(
+                        "CE {} for root {} index {} returned a data message that is not a \
+                         whole number of segment slices",
+                        served.protocol,
+                        short(&served.erasure_root),
+                        served.shard_index
+                    )
+                },
+            ));
+            if served.ragged {
+                continue;
+            }
+
             // One shard per index asked for, in the order asked. The reply
             // carries no indices of its own, so position is the only thing
             // tying a shard to the segment it belongs to.
@@ -345,7 +423,14 @@ pub fn n4_ce139_140_serve(ctx: &N4Ctx) -> Check {
                             .enumerate()
                             .filter(|(_, v)| **v != Some(true))
                             .map(|(i, v)| match v {
-                                None => format!("{i}: unreadable"),
+                                None => format!(
+                                    "{i}: unreadable ({})",
+                                    served
+                                        .justification_details
+                                        .get(i)
+                                        .and_then(|d| d.as_deref())
+                                        .unwrap_or("no detail")
+                                ),
                                 Some(_) => format!("{i}: did not verify"),
                             })
                             .collect::<Vec<_>>();
@@ -569,7 +654,9 @@ mod tests {
             shard_index: 2,
             bundle_shard: vec![1, 2, 3],
             expected_bundle_shard: Some(vec![1, 2, 3]),
-            segment_shards: vec![vec![4, 5]],
+            segment_shards: vec![4, 5],
+            messages: ShardServed::messages_owed(protocol),
+            justification: vec![0, 9],
             justification_verified: Some(true),
             justification_detail: None,
             refused: false,
@@ -600,28 +687,67 @@ mod tests {
             out.iter().all(|(_, o)| *o == Outcome::Pass),
             "all rows pass: {out:?}"
         );
-        assert!(out
-            .iter()
-            .any(|(n, _)| n == "n4_ce137_carries_segment_shards"));
+        assert!(out.iter().any(|(n, _)| n == "n4_ce137_reply_complete"));
     }
 
-    /// CE 138 carries no segment shards, so it must not be graded for
-    /// missing them -- that row belongs to CE 137 alone.
+    /// CE 137 owes three messages and CE 138 two, so a CE 137 reply that
+    /// stopped after the bundle shard and its justification is short --
+    /// even though those are exactly the two messages CE 138 owes.
+    ///
+    /// Counting the segment shards instead would fail a package that
+    /// legitimately exports none: it still owes the message, empty.
     #[test]
-    fn ce138_is_not_graded_for_segment_shards() {
+    fn a_ce137_reply_missing_its_segment_shards_is_short() {
         let ctx = N4Ctx {
             shards_served: vec![ShardServed {
+                messages: 2,
+                segment_shards: Vec::new(),
+                ..served(137)
+            }],
+            ..Default::default()
+        };
+        let out = results(n4_ce137_serve(&ctx));
+        assert!(
+            out.iter()
+                .any(|(n, o)| n == "n4_ce137_reply_complete" && matches!(o, Outcome::Fail(_))),
+            "{out:?}"
+        );
+
+        // The same two messages are a whole CE 138 reply.
+        let ctx = N4Ctx {
+            shards_served: vec![ShardServed {
+                messages: 2,
                 segment_shards: Vec::new(),
                 ..served(138)
             }],
             ..Default::default()
         };
-        let out = names(n4_ce138_serve(&ctx));
+        let out = results(n4_ce138_serve(&ctx));
         assert!(
-            !out.iter().any(|n| n.contains("segment_shards")),
-            "no segment-shard row for CE 138: {out:?}"
+            out.iter().all(|(_, o)| *o == Outcome::Pass),
+            "CE 138 owes two and sent two: {out:?}"
         );
-        assert!(out.iter().any(|n| n == "n4_ce138_justification_verifies"));
+        assert!(out
+            .iter()
+            .any(|(n, _)| n == "n4_ce138_justification_verifies"));
+    }
+
+    /// A package exporting no segments still owes the message, so an empty
+    /// one is a complete reply and not a missing shard.
+    #[test]
+    fn a_ce137_reply_with_no_exported_segments_is_complete() {
+        let ctx = N4Ctx {
+            shards_served: vec![ShardServed {
+                segment_shards: Vec::new(),
+                ..served(137)
+            }],
+            ..Default::default()
+        };
+        let out = results(n4_ce137_serve(&ctx));
+        assert!(
+            out.iter().all(|(_, o)| *o == Outcome::Pass),
+            "three messages, the middle one empty: {out:?}"
+        );
     }
 
     /// An unreadable justification and one that fails to verify are
@@ -662,11 +788,7 @@ mod tests {
         // Answering is the only question worth asking of a reset stream;
         // grading the shard bytes of a reply that never came would report
         // several failures for one fault.
-        assert_eq!(
-            out.len(),
-            2,
-            "answered, plus the segment-shard row: {out:?}"
-        );
+        assert_eq!(out.len(), 1, "answered, and nothing else: {out:?}");
         assert!(out
             .iter()
             .any(|(n, o)| n == "n4_ce137_answered" && matches!(o, Outcome::Fail(_))));
@@ -831,7 +953,10 @@ mod tests {
                 shard_index: 1,
                 requested: vec![0, 1],
                 shards: vec![vec![1], vec![2]],
+                justifications: Vec::new(),
                 justifications_verified: Vec::new(),
+                justification_details: Vec::new(),
+                ragged: false,
                 refused: false,
             }],
             ..Default::default()
@@ -855,7 +980,10 @@ mod tests {
                 shard_index: 1,
                 requested: vec![0],
                 shards: vec![vec![1]],
+                justifications: Vec::new(),
                 justifications_verified: Vec::new(),
+                justification_details: Vec::new(),
+                ragged: false,
                 refused: false,
             }],
             ..Default::default()
@@ -870,6 +998,40 @@ mod tests {
             .any(|n| n == "n4_ce139_140_one_shard_per_request"));
     }
 
+    /// A data message that is not a whole number of slices means the two
+    /// sides disagree about the slice width, which no count of shards would
+    /// show -- so it is its own row, and it stops the rest.
+    #[test]
+    fn a_ragged_reply_is_its_own_row() {
+        let ctx = N4Ctx {
+            segment_shards_served: vec![SegmentShardsServed {
+                protocol: 140,
+                erasure_root: [0x44; 32],
+                shard_index: 1,
+                requested: vec![0, 1],
+                shards: Vec::new(),
+                justifications: Vec::new(),
+                justifications_verified: Vec::new(),
+                justification_details: Vec::new(),
+                ragged: true,
+                refused: false,
+            }],
+            ..Default::default()
+        };
+        let out = results(n4_ce139_140_serve(&ctx));
+        assert!(
+            out.iter()
+                .any(|(n, o)| n == "n4_ce139_140_slices_are_whole"
+                    && matches!(o, Outcome::Fail(_))),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|(n, _)| n == "n4_ce139_140_one_shard_per_request"),
+            "counting slices nobody could split is not a second finding: {out:?}"
+        );
+    }
+
     #[test]
     fn a_short_reply_fails_the_count_row() {
         let ctx = N4Ctx {
@@ -879,7 +1041,10 @@ mod tests {
                 shard_index: 1,
                 requested: vec![0, 1, 2],
                 shards: vec![vec![1]],
+                justifications: Vec::new(),
                 justifications_verified: Vec::new(),
+                justification_details: Vec::new(),
+                ragged: false,
                 refused: false,
             }],
             ..Default::default()

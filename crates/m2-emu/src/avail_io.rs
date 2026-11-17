@@ -7,16 +7,21 @@
 //! proves anything is decided in `m2-scenario::scenarios::n4` from facts the
 //! *engine* produced. A module that answered those questions itself would be
 //! a second implementation of the rules it is grading against.
+//!
+//! What it does own is the *shape* of the wire, and that shape is not
+//! self-describing. Each reply is a sequence of whole framed messages whose
+//! lengths the stream already carries: a bundle shard, CE 137's segment
+//! shards concatenated with no boundary marked, a justification whose
+//! elements run back to back with no count in front of them. Nothing in the
+//! reply says how long any of it is, so what this module reads is messages,
+//! and it hands each one on whole.
 
 use std::sync::{Arc, Mutex};
 
 use jam_types::{Decode, Encode};
 use jamnp_s::{
     codec::{
-        ce137_148::{
-            ProvenSegmentShardsResponse, SegmentShardRequest, SegmentShardsResponse, ShardRequest,
-            ShardResponse,
-        },
+        ce137_148::{SegmentShardRequest, ShardRequest},
         ce141_145::Assurance,
     },
     framing::{frame, CE137, CE140, CE141},
@@ -25,11 +30,11 @@ use jamnp_s::{
 };
 use m2_scenario::dsl::{ObsKind, ObsLog};
 use m2_scenario::scenarios::n4::{AssuranceSeen, SegmentShardsServed, ShardServed};
+use m2_scenario::scenarios::obs::{
+    NUT_SENT_BAD_ASSURANCE, SENT_ASSURANCE, SERVED_BUNDLE_SHARD, SERVED_SEGMENT_SHARDS,
+};
 
 use crate::emu::{lock, record, trace_record, StreamReader};
-
-/// The NUT sent something on CE 141 that is not an assurance.
-pub const NUT_SENT_BAD_ASSURANCE: u8 = 0xA1;
 
 /// Record a CE 141 assurance the node broadcast.
 ///
@@ -92,19 +97,23 @@ pub async fn send_assurance(
         return false;
     }
     send.finish();
-    record(obs, peer, ObsKind::Other(crate::avail_io::SENT_ASSURANCE));
+    record(obs, peer, ObsKind::Other(SENT_ASSURANCE));
     true
 }
 
-/// The harness offered the node an assurance.
-pub const SENT_ASSURANCE: u8 = 0xA2;
-
 /// Ask the NUT for a bundle shard over CE 137 or CE 138.
+///
+/// The reply is not one self-describing structure: it is a sequence of whole
+/// messages, `Bundle Shard`, then CE 137's segment shards, then the
+/// justification (`simple.md:552-554`, `simple.md:577-578`). Each carries its
+/// own length, so nothing here needs to know a shard length in advance -- and
+/// a reply short of its messages is recorded as short rather than read as an
+/// empty one.
 ///
 /// `expected_bundle_shard` is what the reference coded for that index, when
 /// the caller knows the bundle. It is carried through rather than compared
-/// here so that the comparison, and the decision about what a mismatch
-/// means, stay in one place.
+/// here so that the comparison, and the decision about what a mismatch means,
+/// stay in one place.
 #[allow(clippy::too_many_arguments)]
 pub async fn request_shard(
     connection: &Conn,
@@ -117,11 +126,10 @@ pub async fn request_shard(
     obs: &Arc<Mutex<ObsLog>>,
 ) -> Option<ShardServed> {
     let request = ShardRequest {
-        erasure_root: erasure_root.into(),
+        erasure_root,
         shard_index,
     };
     let reply = exchange(connection, protocol, &request.encode(), peer, trace).await?;
-    record(obs, peer, ObsKind::ServesCe137);
 
     let mut served = ShardServed {
         protocol: protocol as u16,
@@ -130,58 +138,73 @@ pub async fn request_shard(
         bundle_shard: Vec::new(),
         expected_bundle_shard,
         segment_shards: Vec::new(),
+        messages: 0,
+        justification: Vec::new(),
         // Filled by the caller, which can reach the oracle; this module
         // deliberately cannot.
         justification_verified: None,
         justification_detail: None,
         refused: false,
     };
-    let Exchange::Answered(content) = reply else {
+    let Exchange::Answered(messages) = reply else {
         served.refused = true;
         return Some(served);
     };
+    // Recorded only once something came back. "Serves CE 137" logged for a
+    // stream the node reset would say the opposite of what happened, and the
+    // refusal already rides on the fact.
+    record(
+        obs,
+        peer,
+        if protocol == CE137 {
+            ObsKind::ServesCe137
+        } else {
+            ObsKind::Other(SERVED_BUNDLE_SHARD)
+        },
+    );
+    served.messages = messages.len();
 
-    // CE 138's reply carries no segment shards, so the two protocols decode
-    // into different types even though the lane grades them alike.
-    let mut input: &[u8] = &content;
-    if protocol == CE137 {
-        let Ok(response) = ShardResponse::decode(&mut input) else {
-            served.justification_detail = Some("the CE 137 response did not decode".into());
-            return Some(served);
-        };
-        served.bundle_shard = response.bundle_shard;
-        served.segment_shards = response.segment_shards;
-        served.justification_detail = Some(hex(&response.justification.encode()));
+    // Taken by position, and only where the position exists. CE 137 puts the
+    // segment shards in the middle, so the justification is the second
+    // message for CE 138 and the third for CE 137; reading it from the end
+    // instead would quietly mistake a two-message CE 137 reply for a
+    // complete one.
+    let mut messages = messages.into_iter();
+    served.bundle_shard = messages.next().unwrap_or_default();
+    let justification = if protocol == CE137 {
+        served.segment_shards = messages.next().unwrap_or_default();
+        messages.next()
     } else {
-        let Ok(response) = jamnp_s::codec::ce137_148::AuditShardResponse::decode(&mut input) else {
-            served.justification_detail = Some("the CE 138 response did not decode".into());
-            return Some(served);
-        };
-        served.bundle_shard = response.bundle_shard;
-        served.justification_detail = Some(hex(&response.justification.encode()));
-    }
+        messages.next()
+    };
+    served.justification = justification.unwrap_or_default();
     Some(served)
 }
 
 /// Ask the NUT for segment shards over CE 139 or CE 140.
+///
+/// The slices come back concatenated in one message, with no boundary marked
+/// and no index attached: `segment_slice_len` of the shard count says where
+/// one ends, and position says which segment it is. CE 140 then sends one
+/// further message per requested index, each a justification.
 #[allow(clippy::too_many_arguments)]
 pub async fn request_segment_shards(
     connection: &Conn,
     protocol: u8,
     erasure_root: [u8; 32],
     shard_index: u16,
+    shard_count: u16,
     segment_indices: Vec<u16>,
     peer: u16,
     trace: &Arc<Mutex<Trace>>,
     obs: &Arc<Mutex<ObsLog>>,
 ) -> Option<SegmentShardsServed> {
     let request = SegmentShardRequest {
-        erasure_root: erasure_root.into(),
+        erasure_root,
         shard_index,
         segment_indices: segment_indices.clone(),
     };
     let reply = exchange(connection, protocol, &request.encode(), peer, trace).await?;
-    record(obs, peer, ObsKind::Other(SERVED_SEGMENT_SHARDS));
 
     let mut served = SegmentShardsServed {
         protocol: protocol as u16,
@@ -189,40 +212,49 @@ pub async fn request_segment_shards(
         shard_index,
         requested: segment_indices,
         shards: Vec::new(),
+        justifications: Vec::new(),
         justifications_verified: Vec::new(),
+        justification_details: Vec::new(),
+        ragged: false,
         refused: false,
     };
-    let Exchange::Answered(content) = reply else {
+    let Exchange::Answered(messages) = reply else {
         served.refused = true;
         return Some(served);
     };
+    record(obs, peer, ObsKind::Other(SERVED_SEGMENT_SHARDS));
 
-    let mut input: &[u8] = &content;
+    let slice_len = jam_types::segment_slice_len(shard_count as usize);
+    let mut messages = messages.into_iter();
+    let data = messages.next().unwrap_or_default();
+    if slice_len == 0 || !data.len().is_multiple_of(slice_len) {
+        served.ragged = true;
+        return Some(served);
+    }
+    served.shards = data.chunks(slice_len).map(<[u8]>::to_vec).collect();
+    // CE 140's justifications follow, one message each. Kept as they
+    // arrived: checking one needs the engine, and this module does not have
+    // it.
     if protocol == CE140 {
-        // CE 140 adds one justification per shard, which the caller checks.
-        if let Ok(response) = ProvenSegmentShardsResponse::decode(&mut input) {
-            served.shards = response.segment_shards;
-        }
-    } else if let Ok(response) = SegmentShardsResponse::decode(&mut input) {
-        served.shards = response.segment_shards;
+        served.justifications = messages.collect();
     }
     Some(served)
 }
 
-/// The NUT answered a CE 139/140 segment-shard request.
-pub const SERVED_SEGMENT_SHARDS: u8 = 0xA3;
-
-/// What came of a request: an answer, or a refusal.
+/// What came of a request: the messages that came back, or a refusal.
 enum Exchange {
-    Answered(Vec<u8>),
+    /// Every message the node sent before the stream ended, in order.
+    Answered(Vec<Vec<u8>>),
     Refused,
 }
 
-/// Open a stream, send one message, read one reply.
+/// Open a stream, send one message, read the reply until the stream ends.
 ///
 /// `None` only when the stream could not be opened at all, which is a
-/// harness-side failure rather than anything the node did; a reset is
-/// `Refused`, which is an answer and belongs in the facts.
+/// harness-side failure rather than anything the node did. A reset before any
+/// reply is `Refused`, which is an answer and belongs in the facts; a reset
+/// *after* some of it keeps what arrived, so the caller can say the reply was
+/// short rather than that there was none.
 async fn exchange(
     connection: &Conn,
     protocol: u8,
@@ -239,20 +271,22 @@ async fn exchange(
     }
     send.finish();
 
-    let mut reader = StreamReader::new(recv);
-    match reader.next().await {
-        Ok(Some((_, content))) => {
-            trace_record(peer, protocol, stream_id, &content, trace, TraceDir::Tx);
-            Some(Exchange::Answered(content.to_vec()))
-        }
-        // A clean close with no reply, or a reset: either way the node
-        // declined to serve, which the lane grades.
-        Ok(None) | Err(_) => Some(Exchange::Refused),
+    // `with_kind`, not `new`: we opened the stream and wrote the kind byte
+    // ourselves, so the node's replies are bare `[len][content]` messages. A
+    // reader built for an accepted stream would take the first byte of the
+    // length prefix for a kind and misread every reply that followed.
+    let mut reader = StreamReader::with_kind(recv, protocol);
+    let mut messages = Vec::new();
+    // A clean end, or a reset: either way there is no more. Whether what
+    // arrived is enough is the lane's question, not this one's.
+    while let Ok(Some((_, content))) = reader.next().await {
+        trace_record(peer, protocol, stream_id, &content, trace, TraceDir::Tx);
+        messages.push(content);
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    if messages.is_empty() {
+        return Some(Exchange::Refused);
+    }
+    Some(Exchange::Answered(messages))
 }
 
 /// Turn the assurances the node sent into the lane's facts.

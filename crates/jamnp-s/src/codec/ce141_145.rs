@@ -8,9 +8,14 @@ use jam_types::HeaderHash;
 /// CE 141: Assurance distribution (`simple.md:675-695`).
 ///
 /// `Assurance = Header Hash (Anchor) ++ Bitfield ++ Ed25519 Signature`
-/// (`simple.md:688`). The bitfield is `[u8; ceil(C / 8)]` in the GP; it is
-/// modelled as a `Vec<u8>` and length-checked by the validator, not the codec.
-#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
+/// (`simple.md:688`). Three fixed-width fields and nothing else: the bitfield
+/// is `[u8; ceil(C / 8)]`, so it carries no length prefix.
+///
+/// Held as a `Vec<u8>` so a validator can report a bitfield of the wrong
+/// width as a fault rather than a decode failure, but encoded raw. A derived
+/// codec would put a compact length in front of it and make every assurance
+/// this harness sent one byte longer than the one a node expects.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Assurance {
     /// Header hash of the block being assured.
     pub anchor: HeaderHash,
@@ -18,6 +23,42 @@ pub struct Assurance {
     pub bitfield: Vec<u8>,
     /// Ed25519 signature over the assurance.
     pub signature: [u8; 64],
+}
+
+/// Bytes a bitfield occupies on the wire: one per eight cores
+/// (`simple.md:688`, GP `C`).
+///
+/// Derived here from the active core count rather than taken from the
+/// engine's own type, which is the point of this crate: a node is graded
+/// against an independent reading of the protocol. `m2-reference`'s
+/// `assurance::bitfield_len` asks the engine instead, and a test there holds
+/// the two together.
+pub fn bitfield_len() -> usize {
+    (jam_types::core_count() as usize).div_ceil(8)
+}
+
+impl Encode for Assurance {
+    fn encode_to<T: Output + ?Sized>(&self, dest: &mut T) {
+        dest.write(&self.anchor.0);
+        dest.write(&self.bitfield);
+        dest.write(&self.signature);
+    }
+}
+
+impl Decode for Assurance {
+    fn decode<I: Input>(input: &mut I) -> Result<Self, codec::Error> {
+        let mut anchor = [0u8; 32];
+        input.read(&mut anchor)?;
+        let mut bitfield = vec![0u8; bitfield_len()];
+        input.read(&mut bitfield)?;
+        let mut signature = [0u8; 64];
+        input.read(&mut signature)?;
+        Ok(Self {
+            anchor: HeaderHash::from(anchor),
+            bitfield,
+            signature,
+        })
+    }
 }
 
 /// CE 142: Preimage announcement (`simple.md:697-721`).
@@ -243,8 +284,12 @@ mod tests {
 
     // --- CE 141: Assurance -------------------------------------------------
 
+    /// The bitfield rides raw: `Anchor ++ Bitfield ++ Signature` and nothing
+    /// in between. A compact length in front of it -- which a derived codec
+    /// puts there -- makes every assurance one byte longer than the one a
+    /// node reads, and the extra byte shifts the signature out of place.
     #[test]
-    fn assurance_vector_2byte_bitfield() {
+    fn assurance_vector_has_no_length_before_the_bitfield() {
         let a = Assurance {
             anchor: HeaderHash::from([0x11; 32]),
             bitfield: vec![0xaa, 0xbb],
@@ -252,35 +297,52 @@ mod tests {
         };
         let bytes = a.encode();
         let mut expected = vec![0x11; 32]; // Header Hash (Anchor)
-        expected.extend_from_slice(&[0x02, 0xaa, 0xbb]); // compact(2) ++ Bitfield
+        expected.extend_from_slice(&[0xaa, 0xbb]); // Bitfield, raw
         expected.extend_from_slice(&sig64(0x30)); // Ed25519 Signature
         assert_eq!(bytes, expected);
-        assert_eq!(bytes.len(), 32 + 3 + 64);
+        assert_eq!(bytes.len(), 32 + 2 + 64);
     }
 
+    /// Decoding reads the width from the active core count, because the wire
+    /// does not carry it. A test that does not apply the parameters is
+    /// decoding against whatever the process last set.
     #[test]
     fn assurance_roundtrip() {
+        jam_types::ProtocolParameters::tiny()
+            .apply()
+            .expect("the tiny parameters are valid");
+        assert_eq!(bitfield_len(), 1, "two cores fit in one byte");
         let a = Assurance {
             anchor: HeaderHash::from([0x22; 32]),
             bitfield: vec![0xcc],
             signature: sig64(0x10),
         };
         let bytes = a.encode();
+        assert_eq!(bytes.len(), 32 + 1 + 64);
         let mut input: &[u8] = &bytes[..];
         let decoded = Assurance::decode(&mut input).unwrap();
-        assert!(input.is_empty());
+        assert!(
+            input.is_empty(),
+            "the message is exactly those three fields"
+        );
         assert_eq!(decoded, a);
     }
 
+    /// Built from `bitfield_len()` rather than from a literal width. The
+    /// message has no length prefix, so what counts as truncated depends on
+    /// the parameters in force, and a fixed-width case stops being short the
+    /// moment the core count changes.
     #[test]
     fn assurance_truncated_errs() {
+        jam_types::ProtocolParameters::tiny()
+            .apply()
+            .expect("the tiny parameters are valid");
+        let full = 32 + bitfield_len() + 64;
         // Header hash only.
         let mut input: &[u8] = &[0x11; 32];
         assert!(Assurance::decode(&mut input).is_err());
-        // Header hash + bitfield but missing the 64-byte signature.
-        let mut bytes = vec![0x11; 32];
-        bytes.extend_from_slice(&[0x02, 0xaa, 0xbb]);
-        bytes.extend_from_slice(&[0u8; 63]);
+        // One byte short of the whole message.
+        let bytes = vec![0x11; full - 1];
         let mut input: &[u8] = &bytes[..];
         assert!(Assurance::decode(&mut input).is_err());
         // Empty.

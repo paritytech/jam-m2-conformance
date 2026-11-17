@@ -941,17 +941,26 @@ fn a_bundle_codes_into_shards_and_a_bad_justification_is_refused() {
 
     // A justification of the wrong shape is reported as undecodable rather
     // than as a proof that failed: they are different findings.
-    match ask(
-        &mut stream,
-        Message::CheckBundleShard {
+    let served = |protocol: u16, segment_shards: Vec<u8>, justification: Vec<u8>| {
+        Message::CheckServedShard {
+            protocol,
             erasure_root: [0x11; 32],
             shard_index: 0,
             shard_count: 6,
             bundle_shard: shards[0].clone(),
-            segment_root: [0x22; 32],
-            justification: vec![0xff; 3],
-        },
-    ) {
+            segment_shards,
+            justification,
+        }
+    };
+    // One element: `0 ++ Hash`, which is what the wire carries and not a
+    // length-prefixed sequence.
+    let hash_element = |fill: u8| {
+        let mut element = vec![0u8];
+        element.extend_from_slice(&[fill; 32]);
+        element
+    };
+
+    match ask(&mut stream, served(138, Vec::new(), vec![0xff; 3])) {
         Message::ShardChecked { verified, detail } => {
             assert_eq!(verified, None, "undecodable is not `did not verify`");
             assert!(detail.is_some(), "and it says why");
@@ -959,30 +968,73 @@ fn a_bundle_codes_into_shards_and_a_bad_justification_is_refused() {
         other => panic!("expected ShardChecked, got {other:?}"),
     }
 
-    // A well-formed but wrong justification decodes and fails to verify.
-    let empty_justification = {
-        use jam_types::Encode;
-        Vec::<[u8; 32]>::new().encode()
-    };
-    match ask(
-        &mut stream,
-        Message::CheckBundleShard {
-            erasure_root: [0x11; 32],
-            shard_index: 0,
-            shard_count: 6,
-            bundle_shard: shards[0].clone(),
-            segment_root: [0x22; 32],
-            justification: empty_justification,
-        },
-    ) {
+    // Empty is refused before any proof is checked, the way polkajam's own
+    // reader refuses it.
+    match ask(&mut stream, served(138, Vec::new(), Vec::new())) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(verified, None);
+            assert!(
+                detail.as_deref().is_some_and(|d| d.contains("empty")),
+                "and it says so: {detail:?}"
+            );
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // CE 138 carries the segment root as its last element, so a
+    // justification of one element has a root and no proof left.
+    match ask(&mut stream, served(138, Vec::new(), hash_element(0x33))) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(verified, None);
+            assert!(
+                detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("once the segment root is off")),
+                "the root is taken off before the proof is judged: {detail:?}"
+            );
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // The same bytes under CE 137, which carries no root in the
+    // justification, are a one-element proof that decodes and does not
+    // verify. The two protocols reading one message differently is the
+    // reason the protocol travels with the request.
+    match ask(&mut stream, served(137, Vec::new(), hash_element(0x33))) {
         Message::ShardChecked { verified, detail } => {
             assert_eq!(
                 verified,
                 Some(false),
-                "a justification for nothing proves nothing ({detail:?})"
+                "a proof against the wrong root proves nothing ({detail:?})"
             );
         }
         other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // A well-formed CE 138 justification -- a proof element and a root --
+    // decodes and fails to verify against a root nothing was coded under.
+    let mut two = hash_element(0x44);
+    two.extend_from_slice(&hash_element(0x33));
+    match ask(&mut stream, served(138, Vec::new(), two)) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(
+                verified,
+                Some(false),
+                "decoded, and did not verify ({detail:?})"
+            );
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // A protocol that does not serve bundle shards is the caller's mistake,
+    // not the node's, so it comes back as `Error` rather than as a shard
+    // that failed to check.
+    match ask(&mut stream, served(139, Vec::new(), hash_element(0x33))) {
+        Message::Error(message) => assert!(
+            message.contains("139"),
+            "the error names the protocol: {message}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
     }
 }
 

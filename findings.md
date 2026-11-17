@@ -438,7 +438,8 @@ rule the node does not enforce — and which also failed in this run.
 
 ## 9. The hazmat availability export cannot build a justification
 
-**Status:** open upstream, fix proposed. Found 2026-11-17, starting N4.
+**Status:** open upstream; the harness is pinned to the proposed branch.
+Found 2026-11-17, starting N4.
 
 polkajam #1378 exported erasure coding and the justification builders so the
 harness could produce availability artifacts outside the node, and that is
@@ -475,6 +476,12 @@ becomes `pub(crate)` and `hazmat::merkle` re-exports `merkle_proofs`,
 `merkle_root`, `pack_erasure_tree_entry` and the proof types. The same shape
 as #1378 -- a re-export and a visibility bump, no behaviour change.
 
+The pin moved to that branch (`43689c3de`) on 2026-11-17, ahead of the PR:
+`merkle_root` is needed to check a CE 137 justification at all, since that
+protocol takes its segment root from the shards rather than from the
+justification (§11b). The pin goes back to a merge commit once the PR
+lands.
+
 ## 10. DESIGN had the erasure recovery threshold wrong
 
 **Status:** fixed in DESIGN 2026-11-17.
@@ -498,3 +505,62 @@ Found by asserting the wrong value in a reachability test and reading the
 failure, rather than by reading the table -- which is the only reason it was
 caught before the row was written. `CodedBundle` now carries the threshold
 from the engine so no lane has to hold a copy of this number.
+
+## 11. The harness's availability codecs were shape models, not the wire — CLOSED 2026-11-17
+
+**Status:** closed. Found 2026-11-17, wiring the N4 emulator against the real
+serving path; all three defects were the harness's own.
+
+`crates/jamnp-s/src/codec/ce137_148.rs` opens by saying so:
+
+> Shapes only: the harness does not produce real erasure data at this layer,
+> so all shards/segments/bundles are opaque `Vec<u8>`.
+
+That was a fair trade while nothing spoke those protocols. The moment N4
+started it stopped being one, and three separate things were wrong — each of
+which would have failed an honest node rather than erroring.
+
+**a. CE 137/138/139/140 replies are framed messages, not one structure.**
+`ShardResponse` and friends derive `Encode`/`Decode`, so a bundle shard
+decoded as a compact-length-prefixed `Vec<u8>` and the segment shards as a
+prefixed `Vec<Vec<u8>>`. The node writes neither. It writes a *sequence of
+whole messages* — bundle shard, then CE 137's segment shards concatenated
+with no boundary, then the justification — each with the stream's own
+`[len: u32 LE]` framing (`availability/net/mod.rs:358-368`, read back by
+`read_exact` / `read_decoded_bounded_seq`). Nothing in the reply says how
+long a shard is, because the reader already knows: the frame does.
+
+The justification is the sharpest case. Its elements are written back to
+back with **no count in front of them**, while the engine's own
+`BundleJustification` is a `BoundedVec` whose `Decode` expects a compact
+count. Handing the wire bytes to that decoder reads the first element's
+discriminator as a length.
+
+**b. The two bundle protocols take their segment root from different
+places.** CE 138 appends it as a final `0 ++ Hash` element and the reader
+pops it off before checking the proof; CE 137 omits it and the reader takes
+the Merkle root of the segment shards instead (`net/mod.rs:946-963` against
+`:1030-1046`). Reading one the other's way turns a sound proof into a failed
+one. This is now `CheckServedShard`'s `protocol` field, decided in the
+oracle: it is a rule both sides must apply identically, so it is applied in
+one place.
+
+**c. CE 141's bitfield had a length prefix.** `Assurance.bitfield` was a
+`Vec<u8>` with a derived codec, which puts a compact length in front of it.
+The wire is `AvailabilityStatement ++ Signature` and the bitfield is
+`[u8; ceil(C / 8)]` — fixed width, no prefix. Under tiny that is one extra
+byte, which shifts the 64-byte signature out of place: every assurance the
+harness sent would have been refused, and every one it received would have
+been read as a bad signature from a node that signed correctly.
+
+Two tests had the wrong vector written into them, which is why this survived
+a full suite. They now assert the raw layout, and
+`assurance::the_wire_and_the_engine_agree_about_the_width` holds the two
+independent readings of the width together — `jamnp-s` derives it from the
+core count, `m2-reference` asks the engine's type, and neither can drift
+alone because the wire carries nothing to contradict either.
+
+**The general shape.** All three are the same mistake in different places: a
+self-describing codec standing in for a wire whose lengths are carried out of
+band. A shape model is only safe while nothing sends it, and the comment
+saying so is not a guard.

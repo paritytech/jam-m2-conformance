@@ -287,19 +287,104 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             }
         }
 
-        Message::CheckBundleShard {
+        Message::CheckServedShard {
+            protocol,
             erasure_root,
             shard_index,
             shard_count,
             bundle_shard,
-            segment_root,
+            segment_shards,
             justification,
         } => {
-            // Decoded with the engine's own type, from the bytes that came
-            // off the wire. A justification this cannot read is not a failed
-            // proof -- it is a disagreement about the structure, and the two
-            // belong in different findings.
-            let mut cursor = &justification[..];
+            if protocol != 137 && protocol != 138 {
+                return Message::Error(format!(
+                    "CE {protocol} does not serve bundle shards; 137 and 138 do"
+                ));
+            }
+            // The wire carries the justification's elements back to back with
+            // no count in front of them (`simple.md:546`; polkajam writes them
+            // with `write_encoded_seq` and reads them back until the message
+            // runs out), while the engine's type decodes as an ordinary
+            // length-prefixed sequence. Walking the discriminator bytes to
+            // find the boundaries is a shape fact and nothing cryptographic,
+            // and it is the same walk CE 138 needs to find its segment root.
+            let Some(elements) = bundle_elements(&justification) else {
+                return Message::ShardChecked {
+                    verified: None,
+                    detail: Some(
+                        "the justification is not a sequence of 0++Hash / 1++Hash++Hash elements"
+                            .into(),
+                    ),
+                };
+            };
+            if elements.is_empty() {
+                // polkajam calls an empty justification a misbehaviour before
+                // it checks any proof, and so does this.
+                return Message::ShardChecked {
+                    verified: None,
+                    detail: Some("the justification is empty".into()),
+                };
+            }
+
+            // Where the segment root comes from is the one thing the two
+            // protocols do differently, and reading it from the wrong place
+            // fails an honest node rather than erroring.
+            let (proof_elements, segment_root) = if protocol == 138 {
+                // CE 138 appends the root as a final `0 ++ Hash`, which
+                // polkajam's reader pops off before checking the proof.
+                let last = elements[elements.len() - 1];
+                if last.len() != 33 || last[0] != 0 {
+                    return Message::ShardChecked {
+                        verified: None,
+                        detail: Some(
+                            "the CE 138 justification does not end in a segment root".into(),
+                        ),
+                    };
+                }
+                let mut root = [0u8; 32];
+                root.copy_from_slice(&last[1..]);
+                (&elements[..elements.len() - 1], root)
+            } else {
+                // CE 137 sends the segment shards instead, and the root is
+                // the Merkle root over them -- the engine's own, computed
+                // here rather than by a caller.
+                // The slice length is `SEGMENT_LEN / D(v)`, which the shard
+                // count already fixes. Derived rather than carried, so the
+                // caller has no way to disagree with the engine about it.
+                let slice_len = jam_types::segment_slice_len(shard_count as usize);
+                let slices = if segment_shards.is_empty() {
+                    // A package that exports nothing still has a root, over
+                    // no slices; the length is then immaterial, and a zero
+                    // one is refused by the constructor.
+                    jam_std_common::SegmentSliceVec::from_bytes(Vec::new(), 1)
+                } else {
+                    jam_std_common::SegmentSliceVec::from_bytes(segment_shards, slice_len)
+                };
+                let Some(slices) = slices else {
+                    return Message::ShardChecked {
+                        verified: None,
+                        detail: Some(format!(
+                            "the segment shards are not a whole number of {slice_len} byte slices"
+                        )),
+                    };
+                };
+                let root = jam_node::hazmat::merkle::merkle_root(&slices, slices.len());
+                (&elements[..], root)
+            };
+            if proof_elements.is_empty() {
+                return Message::ShardChecked {
+                    verified: None,
+                    detail: Some("the justification is empty once the segment root is off".into()),
+                };
+            }
+
+            // Re-prefixed and handed to the engine's own decoder: the bytes
+            // are the node's, only the count in front of them is ours.
+            let mut prefixed = codec::Compact(proof_elements.len() as u32).encode();
+            for element in proof_elements {
+                prefixed.extend_from_slice(element);
+            }
+            let mut cursor = &prefixed[..];
             let decoded = match Decode::decode(&mut cursor) {
                 Ok(decoded) => decoded,
                 Err(e) => {
@@ -309,21 +394,13 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
                     }
                 }
             };
-            if !cursor.is_empty() {
-                return Message::ShardChecked {
-                    verified: None,
-                    detail: Some(format!(
-                        "the justification has {} trailing bytes",
-                        cursor.len()
-                    )),
-                };
-            }
+
             let verified = jam_node::hazmat::availability::check_bundle_proof(
                 erasure_root.into(),
                 shard_index,
                 shard_count as usize,
                 jam_std_common::hash_raw(&bundle_shard),
-                segment_root.into(),
+                segment_root,
                 decoded,
             )
             .is_some();
@@ -759,6 +836,35 @@ fn with(
 
 fn hex8(bytes: &[u8; 32]) -> String {
     bytes[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Split a CE 137/138 justification into its elements, without decoding them.
+///
+/// The wire writes them concatenated and unprefixed, so the only thing that
+/// says where one ends is its discriminator: `0` is a hash, `1` is a pair of
+/// them. That is the shape of the message rather than a rule about the proof,
+/// which is why it is read here and the elements themselves are still handed
+/// to the engine's decoder.
+///
+/// `None` when the bytes are not a whole sequence of elements, which is a
+/// disagreement about the structure and not a proof that failed.
+fn bundle_elements(justification: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut elements = Vec::new();
+    let mut rest = justification;
+    while let Some((discriminator, body)) = rest.split_first() {
+        let len = match discriminator {
+            0 => 32,
+            1 => 64,
+            _ => return None,
+        };
+        if body.len() < len {
+            return None;
+        }
+        let (element, remainder) = rest.split_at(1 + len);
+        elements.push(element);
+        rest = remainder;
+    }
+    Some(elements)
 }
 
 #[cfg(test)]

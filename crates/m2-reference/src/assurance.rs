@@ -250,4 +250,28 @@ mod tests {
              engine's type rather than computed here"
         );
     }
+
+    /// Two readings of the same rule, and they have to agree.
+    ///
+    /// `jamnp-s` derives the width from the core count because it is the
+    /// independent implementation a node is graded against; this module asks
+    /// the engine's own type. Either one alone could drift without anything
+    /// noticing, because the wire carries no length to contradict it -- and
+    /// a signature read one byte out of place is a `BadSignature` finding
+    /// against a node that did nothing wrong.
+    #[test]
+    fn the_wire_and_the_engine_agree_about_the_width() {
+        tiny();
+        assert_eq!(
+            bitfield_len(),
+            jamnp_s::codec::ce141_145::bitfield_len(),
+            "the codec and the engine must measure the bitfield alike"
+        );
+        let assurance = sign_assurance(1, [0x5a; 32], &[0]);
+        assert_eq!(
+            jam_types::Encode::encode(&assurance).len(),
+            32 + bitfield_len() + 64,
+            "`Anchor ++ Bitfield ++ Signature`, with nothing in between"
+        );
+    }
 }

@@ -95,3 +95,22 @@ pub const EMU_SENT_134: u8 = 56;
 /// Its absence, where the stream was not reset either, is a node that took
 /// the bundle and said nothing -- neither refusing nor refining.
 pub const NUT_ANSWERED_134: u8 = 57;
+
+// --- N4: availability ---------------------------------------------------
+//
+// Here rather than beside the code that records them, which is where they
+// started. One file holds every code precisely so that two lanes cannot pick
+// the same number, and a registry kept in two places is not a registry.
+
+/// The NUT sent something on CE 141 that is not an assurance.
+pub const NUT_SENT_BAD_ASSURANCE: u8 = 58;
+/// The harness offered the NUT an assurance over CE 141.
+pub const SENT_ASSURANCE: u8 = 59;
+/// The NUT answered a CE 139/140 segment-shard request.
+pub const SERVED_SEGMENT_SHARDS: u8 = 60;
+/// The NUT answered a CE 138 audit-shard request.
+///
+/// CE 137 has [`crate::dsl::ObsKind::ServesCe137`] of its own; CE 138 is the
+/// same question asked without the segment shards, and a lane that could not
+/// tell the two apart would read either as both.
+pub const SERVED_BUNDLE_SHARD: u8 = 61;
