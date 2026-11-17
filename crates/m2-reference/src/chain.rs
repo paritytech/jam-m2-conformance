@@ -58,6 +58,12 @@ pub fn slot_start_ms(slot: u32) -> u64 {
     (jam_types::JAM_COMMON_ERA + u64::from(slot) * SLOT_PERIOD_SEC) * 1000
 }
 
+/// The slot a wall-clock millisecond falls in, the inverse of
+/// [`slot_start_ms`].
+pub fn slot_of_ms(at_ms: u64) -> u32 {
+    ((at_ms / 1000).saturating_sub(jam_types::JAM_COMMON_ERA) / SLOT_PERIOD_SEC) as u32
+}
+
 /// First slot of the current epoch.
 ///
 /// polkajam gates ticket acceptance and authoring on the finalized block being

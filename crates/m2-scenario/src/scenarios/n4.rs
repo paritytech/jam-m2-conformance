@@ -12,6 +12,14 @@
 //! `m2-reference`. A lane that coded its own shards would be grading a node
 //! against a second implementation of Reed–Solomon, which is the mistake
 //! `proxy_index` already made once in this harness.
+//!
+//! **What a pass here does not yet mean.** Every row is graded on a
+//! deterministic baseline and none of them has been shown to *fail* against
+//! a node that misbehaves: there are no availability variants in `m2-sim`,
+//! so nothing proves these checks catch anything. Until there are, `n4` is
+//! asked for by name rather than being in the default lane set, and a green
+//! N4 should be read as "nothing contradicted the node", not as "the node
+//! was checked".
 
 use crate::dsl::{check, log, Check, Control, Severity};
 

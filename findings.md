@@ -564,3 +564,49 @@ alone because the wire carries nothing to contradict either.
 self-describing codec standing in for a wire whose lengths are carried out of
 band. A shape model is only safe while nothing sends it, and the comment
 saying so is not a guard.
+
+## 12. N4's plan cannot be written before the run, and that is the protocol's doing
+
+**Status:** not a defect — a design note, recorded because the first attempt
+got it wrong. 2026-11-17, wiring N4 into a real run.
+
+Every other plan this harness makes is laid out before the observation
+window: the ticket schedule, the CE 133 submission, the report to distribute,
+the bundles to share. N4's cannot be, and the reason is worth writing down
+because the obvious alternative is wrong in a way that reads as a node
+defect.
+
+CE 137/138/139/140 are *fetches against an erasure root*. A node serves
+shards for the bundles it holds, and it holds the ones it guaranteed. The
+harness knows several erasure roots before a run starts — every bundle it
+built itself — and the node is entitled to answer `NoData` for every one of
+them, because it never saw those bundles. A lane that asked for one of those
+would record a refusal and fail `n4_ce137_answered` against a node doing
+exactly the right thing.
+
+The only root a node owes shards for is one **it** published. That root
+exists only once the node has guaranteed a package and distributed the
+report, which is mid-run. So:
+
+- the harness submits a package over CE 133 (N3's machinery, which N4 now
+  also depends on — `LaneSet::needs_package` covers both),
+- a watcher waits for the node's own CE 135 distribution and reads
+  `package_spec.erasure_root`, `erasure_shards` and `exports_count` straight
+  off the report's bytes,
+- the plan goes out on a watch of its own, because `plans_set` has long
+  since flipped by then and a driver waiting on that would read an empty
+  plan and do nothing.
+
+A run where the node guarantees nothing therefore exercises no N4 fetch. The
+lane says so, which is the truth, rather than failing the node for the
+harness having nothing to ask about.
+
+**The assurance rounds are split for a related reason.** The three
+deliberate faults (`WrongAnchor`, `BadSignature`, `EmptyCore`) must come from
+validators that did *not* already send an honest assurance for the same
+anchor — otherwise the node drops the second as a duplicate, and
+`n4_ce141_invalid_assurance_excluded` passes for a reason that has nothing to
+do with the assurance being invalid. So the honest round and the spoiled
+round sit three slots apart, against different blocks. With a supermajority
+threshold of 5 of 6, that also keeps the honest round complete enough for
+`n4_availability_threshold_reached` to mean something.

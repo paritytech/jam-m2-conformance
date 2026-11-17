@@ -24,12 +24,14 @@ use jamnp_s::{
         ce137_148::{SegmentShardRequest, ShardRequest},
         ce141_145::Assurance,
     },
-    framing::{frame, CE137, CE140, CE141},
+    framing::{frame, CE137, CE138, CE139, CE140, CE141},
     trace::{wall_ts, Direction as TraceDir, Trace},
     transport::Conn,
 };
 use m2_scenario::dsl::{ObsKind, ObsLog};
-use m2_scenario::scenarios::n4::{AssuranceSeen, SegmentShardsServed, ShardServed};
+use m2_scenario::scenarios::n4::{
+    AssuranceFaultKind, AssuranceOffered, AssuranceSeen, SegmentShardsServed, ShardServed,
+};
 use m2_scenario::scenarios::obs::{
     NUT_SENT_BAD_ASSURANCE, SENT_ASSURANCE, SERVED_BUNDLE_SHARD, SERVED_SEGMENT_SHARDS,
 };
@@ -289,14 +291,233 @@ async fn exchange(
     Some(Exchange::Answered(messages))
 }
 
+/// What one emulated validator does about availability in a run.
+///
+/// The erasure root is not known when the run is planned: it is the one the
+/// NUT published in a report it guaranteed, so it exists only once the node
+/// has guaranteed something. The plan is therefore set mid-run, which is why
+/// it travels on its own watch rather than with the rest.
+#[derive(Clone, Debug)]
+pub struct AvailPlan {
+    /// The erasure root the NUT guaranteed. Its own: a root the harness
+    /// guaranteed would be one the node is right to answer `NoData` for.
+    pub erasure_root: [u8; 32],
+    /// Shards the report declared it was coded into (`erasure_shards`).
+    pub shard_count: u16,
+    /// Segment indices to ask for over CE 139 and CE 140.
+    ///
+    /// Empty where the package exported nothing, in which case those two
+    /// protocols are not exercised rather than asked for segments that do
+    /// not exist.
+    pub segment_indices: Vec<u16>,
+    /// Cores the harness believes carried a report, which is what an honest
+    /// assurance claims.
+    pub cores: Vec<u16>,
+    /// Slot the honest assurances go out in.
+    pub honest_slot: u32,
+    /// Slot the deliberately spoiled ones go out in.
+    ///
+    /// A different slot, and so a different anchor, on purpose. A validator
+    /// that sent an honest assurance and a spoiled one for the *same* block
+    /// would have its second dropped as a duplicate, and the row asking
+    /// whether the node excludes invalid assurances would pass for the wrong
+    /// reason.
+    pub spoiled_slot: u32,
+}
+
+/// Run one emulated validator's availability exchange against the NUT.
+///
+/// Four fetches for its own shard index, then an honest assurance, then a
+/// spoiled one. Everything it learns goes into the shared records; nothing
+/// here decides whether any of it was right.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_availability(
+    connection: &Conn,
+    peer: u16,
+    plan: &AvailPlan,
+    trace: &Arc<Mutex<Trace>>,
+    obs: &Arc<Mutex<ObsLog>>,
+    shards_served: &Arc<Mutex<Vec<ShardServed>>>,
+    segment_shards_served: &Arc<Mutex<Vec<SegmentShardsServed>>>,
+    assurances_offered: &Arc<Mutex<Vec<AssuranceOffered>>>,
+    anchor_of: impl Fn() -> Option<[u8; 32]>,
+) {
+    // Its own index, because that is the shard a validator is entitled to:
+    // `simple.md:523-556` is a validator fetching the piece it must assure.
+    let shard_index = peer;
+
+    for protocol in [CE137, CE138] {
+        if let Some(served) = request_shard(
+            connection,
+            protocol,
+            plan.erasure_root,
+            shard_index,
+            // The lane leaves the byte comparison unmade: the harness did
+            // not build this bundle, the node did, so it has nothing to
+            // compare against. Predicting it would mean refining the
+            // package a second time and calling the result authoritative.
+            None,
+            peer,
+            trace,
+            obs,
+        )
+        .await
+        {
+            lock(shards_served).push(served);
+        }
+    }
+
+    if !plan.segment_indices.is_empty() {
+        for protocol in [CE139, CE140] {
+            if let Some(served) = request_segment_shards(
+                connection,
+                protocol,
+                plan.erasure_root,
+                shard_index,
+                plan.shard_count,
+                plan.segment_indices.clone(),
+                peer,
+                trace,
+                obs,
+            )
+            .await
+            {
+                lock(segment_shards_served).push(served);
+            }
+        }
+    }
+
+    // The honest one first. Its anchor is read now rather than planned: the
+    // block to assure is whichever one the chain is on, and a hash chosen
+    // when the plan was written would name a block several slots old.
+    sleep_until_slot(plan.honest_slot).await;
+    if let Some(anchor) = anchor_of() {
+        let assurance = m2_reference::assurance::sign_assurance(peer, anchor, &plan.cores);
+        if send_assurance(connection, &assurance, peer, trace, obs).await {
+            lock(assurances_offered).push(AssuranceOffered {
+                validator: peer,
+                anchor,
+                cores: plan.cores.clone(),
+                sent_in_slot: plan.honest_slot,
+                included: false,
+                had_opportunity: false,
+                fault: None,
+            });
+        }
+    }
+
+    // Then one that is wrong on purpose, so the row asking whether the node
+    // leaves invalid assurances out is exercised rather than merely absent.
+    sleep_until_slot(plan.spoiled_slot).await;
+    let Some(anchor) = anchor_of() else { return };
+    let kind = spoil_for(peer);
+    // `None` where this validator cannot pose its fault -- there is no
+    // empty core to claim when every core carried a report. Sending some
+    // other fault instead would mean the run graded a different rule from
+    // the one it recorded.
+    let Some((assurance, claimed_cores)) = spoil(peer, anchor, &plan.cores, kind) else {
+        return;
+    };
+    if send_assurance(connection, &assurance, peer, trace, obs).await {
+        lock(assurances_offered).push(AssuranceOffered {
+            validator: peer,
+            anchor: assurance.anchor.0,
+            cores: claimed_cores,
+            sent_in_slot: plan.spoiled_slot,
+            included: false,
+            had_opportunity: false,
+            fault: Some(kind),
+        });
+    }
+}
+
+/// Which fault this validator poses.
+///
+/// By index, so a run poses all three where there are three or more
+/// emulated validators, and so the same validator poses the same one on
+/// every run. A random choice would make a failing row unreproducible.
+fn spoil_for(peer: u16) -> AssuranceFaultKind {
+    match peer % 3 {
+        0 => AssuranceFaultKind::WrongAnchor,
+        1 => AssuranceFaultKind::BadSignature,
+        _ => AssuranceFaultKind::EmptyCore,
+    }
+}
+
+/// Build an assurance that is wrong in exactly one way.
+///
+/// Each fault is posed at the level it belongs to: a wrong anchor is signed
+/// genuinely over a block that does not exist, a bad signature is a genuine
+/// statement signed by someone else, and an empty core is a genuine
+/// signature over a claim about a core carrying nothing. A node that catches
+/// one and not another is a node with a specific hole, which is what the
+/// lane grades them separately for.
+fn spoil(
+    peer: u16,
+    anchor: [u8; 32],
+    cores: &[u16],
+    kind: AssuranceFaultKind,
+) -> Option<(Assurance, Vec<u16>)> {
+    match kind {
+        AssuranceFaultKind::WrongAnchor => {
+            // A hash nothing hashes to: the block it names was never
+            // authored, so there is nothing to assure. The signature over it
+            // is genuine, so a node that lets this through is not checking
+            // anchors at all.
+            let mut absent = anchor;
+            absent[0] ^= 0xff;
+            Some((
+                m2_reference::assurance::sign_assurance(peer, absent, cores),
+                cores.to_vec(),
+            ))
+        }
+        AssuranceFaultKind::BadSignature => {
+            // Signed by the next validator along and sent as this one. CE
+            // 141 carries no validator index -- the node reads it off the
+            // connection -- so the statement is sound and only the hand that
+            // signed it is wrong.
+            Some((
+                m2_reference::assurance::sign_assurance(peer.wrapping_add(1), anchor, cores),
+                cores.to_vec(),
+            ))
+        }
+        AssuranceFaultKind::EmptyCore => {
+            // A core the harness knows carried no report, signed properly,
+            // so only the claim is false. Where every core carried one there
+            // is no such claim to make, and posing some other fault instead
+            // would grade a different rule from the one recorded.
+            let empty = (0..jam_types::core_count()).find(|core| !cores.contains(core))?;
+            let claimed = vec![empty];
+            Some((
+                m2_reference::assurance::sign_assurance(peer, anchor, &claimed),
+                claimed,
+            ))
+        }
+    }
+}
+
+/// Wait until `slot` begins.
+async fn sleep_until_slot(slot: u32) {
+    let target_ms = crate::emu::slot_start_ms(slot);
+    loop {
+        let now = wall_ts();
+        if now >= target_ms {
+            return;
+        }
+        jamnp_s::clock::current()
+            .sleep(std::time::Duration::from_millis(target_ms - now))
+            .await;
+    }
+}
+
 /// Turn the assurances the node sent into the lane's facts.
 ///
-/// The anchor it should have used and the cores that carried reports come
-/// from the run; this only pairs them with what arrived.
+/// The blocks the node could have been assuring and the cores that carried
+/// reports come from the run; this only pairs them with what arrived.
 pub fn assurances_for_lane(
     raw: &[RawAssurance],
     nut_index: u16,
-    expected_anchor: [u8; 32],
+    known_anchors: &[[u8; 32]],
     reported_cores: &[u16],
     slot_start_ms: impl Fn(u64) -> i64,
 ) -> Vec<AssuranceSeen> {
@@ -305,7 +526,7 @@ pub fn assurances_for_lane(
             let fault = m2_reference::assurance::check_assurance(
                 &entry.assurance,
                 nut_index,
-                expected_anchor,
+                known_anchors,
             )
             .err()
             .map(|fault| format!("{fault:?}"));
@@ -405,7 +626,7 @@ mod tests {
         handle_inbound_assurance(&assurance.encode(), 5, &obs, &seen);
         assert_eq!(lock(&seen).len(), 1);
 
-        let facts = assurances_for_lane(&lock(&seen), 5, [0x7d; 32], &[0], |_| 2000);
+        let facts = assurances_for_lane(&lock(&seen), 5, &[[0x7d; 32]], &[0], |_| 2000);
         assert_eq!(facts.len(), 1);
         assert!(
             facts[0]
@@ -427,7 +648,7 @@ mod tests {
         let seen = Mutex::new(Vec::new());
         handle_inbound_assurance(&assurance.encode(), 5, &obs, &seen);
 
-        let facts = assurances_for_lane(&lock(&seen), 5, anchor, &[0], |_| 1500);
+        let facts = assurances_for_lane(&lock(&seen), 5, &[anchor], &[0], |_| 1500);
         assert_eq!(facts[0].fault, None);
         assert_eq!(facts[0].lead_ms, 1500);
         assert_eq!(facts[0].reported_cores, vec![0]);

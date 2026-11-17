@@ -28,8 +28,15 @@ pub enum AssuranceFault {
     BitfieldLength { got: usize, want: usize },
     /// A bit is set beyond the active core count.
     BitBeyondCores { bit: u16, cores: u16 },
-    /// The anchor is not the block the assurance should be against.
-    WrongAnchor { got: [u8; 32], want: [u8; 32] },
+    /// The anchor names no block the harness has seen.
+    ///
+    /// A set rather than one expected hash. Which block a node assures is
+    /// its own choice -- `simple.md:679-680` puts the assurance roughly two
+    /// seconds before a slot, and the head at that instant is not something
+    /// the harness can name in advance. What it can say is that the anchor
+    /// must be a block that exists, and a node assuring one nobody authored
+    /// is assuring nothing.
+    WrongAnchor { got: [u8; 32], known: usize },
     /// The signature does not verify against that validator's key.
     BadSignature,
 }
@@ -76,14 +83,14 @@ pub fn sign_assurance(index: u16, anchor: [u8; 32], cores: &[u16]) -> Assurance 
 
 /// Check an assurance the node sent: shape, anchor, and signature.
 ///
-/// `expected_anchor` is the block the lane believes the assurance should be
-/// against. The active core count comes from the parameters in force, and
-/// the validator's public key from its index, the same way
-/// [`sign_assurance`] takes the secret.
+/// `known_anchors` is every block the harness has seen the node on. The
+/// active core count comes from the parameters in force, and the validator's
+/// public key from its index, the same way [`sign_assurance`] takes the
+/// secret.
 pub fn check_assurance(
     assurance: &Assurance,
     index: u16,
-    expected_anchor: [u8; 32],
+    known_anchors: &[[u8; 32]],
 ) -> Result<(), AssuranceFault> {
     let cores = jam_types::core_count();
     let want = bitfield_len();
@@ -101,10 +108,10 @@ pub fn check_assurance(
             return Err(AssuranceFault::BitBeyondCores { bit, cores });
         }
     }
-    if assurance.anchor.0 != expected_anchor {
+    if !known_anchors.contains(&assurance.anchor.0) {
         return Err(AssuranceFault::WrongAnchor {
             got: assurance.anchor.0,
-            want: expected_anchor,
+            known: known_anchors.len(),
         });
     }
 
@@ -162,7 +169,7 @@ mod tests {
         let cores = tiny();
         let anchor = [0x5a; 32];
         let assurance = sign_assurance(3, anchor, &(0..cores).collect::<Vec<_>>());
-        assert_eq!(check_assurance(&assurance, 3, anchor), Ok(()));
+        assert_eq!(check_assurance(&assurance, 3, &[anchor]), Ok(()));
         assert_eq!(assured_cores(&assurance), (0..cores).collect::<Vec<_>>());
     }
 
@@ -177,7 +184,7 @@ mod tests {
         assert_eq!(assured_cores(&assurance), vec![0]);
         assurance.bitfield[0] |= 0b10;
         assert_eq!(
-            check_assurance(&assurance, 3, anchor),
+            check_assurance(&assurance, 3, &[anchor]),
             Err(AssuranceFault::BadSignature)
         );
     }
@@ -188,7 +195,7 @@ mod tests {
         let anchor = [0x5a; 32];
         let assurance = sign_assurance(3, anchor, &[0]);
         assert_eq!(
-            check_assurance(&assurance, 4, anchor),
+            check_assurance(&assurance, 4, &[anchor]),
             Err(AssuranceFault::BadSignature)
         );
     }
@@ -201,10 +208,10 @@ mod tests {
         // Reporting `BadSignature` here would send a reader looking at the
         // node's keys instead of at which block it assured.
         assert_eq!(
-            check_assurance(&assurance, 3, [0x5b; 32]),
+            check_assurance(&assurance, 3, &[[0x5b; 32]]),
             Err(AssuranceFault::WrongAnchor {
                 got: [0x5a; 32],
-                want: [0x5b; 32],
+                known: 1,
             })
         );
     }
@@ -217,7 +224,7 @@ mod tests {
         let mut assurance = sign_assurance(3, anchor, &[0]);
         assurance.bitfield.push(0);
         assert_eq!(
-            check_assurance(&assurance, 3, anchor),
+            check_assurance(&assurance, 3, &[anchor]),
             Err(AssuranceFault::BitfieldLength {
                 got: want + 1,
                 want
@@ -235,7 +242,7 @@ mod tests {
         let mut assurance = sign_assurance(3, anchor, &[0]);
         assurance.bitfield[0] |= 1 << 7;
         assert_eq!(
-            check_assurance(&assurance, 3, anchor),
+            check_assurance(&assurance, 3, &[anchor]),
             Err(AssuranceFault::BitBeyondCores { bit: 7, cores })
         );
     }
@@ -248,6 +255,26 @@ mod tests {
             cores.div_ceil(8) as usize,
             "one byte per eight cores, as the GP says -- but read off the \
              engine's type rather than computed here"
+        );
+    }
+
+    /// Any block the harness has seen will do. Pinning one expected anchor
+    /// would fail an honest node for choosing a different head two seconds
+    /// before its slot, which is its own choice to make.
+    #[test]
+    fn an_anchor_is_judged_against_every_block_the_harness_knows() {
+        tiny();
+        let anchor = [0x5a; 32];
+        let assurance = sign_assurance(3, anchor, &[0]);
+        let known = [[0x01; 32], anchor, [0x02; 32]];
+        assert_eq!(check_assurance(&assurance, 3, &known), Ok(()));
+        assert_eq!(
+            check_assurance(&assurance, 3, &[]),
+            Err(AssuranceFault::WrongAnchor {
+                got: anchor,
+                known: 0,
+            }),
+            "with no blocks to check against, nothing is anchored"
         );
     }
 

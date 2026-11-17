@@ -106,6 +106,13 @@ pub struct Emulator {
     distributed: Arc<Mutex<Vec<DistributedReport>>>,
     /// CE 134 shares the emulator opened to the NUT.
     share_plan: Arc<Mutex<Vec<ScheduledShare>>>,
+    /// This run's availability plan; see [`EmuShared::avail_plan`].
+    avail_plan: Arc<Mutex<Option<crate::avail_io::AvailPlan>>>,
+    /// Flips once an availability plan has been set.
+    avail_set: Arc<watch::Sender<bool>>,
+    shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::ShardServed>>>,
+    segment_shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentShardsServed>>>,
+    assurances_offered: Arc<Mutex<Vec<m2_scenario::scenarios::n4::AssuranceOffered>>>,
     shared_to_nut: Arc<Mutex<Vec<SharedToNut>>>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
     ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
@@ -129,6 +136,25 @@ pub struct Emulator {
     /// mean holding that lock across a write. A subscriber also disappears on
     /// its own when its stream task ends.
     announce: broadcast::Sender<Vec<u8>>,
+}
+
+/// Sets this run's availability plan and wakes every connection's driver.
+///
+/// A root the harness guaranteed would be one the node is right to answer
+/// `NoData` for, so the plan waits for one the *node* published.
+#[derive(Clone)]
+pub struct AvailPlanner {
+    plan: Arc<Mutex<Option<crate::avail_io::AvailPlan>>>,
+    set: Arc<watch::Sender<bool>>,
+}
+
+impl AvailPlanner {
+    /// Publish the plan. After the plan, never before: a driver woken by the
+    /// flag reads the plan straight away.
+    pub fn set(&self, plan: crate::avail_io::AvailPlan) {
+        *lock(&self.plan) = Some(plan);
+        self.set.send_replace(true);
+    }
 }
 
 /// Everything a connection handler shares with the rest of the emulator.
@@ -175,6 +201,22 @@ pub struct EmuShared {
     /// CE 134 shares the emulator opened to the NUT.
     pub share_plan: Arc<Mutex<Vec<ScheduledShare>>>,
     pub shared_to_nut: Arc<Mutex<Vec<SharedToNut>>>,
+    /// This run's availability plan, or `None` until one exists.
+    ///
+    /// Unlike every other plan, this one cannot be written before the run:
+    /// it is built around an erasure root the NUT published, which exists
+    /// only once the node has guaranteed something. Hence a watch of its
+    /// own -- `plans_set` has already flipped by then, so a driver waiting
+    /// on that would read an empty plan and do nothing.
+    pub avail_plan: Arc<Mutex<Option<crate::avail_io::AvailPlan>>>,
+    /// Flips once an availability plan exists.
+    pub avail_set: watch::Receiver<bool>,
+    /// CE 137/138 replies the NUT served.
+    pub shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::ShardServed>>>,
+    /// CE 139/140 replies the NUT served.
+    pub segment_shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentShardsServed>>>,
+    /// CE 141 assurances the emulator offered the NUT.
+    pub assurances_offered: Arc<Mutex<Vec<m2_scenario::scenarios::n4::AssuranceOffered>>>,
     /// Tickets actually put on the wire, with the wall-clock time they were
     /// sent. The sender knows each ticket's id, so the N1 lane reads this
     /// rather than re-deriving ids from the observation log.
@@ -353,6 +395,11 @@ impl Emulator {
             distributed: Arc::new(Mutex::new(Vec::new())),
             share_plan: Arc::new(Mutex::new(Vec::new())),
             shared_to_nut: Arc::new(Mutex::new(Vec::new())),
+            avail_plan: Arc::new(Mutex::new(None)),
+            avail_set: Arc::new(watch::channel(false).0),
+            shards_served: Arc::new(Mutex::new(Vec::new())),
+            segment_shards_served: Arc::new(Mutex::new(Vec::new())),
+            assurances_offered: Arc::new(Mutex::new(Vec::new())),
             deliveries: Arc::new(Mutex::new(Vec::new())),
             ce128_probes: Arc::new(Mutex::new(Vec::new())),
             ce129_probes: Arc::new(Mutex::new(Vec::new())),
@@ -425,6 +472,39 @@ impl Emulator {
         Arc::clone(&self.shared_to_nut)
     }
 
+    /// A handle that can set this run's availability plan.
+    ///
+    /// Handed out rather than setting through the `Emulator` itself,
+    /// because the plan is written by a task that outlives this borrow: it
+    /// is built mid-run, once the NUT has published a report of its own, and
+    /// by then the emulator has been moved into the run's observation
+    /// source.
+    pub fn avail_planner(&self) -> AvailPlanner {
+        AvailPlanner {
+            plan: Arc::clone(&self.avail_plan),
+            set: Arc::clone(&self.avail_set),
+        }
+    }
+
+    /// CE 137/138 replies the NUT served.
+    pub fn shards_served(&self) -> Arc<Mutex<Vec<m2_scenario::scenarios::n4::ShardServed>>> {
+        Arc::clone(&self.shards_served)
+    }
+
+    /// CE 139/140 replies the NUT served.
+    pub fn segment_shards_served(
+        &self,
+    ) -> Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentShardsServed>>> {
+        Arc::clone(&self.segment_shards_served)
+    }
+
+    /// CE 141 assurances the emulator offered the NUT.
+    pub fn assurances_offered(
+        &self,
+    ) -> Arc<Mutex<Vec<m2_scenario::scenarios::n4::AssuranceOffered>>> {
+        Arc::clone(&self.assurances_offered)
+    }
+
     /// The tickets the emulator put on the wire, with their send times.
     pub fn deliveries(&self) -> Arc<Mutex<Vec<DeliveredTicket>>> {
         Arc::clone(&self.deliveries)
@@ -471,6 +551,11 @@ impl Emulator {
             report_plan: Arc::clone(&self.report_plan),
             distributed: Arc::clone(&self.distributed),
             share_plan: Arc::clone(&self.share_plan),
+            avail_plan: Arc::clone(&self.avail_plan),
+            avail_set: self.avail_set.subscribe(),
+            shards_served: Arc::clone(&self.shards_served),
+            segment_shards_served: Arc::clone(&self.segment_shards_served),
+            assurances_offered: Arc::clone(&self.assurances_offered),
             shared_to_nut: Arc::clone(&self.shared_to_nut),
             deliveries: Arc::clone(&self.deliveries),
             ce128_probes: Arc::clone(&self.ce128_probes),
@@ -772,6 +857,7 @@ async fn endpoint_task(
         start_ticket_delivery(&connection, peer_index, &shared);
         start_report_distribution(&connection, peer_index, &shared);
         start_share_to_nut(&connection, peer_index, &shared);
+        start_availability(&connection, peer_index, &shared);
         start_sync_probe(&connection, peer_index, &shared);
         // One task per connection: with UP 0 persistent the handler runs for
         // the lifetime of the connection, so awaiting it here would stall the
@@ -781,6 +867,52 @@ async fn endpoint_task(
             handle_connection(connection, peer_index, genesis_hash, shared).await;
         });
     }
+}
+
+/// Spawn this peer's availability exchange, once a plan exists.
+///
+/// Not claimed, unlike the report and the shares: every validator fetches
+/// *its own* shard and sends *its own* assurance, so there is nothing here
+/// for one connection to take on behalf of the others. Five emulated
+/// validators mean five shard indices asked for and five assurances offered,
+/// which is what the protocol describes happening.
+fn start_availability(connection: &Conn, peer: u16, shared: &EmuShared) {
+    let connection = connection.clone();
+    let mut avail_set = shared.avail_set.clone();
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        while !*avail_set.borrow_and_update() {
+            // Err only once the `Emulator` is dropped, which ends the run.
+            if avail_set.changed().await.is_err() {
+                return;
+            }
+        }
+        let Some(plan) = lock(&shared.avail_plan).clone() else {
+            return;
+        };
+        let nut_blocks = Arc::clone(&shared.nut_blocks);
+        crate::avail_io::drive_availability(
+            &connection,
+            peer,
+            &plan,
+            &shared.trace,
+            &shared.obs,
+            &shared.shards_served,
+            &shared.segment_shards_served,
+            &shared.assurances_offered,
+            // Read at send time, not planned: the block to assure is
+            // whichever one the chain is on two seconds before the slot,
+            // and a hash chosen when the plan was written names a block
+            // several slots old by then.
+            move || {
+                lock(&nut_blocks)
+                    .iter()
+                    .max_by_key(|nut| nut.block.header.slot)
+                    .map(|nut| nut.block.header.hash().0)
+            },
+        )
+        .await;
+    });
 }
 
 /// Spawn the CE 134 sharer on this connection, if it claims this run's
