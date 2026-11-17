@@ -435,3 +435,66 @@ on this code path yesterday".
 
 Related: §4, the oversized first message, which is the same shape — a size
 rule the node does not enforce — and which also failed in this run.
+
+## 9. The hazmat availability export cannot build a justification
+
+**Status:** open upstream, fix proposed. Found 2026-11-17, starting N4.
+
+polkajam #1378 exported erasure coding and the justification builders so the
+harness could produce availability artifacts outside the node, and that is
+what let the N4 lane start. It is not sufficient for half of it.
+
+`bundle_justification` and `segment_justification` both take a `ShardProof`,
+and nothing outside `jam-node` can build one. Every top-level module in that
+crate is private except `hazmat`, so only its explicit re-exports are
+reachable, and the Merkle layer is not among them. Tracing what the node
+itself does to turn a bundle into a servable shard
+(`availability/mod.rs:190-215`):
+
+| step | exported |
+|---|---|
+| `erasure_shards(bundle, n)` | yes |
+| `segments_shards(segments, n)` | yes |
+| `merkle_root(s, len)` | **no** — `util::merkle` |
+| `pack_erasure_tree_entry(hash, root)` | **no** — `util::merkle` |
+| `merkle_proofs(entries, len)` | **no** — `util::merkle` |
+| `bundle_justification(&ShardProof)` | yes, and uncallable without the above |
+
+`check_bundle_proof` and `check_segment_proof` take wire types and are fully
+usable. So the harness can **verify** a node's justification and cannot
+**construct** its own.
+
+**What that costs.** Five of DESIGN's seven N4 rows are the node producing
+and the harness checking -- CE 137/138/139/140 serve, CE 141 send, CE 141
+receive to inclusion -- and all are reachable now. The two where the
+*harness* must serve shards to the node, CE 137 fetch and CE 139/140 fetch,
+are not.
+
+**Proposed upstream**, on polkajam branch `jv-export-n4`: `util::merkle`
+becomes `pub(crate)` and `hazmat::merkle` re-exports `merkle_proofs`,
+`merkle_root`, `pack_erasure_tree_entry` and the proof types. The same shape
+as #1378 -- a re-export and a visibility bump, no behaviour change.
+
+## 10. DESIGN had the erasure recovery threshold wrong
+
+**Status:** fixed in DESIGN 2026-11-17.
+
+DESIGN §2's tiny-parameter table said "EC recovery 2 shards" and the §11 N4
+row said the node "reconstructs imports from 2 shards". It is **three**:
+
+```rust
+pub const fn erasure_recovery_count(val_count: usize) -> usize {
+    let mut recovery_count = val_count / VALS_PER_CORE + 1;   // 6/3 + 1 = 3
+    while !SEGMENT_LEN.is_multiple_of(POINT_LEN * recovery_count) { recovery_count -= 1; }
+    recovery_count
+}
+```
+
+polkajam pins it with `erasure_recovery_count_matches_gp`: 6 to 3, 78 to 27,
+1023 to 342. A CE 139/140 fetch row written from DESIGN would have asked a
+conforming node to reconstruct from one shard too few and failed it.
+
+Found by asserting the wrong value in a reachability test and reading the
+failure, rather than by reading the table -- which is the only reason it was
+caught before the row was written. `CodedBundle` now carries the threshold
+from the engine so no lane has to hold a copy of this number.

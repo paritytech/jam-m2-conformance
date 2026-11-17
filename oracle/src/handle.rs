@@ -272,6 +272,67 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             }
         }
 
+        Message::CodeBundle {
+            bundle,
+            shard_count,
+        } => {
+            let count = shard_count as usize;
+            match jam_node::hazmat::erasure::erasure_shards(&bundle, count) {
+                Ok(shards) => Message::CodedBundle {
+                    shards,
+                    recovery_threshold: jam_node::hazmat::erasure::recovery_threshold(count) as u16,
+                    shard_len: jam_node::hazmat::erasure::shard_len(bundle.len(), count) as u32,
+                },
+                Err(e) => Message::Error(format!("coding a {} byte bundle: {e:?}", bundle.len())),
+            }
+        }
+
+        Message::CheckBundleShard {
+            erasure_root,
+            shard_index,
+            shard_count,
+            bundle_shard,
+            segment_root,
+            justification,
+        } => {
+            // Decoded with the engine's own type, from the bytes that came
+            // off the wire. A justification this cannot read is not a failed
+            // proof -- it is a disagreement about the structure, and the two
+            // belong in different findings.
+            let mut cursor = &justification[..];
+            let decoded = match Decode::decode(&mut cursor) {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    return Message::ShardChecked {
+                        verified: None,
+                        detail: Some(format!("the justification did not decode: {e}")),
+                    }
+                }
+            };
+            if !cursor.is_empty() {
+                return Message::ShardChecked {
+                    verified: None,
+                    detail: Some(format!(
+                        "the justification has {} trailing bytes",
+                        cursor.len()
+                    )),
+                };
+            }
+            let verified = jam_node::hazmat::availability::check_bundle_proof(
+                erasure_root.into(),
+                shard_index,
+                shard_count as usize,
+                jam_std_common::hash_raw(&bundle_shard),
+                segment_root.into(),
+                decoded,
+            )
+            .is_some();
+            Message::ShardChecked {
+                verified: Some(verified),
+                detail: None,
+            }
+        }
+
         Message::GetState(hash) => {
             let Some(session) = sessions.first() else {
                 return Message::OracleFault("no session is open".into());
@@ -727,5 +788,29 @@ mod tests {
             matches!(reply, Message::OracleFault(ref m) if m.contains("engine exploded")),
             "the panic's message must survive into the fault, got {reply:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod n4_reachability {
+    /// What the merged hazmat export can and cannot do, checked by the
+    /// compiler rather than by reading.
+    #[test]
+    fn erasure_coding_is_callable() {
+        let bundle = vec![0xab_u8; 4096];
+        let shards = jam_node::hazmat::erasure::erasure_shards(&bundle, 6).expect("coded");
+        assert_eq!(shards.len(), 6);
+        // Three of six, not two. DESIGN said two in both its tiny-parameter
+        // table and its N4 row; polkajam computes `val_count / VALS_PER_CORE
+        // + 1`, reduced until `SEGMENT_LEN` divides `POINT_LEN * d`, and has
+        // its own `erasure_recovery_count_matches_gp` pinning 6 -> 3. A lane
+        // written from DESIGN would have asked the node to reconstruct from
+        // one shard too few.
+        assert_eq!(
+            jam_node::hazmat::erasure::recovery_threshold(6),
+            3,
+            "three of six shards recover a bundle under tiny"
+        );
+        let _ = jam_node::hazmat::erasure::shard_len(bundle.len(), 6);
     }
 }

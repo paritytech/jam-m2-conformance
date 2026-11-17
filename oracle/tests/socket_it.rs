@@ -879,3 +879,109 @@ fn an_import_reports_its_roots_and_its_refusals() {
     assert!(error.is_some(), "a refusal says why");
     assert_eq!(root, None);
 }
+
+/// Erasure coding, and what a justification check says.
+///
+/// The coding is the engine's: a harness that coded bundles itself would be
+/// grading a node against a second implementation of Reed-Solomon, which is
+/// the mistake `proxy_index` already made once in this protocol.
+#[test]
+fn a_bundle_codes_into_shards_and_a_bad_justification_is_refused() {
+    let oracle = start("availability");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    // Coding needs no session: it is a function of the bytes and the count.
+    let bundle: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+    let (shards, recovery_threshold, shard_len) = match ask(
+        &mut stream,
+        Message::CodeBundle {
+            bundle: bundle.clone(),
+            shard_count: 6,
+        },
+    ) {
+        Message::CodedBundle {
+            shards,
+            recovery_threshold,
+            shard_len,
+        } => (shards, recovery_threshold, shard_len),
+        other => panic!("expected CodedBundle, got {other:?}"),
+    };
+
+    assert_eq!(shards.len(), 6, "one shard per validator");
+    for shard in &shards {
+        assert_eq!(shard.len() as u32, shard_len, "every shard is one length");
+    }
+    assert!(
+        shards
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1,
+        "coding produced distinct shards"
+    );
+    // Three of six, not two: `val_count / VALS_PER_CORE + 1`. DESIGN's tiny
+    // table and its N4 row both said two, and a lane written from them would
+    // have asked the node to reconstruct from one shard too few.
+    assert_eq!(recovery_threshold, 3, "D(6) is three");
+
+    // Coding is deterministic, or two sides of a run would disagree about
+    // what a node should have served.
+    match ask(
+        &mut stream,
+        Message::CodeBundle {
+            bundle,
+            shard_count: 6,
+        },
+    ) {
+        Message::CodedBundle { shards: again, .. } => {
+            assert_eq!(again, shards, "the same bundle codes the same way")
+        }
+        other => panic!("expected CodedBundle, got {other:?}"),
+    }
+
+    // A justification of the wrong shape is reported as undecodable rather
+    // than as a proof that failed: they are different findings.
+    match ask(
+        &mut stream,
+        Message::CheckBundleShard {
+            erasure_root: [0x11; 32],
+            shard_index: 0,
+            shard_count: 6,
+            bundle_shard: shards[0].clone(),
+            segment_root: [0x22; 32],
+            justification: vec![0xff; 3],
+        },
+    ) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(verified, None, "undecodable is not `did not verify`");
+            assert!(detail.is_some(), "and it says why");
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // A well-formed but wrong justification decodes and fails to verify.
+    let empty_justification = {
+        use jam_types::Encode;
+        Vec::<[u8; 32]>::new().encode()
+    };
+    match ask(
+        &mut stream,
+        Message::CheckBundleShard {
+            erasure_root: [0x11; 32],
+            shard_index: 0,
+            shard_count: 6,
+            bundle_shard: shards[0].clone(),
+            segment_root: [0x22; 32],
+            justification: empty_justification,
+        },
+    ) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(
+                verified,
+                Some(false),
+                "a justification for nothing proves nothing ({detail:?})"
+            );
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+}

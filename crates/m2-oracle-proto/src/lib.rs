@@ -331,6 +331,56 @@ pub enum Message {
         protocol_parameters: Vec<u8>,
     } = 46,
 
+    /// Erasure-code a work-package bundle, as a guarantor does before
+    /// serving CE 137/138.
+    ///
+    /// Session-free: coding is a pure function of the bytes and the shard
+    /// count. What makes it the oracle's job is that the harness must get
+    /// the *engine's* answer, not a second implementation of Reed-Solomon.
+    CodeBundle {
+        bundle: Vec<u8>,
+        shard_count: u16,
+    } = 47,
+    /// The coded shards, with the two numbers a lane needs beside them.
+    CodedBundle {
+        shards: Vec<Vec<u8>>,
+        /// How many shards reconstruct the bundle (`D(v)`), which for six
+        /// validators is three and not two. DESIGN said two in both its
+        /// parameter table and its N4 row.
+        recovery_threshold: u16,
+        /// The length every shard has, for a row that checks sizes without
+        /// holding the shards.
+        shard_len: u32,
+    } = 48,
+
+    /// Check a CE 137/138 bundle-shard justification against an erasure
+    /// root, the way a node checks one it was served.
+    ///
+    /// The justification travels as the bytes that came off the wire rather
+    /// than re-encoded through this harness's own type. Re-encoding would
+    /// hide exactly the disagreement worth finding: if `jamnp-s` and the
+    /// engine read that structure differently, the round trip through our
+    /// type would paper over it and the check would pass on bytes the node
+    /// never sent.
+    CheckBundleShard {
+        erasure_root: [u8; 32],
+        shard_index: u16,
+        shard_count: u16,
+        /// Hashed here, so the hash is the engine's own.
+        bundle_shard: Vec<u8>,
+        segment_root: [u8; 32],
+        justification: Vec<u8>,
+    } = 49,
+    /// Whether the justification proves that shard sits under that root.
+    ///
+    /// `None` where it could not be decoded at all, which is a different
+    /// answer from "decoded and did not verify" and belongs in a different
+    /// finding.
+    ShardChecked {
+        verified: Option<bool>,
+        detail: Option<String>,
+    } = 50,
+
     /// Build a package, optionally against an authorizer no core accepts.
     BuildPackage {
         session: SessionId,
@@ -593,6 +643,31 @@ mod tests {
             })),
             Message::StateIs(None),
             Message::DevSpec { base_port: 40_000 },
+            Message::CodeBundle {
+                bundle: vec![0x17; 64],
+                shard_count: 6,
+            },
+            Message::CodedBundle {
+                shards: vec![vec![0x18; 8], vec![0x19; 8]],
+                recovery_threshold: 3,
+                shard_len: 8,
+            },
+            Message::CheckBundleShard {
+                erasure_root: [0x1b; 32],
+                shard_index: 2,
+                shard_count: 6,
+                bundle_shard: vec![0x1c; 8],
+                segment_root: [0x1d; 32],
+                justification: vec![0x1e; 33],
+            },
+            Message::ShardChecked {
+                verified: Some(true),
+                detail: None,
+            },
+            Message::ShardChecked {
+                verified: None,
+                detail: Some("the justification did not decode".into()),
+            },
             Message::DevSpecIs {
                 genesis_header: vec![0x12; 8],
                 keyvals: vec![(vec![0x13; 31], vec![0x14, 0x15])],
