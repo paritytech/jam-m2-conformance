@@ -206,9 +206,26 @@ and pins `PvmBackend::Interpreter`.
 |---|---|---|
 | P0 | `jamnp-s`, runner skeleton, N0 | ✅ implemented |
 | P1 | `m2-reference` (now an oracle client), N1 authoring, N2 tickets | ✅ implemented |
-| P2 | N3 guaranteeing, N4 availability | ⏳ next — the erasure/justification export it waited on is merged and pinned |
+| P2 | N3 guaranteeing, N4 availability | ✅ implemented — graded by name (`--lanes n0,n1,n2,n3,n4`), not by default; see below |
 | P3 | N5 auditing/disputes, N6 preimages | ⏳ |
 | P4 | N7 adversarial, index rotation, IPv6, web UI | ⏳ |
+
+**Why N3 and N4 are not in the default lane set.** A check nobody has seen
+fail is a check nobody knows is a check. N4's serve and assurance rows are
+held to that bar by `m2-sim/tests/n4_sim_it.rs`, which drives eleven faults
+through a simulated guarantor; `n4_ce141_inclusion` is not, because a
+stand-in that authors through the reference chain cannot carry a received
+assurance in a block. N3 has the same gap in places. Until they close, a
+green N3 or N4 means "nothing contradicted the node" rather than "the node
+was checked", and the lanes are asked for by name so that distinction is
+never made silently.
+
+**The pin is on an unmerged branch.** `Cargo.toml` and `oracle/Cargo.toml`
+point at polkajam `43689c3de` (branch `jv-export-n4`), which exports
+`hazmat::merkle`. Checking a CE 137 justification needs `merkle_root`, and
+building one at all — which is what lets a simulated node serve shards —
+needs `merkle_proofs` and `pack_erasure_tree_entry`. The pin goes back to a
+merge commit once that PR lands; see `findings.md` §9.
 
 Iterate-later items: full 2-epoch observation + epoch-boundary alignment of the ticket window;
 independent (non-`import_block`) seal/entropy VRF re-verification; full M1-style keyvals diff on
