@@ -97,6 +97,60 @@ pub fn code_segments(
     }
 }
 
+/// Everything needed to serve a bundle's shards, as a guarantor holds it.
+#[derive(Clone, Debug)]
+pub struct AvailableShards {
+    pub erasure_root: [u8; 32],
+    /// Per validator, in validator order.
+    pub bundle_shards: Vec<Vec<u8>>,
+    /// Per validator: that validator's slice of every segment, concatenated.
+    pub segment_shards: Vec<Vec<u8>>,
+    /// CE 137's justification per validator.
+    pub shard_justifications: Vec<Vec<u8>>,
+    /// CE 138's per validator, with the segment root appended.
+    pub audit_justifications: Vec<Vec<u8>>,
+    /// CE 140's, per validator and then per segment index.
+    pub segment_justifications: Vec<Vec<Vec<u8>>>,
+}
+
+/// Code a bundle and its segments into servable shards with justifications.
+///
+/// The half of availability that was unreachable until `hazmat::merkle` was
+/// exported (findings.md §9), and what lets a simulated node serve CE
+/// 137/138/139/140 at all -- which is what it takes to show those rows
+/// failing against a node that serves them wrongly.
+pub fn make_available(
+    oracle: &Arc<Oracle>,
+    bundle: Vec<u8>,
+    segments: Vec<Vec<u8>>,
+    shard_count: u16,
+) -> Result<AvailableShards, ChainError> {
+    match oracle.expect(Message::MakeAvailable {
+        bundle,
+        segments,
+        shard_count,
+    })? {
+        Message::AvailableShards {
+            erasure_root,
+            bundle_shards,
+            segment_shards,
+            shard_justifications,
+            audit_justifications,
+            segment_justifications,
+        } => Ok(AvailableShards {
+            erasure_root,
+            bundle_shards,
+            segment_shards,
+            shard_justifications,
+            audit_justifications,
+            segment_justifications,
+        }),
+        other => Err(ChainError::Oracle(format!(
+            "MakeAvailable answered {other:?}"
+        ))),
+    }
+}
+
 /// A CE 137 or CE 138 reply, as it came off the wire.
 ///
 /// Carried whole rather than picked apart here, because the two protocols
@@ -265,6 +319,115 @@ mod tests {
             ce138.verified, None,
             "CE 138 reads it as the segment root, leaving no proof at all"
         );
+    }
+
+    /// The two halves have to meet: a shard built by `make_available` must
+    /// verify through `check_served_shard`, under both protocols.
+    ///
+    /// This is the test the rest of N4 rests on. If building and checking
+    /// disagree -- about where the segment root comes from, about the
+    /// element layout, about which validator's slices pair with which
+    /// bundle shard -- then every row that grades a served shard is grading
+    /// the harness against itself.
+    #[test]
+    fn a_shard_this_builds_is_a_shard_this_accepts() {
+        let oracle = Oracle::for_tests();
+        let bundle: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+        let segments = vec![
+            vec![0xa1; jam_types::SEGMENT_LEN],
+            vec![0xb2; jam_types::SEGMENT_LEN],
+        ];
+        let held = make_available(&oracle, bundle, segments, 6).expect("the bundle is codeable");
+
+        assert_eq!(held.bundle_shards.len(), 6);
+        assert_eq!(held.segment_shards.len(), 6);
+        assert_eq!(held.segment_justifications.len(), 6);
+
+        for index in 0..6u16 {
+            let i = index as usize;
+            // CE 137: the segment shards travel beside the bundle shard and
+            // their root is taken from them.
+            let ce137 = check_served_shard(
+                &oracle,
+                ServedShard {
+                    protocol: 137,
+                    erasure_root: held.erasure_root,
+                    shard_index: index,
+                    shard_count: 6,
+                    bundle_shard: held.bundle_shards[i].clone(),
+                    segment_shards: held.segment_shards[i].clone(),
+                    justification: held.shard_justifications[i].clone(),
+                },
+            )
+            .expect("the oracle answers");
+            assert_eq!(
+                ce137.verified,
+                Some(true),
+                "CE 137 shard {index} must verify: {:?}",
+                ce137.detail
+            );
+
+            // CE 138: no segment shards, and the root rides at the end of
+            // the justification instead.
+            let ce138 = check_served_shard(
+                &oracle,
+                ServedShard {
+                    protocol: 138,
+                    erasure_root: held.erasure_root,
+                    shard_index: index,
+                    shard_count: 6,
+                    bundle_shard: held.bundle_shards[i].clone(),
+                    segment_shards: Vec::new(),
+                    justification: held.audit_justifications[i].clone(),
+                },
+            )
+            .expect("the oracle answers");
+            assert_eq!(
+                ce138.verified,
+                Some(true),
+                "CE 138 shard {index} must verify: {:?}",
+                ce138.detail
+            );
+        }
+    }
+
+    /// And CE 140's per-segment justifications likewise.
+    #[test]
+    fn a_segment_justification_this_builds_is_one_this_accepts() {
+        let oracle = Oracle::for_tests();
+        let segments = vec![
+            vec![0xa1; jam_types::SEGMENT_LEN],
+            vec![0xb2; jam_types::SEGMENT_LEN],
+            vec![0xc3; jam_types::SEGMENT_LEN],
+        ];
+        let held = make_available(&oracle, vec![0x5a; 4096], segments.clone(), 6)
+            .expect("the bundle is codeable");
+        let slice_len = jam_types::segment_slice_len(6);
+
+        for index in 0..6u16 {
+            let i = index as usize;
+            let row = &held.segment_shards[i];
+            for segment in 0..segments.len() {
+                let slice = row[segment * slice_len..(segment + 1) * slice_len].to_vec();
+                let check = check_segment_shard(
+                    &oracle,
+                    held.erasure_root,
+                    index,
+                    6,
+                    segment as u16,
+                    segments.len() as u32,
+                    slice,
+                    held.segment_justifications[i][segment].clone(),
+                )
+                .expect("the oracle answers");
+                assert_eq!(
+                    check.verified,
+                    Some(true),
+                    "shard {index} segment {segment} must verify: {:?}",
+                    check.detail
+                );
+            }
+        }
     }
 
     /// A justification that is not a sequence of elements is reported as

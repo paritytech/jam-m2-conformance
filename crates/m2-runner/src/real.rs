@@ -271,74 +271,13 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
     let shard_count = lock(&data.avail_shard_count).unwrap_or_else(jam_types::max_val_count);
 
     let mut shards_served = lock(&data.shards_served).clone();
-    for served in &mut shards_served {
-        if served.refused {
-            continue;
-        }
-        match m2_reference::availability::check_served_shard(
-            data.ref_chain.oracle(),
-            m2_reference::availability::ServedShard {
-                protocol: served.protocol,
-                erasure_root: served.erasure_root,
-                shard_index: served.shard_index,
-                shard_count,
-                bundle_shard: served.bundle_shard.clone(),
-                segment_shards: served.segment_shards.clone(),
-                justification: served.justification.clone(),
-            },
-        ) {
-            Ok(check) => {
-                served.justification_verified = check.verified;
-                served.justification_detail = check.detail;
-            }
-            // The oracle refusing to answer is the harness's problem, not
-            // the node's. Left unverified with the reason on it, which the
-            // lane reports as a justification it could not read rather than
-            // as a proof that failed.
-            Err(e) => served.justification_detail = Some(format!("the oracle could not say: {e}")),
-        }
-    }
-
+    verify_served_shards(data.ref_chain.oracle(), shard_count, &mut shards_served);
     let mut segment_shards_served = lock(&data.segment_shards_served).clone();
-    for served in &mut segment_shards_served {
-        if served.refused || served.ragged || served.protocol != 140 {
-            continue;
-        }
-        // One justification per slice, paired by position: the reply carries
-        // no indices, so position is the only thing tying the two together.
-        for (i, slice) in served.shards.iter().enumerate() {
-            let Some(justification) = served.justifications.get(i) else {
-                served.justifications_verified.push(None);
-                served
-                    .justification_details
-                    .push(Some("no justification was sent for this slice".into()));
-                continue;
-            };
-            let segment_index = served.requested.get(i).copied().unwrap_or(i as u16);
-            match m2_reference::availability::check_segment_shard(
-                data.ref_chain.oracle(),
-                served.erasure_root,
-                served.shard_index,
-                shard_count,
-                segment_index,
-                served.requested.len() as u32,
-                slice.clone(),
-                justification.clone(),
-            ) {
-                Ok(check) => {
-                    served.justifications_verified.push(check.verified);
-                    served.justification_details.push(check.detail);
-                }
-                Err(e) => {
-                    served.justifications_verified.push(None);
-                    served
-                        .justification_details
-                        .push(Some(format!("the oracle could not say: {e}")));
-                }
-            }
-        }
-    }
-
+    verify_segment_shards(
+        data.ref_chain.oracle(),
+        shard_count,
+        &mut segment_shards_served,
+    );
     // Every block the harness has seen the node on. Which one it assures is
     // its own choice -- the head two seconds before a slot -- so the rule is
     // that the anchor names a block that exists, not a block the harness
@@ -409,6 +348,96 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
         assurances_offered,
         availability_threshold: jam_types::supermajority_threshold(jam_types::max_val_count()),
         assured_by_core: assured_by_core(nut_blocks),
+    }
+}
+
+/// Ask the engine whether each served bundle shard's justification proves it.
+///
+/// Done after the observation window rather than on the wire: the emulator
+/// records bytes, the engine decides, and holding the round trips out of the
+/// window keeps a slow oracle from shifting the timing the other lanes are
+/// graded on.
+///
+/// Public because `m2-sim`'s N4 test grades the same facts the runner does.
+/// A test that re-implemented this would be checking its own copy of the
+/// rule rather than the one a run uses.
+pub fn verify_served_shards(
+    oracle: &Arc<m2_reference::oracle::Oracle>,
+    shard_count: u16,
+    served: &mut [ShardServed],
+) {
+    for shard in served {
+        if shard.refused {
+            continue;
+        }
+        match m2_reference::availability::check_served_shard(
+            oracle,
+            m2_reference::availability::ServedShard {
+                protocol: shard.protocol,
+                erasure_root: shard.erasure_root,
+                shard_index: shard.shard_index,
+                shard_count,
+                bundle_shard: shard.bundle_shard.clone(),
+                segment_shards: shard.segment_shards.clone(),
+                justification: shard.justification.clone(),
+            },
+        ) {
+            Ok(check) => {
+                shard.justification_verified = check.verified;
+                shard.justification_detail = check.detail;
+            }
+            // The oracle refusing to answer is the harness's problem, not
+            // the node's. Left unverified with the reason on it, which the
+            // lane reports as a justification it could not read rather than
+            // as a proof that failed.
+            Err(e) => shard.justification_detail = Some(format!("the oracle could not say: {e}")),
+        }
+    }
+}
+
+/// The same for CE 140's per-slice justifications.
+pub fn verify_segment_shards(
+    oracle: &Arc<m2_reference::oracle::Oracle>,
+    shard_count: u16,
+    served: &mut [SegmentShardsServed],
+) {
+    for shards in served {
+        if shards.refused || shards.ragged || shards.protocol != 140 {
+            continue;
+        }
+        // One justification per slice, paired by position: the reply carries
+        // no indices, so position is the only thing tying the two together.
+        for (i, slice) in shards.shards.iter().enumerate() {
+            let Some(justification) = shards.justifications.get(i) else {
+                shards.justifications_verified.push(None);
+                shards
+                    .justification_details
+                    .push(Some("no justification was sent for this slice".into()));
+                continue;
+            };
+            let segment_index = shards.requested.get(i).copied().unwrap_or(i as u16);
+            match m2_reference::availability::check_segment_shard(
+                oracle,
+                shards.erasure_root,
+                shards.shard_index,
+                shard_count,
+                segment_index,
+                shards.requested.len() as u32,
+                slice.clone(),
+                justification.clone(),
+            ) {
+                Ok(check) => {
+                    shards.justifications_verified.push(check.verified);
+                    shards.justification_details.push(check.detail);
+                }
+                Err(e) => {
+                    shards.justifications_verified.push(None);
+                    shards
+                        .justification_details
+                        .push(Some(format!("the oracle could not say: {e}")));
+                }
+            }
+        }
     }
 }
 

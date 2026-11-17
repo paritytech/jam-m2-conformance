@@ -13,13 +13,21 @@
 //! against a second implementation of Reed–Solomon, which is the mistake
 //! `proxy_index` already made once in this harness.
 //!
-//! **What a pass here does not yet mean.** Every row is graded on a
-//! deterministic baseline and none of them has been shown to *fail* against
-//! a node that misbehaves: there are no availability variants in `m2-sim`,
-//! so nothing proves these checks catch anything. Until there are, `n4` is
-//! asked for by name rather than being in the default lane set, and a green
-//! N4 should be read as "nothing contradicted the node", not as "the node
-//! was checked".
+//! **What a pass here means.** Eleven of these rows have been shown to fail
+//! against a simulated node that gets exactly one thing wrong, and to pass
+//! against one that does not (`m2-sim/tests/n4_sim_it.rs`): the serve rows
+//! for both bundle protocols and both segment protocols, and the assurance
+//! rows for a wrong anchor, a wrong signature, an empty core and a late
+//! send. Writing that test caught a row that could never fail --
+//! `n4_ce141_sent_before_the_slot` asked whether the lead was positive,
+//! which it is by construction.
+//!
+//! The exception is [`n4_ce141_inclusion`]. Its rows ask whether the node
+//! carries valid assurances in its blocks and leaves invalid ones out, and
+//! the stand-in authors through the reference chain, so it cannot put a
+//! received assurance into a block. Those rows are still unproven, and a
+//! green `n4_ce141_valid_assurance_included` should be read as "nothing
+//! contradicted the node" rather than "the node was checked".
 
 use crate::dsl::{check, log, Check, Control, Severity};
 
@@ -119,10 +127,13 @@ pub struct AssuranceSeen {
     /// `None` when the assurance was well formed and verified; otherwise why
     /// it was refused, in the reference's words.
     pub fault: Option<String>,
-    /// Milliseconds before the start of the slot it was sent for.
+    /// Milliseconds between its arrival and the start of the next slot.
     ///
-    /// `simple.md:679-680` asks for roughly two seconds' lead. Negative
-    /// means it arrived after the slot had begun.
+    /// `simple.md:679-680` asks for roughly two seconds' lead. The message
+    /// does not say which slot it is for, so what can be measured is how
+    /// much of the current slot was left when it arrived: a node that sends
+    /// with half a slot to spare is in time, one that sends with a fraction
+    /// of a second left is not.
     pub lead_ms: i64,
     /// Cores the harness knows had a report at that anchor, so a bit set
     /// for anything else is a claim about an empty core.
@@ -516,16 +527,24 @@ pub fn n4_ce141_send(ctx: &N4Ctx) -> Check {
 
             // Soft: `simple.md:679-680` says roughly two seconds before the
             // slot, and "roughly" is not a number a node can be failed on.
+            //
+            // A floor rather than a window. Assuring *early* is not a
+            // defect -- a node with nothing left to wait for may send as
+            // soon as it has verified its shard -- so only too little lead
+            // is reported. An earlier version asked whether the lead was
+            // positive at all, which it always is by construction: the
+            // measurement is time remaining in a slot, and that is never
+            // negative. The row passed on every node, conforming or not.
             results.push(log::check_detail(
                 "n4_ce141_sent_before_the_slot",
-                seen.lead_ms > 0,
+                seen.lead_ms >= ASSURANCE_LEAD_MS,
                 Severity::Soft,
                 || {
                     format!(
-                        "the assurance for anchor {} arrived {} ms after its slot began; \
-                         `simple.md:679-680` asks for roughly 2000 ms before",
+                        "the assurance for anchor {} arrived with {} ms of its slot left; \
+                         `simple.md:679-680` asks for roughly {ASSURANCE_LEAD_MS} ms",
                         short(&seen.anchor),
-                        -seen.lead_ms
+                        seen.lead_ms
                     )
                 },
             ));
@@ -613,6 +632,12 @@ pub fn n4_ce141_inclusion(ctx: &N4Ctx) -> Check {
         results
     })
 }
+
+/// Lead `simple.md:679-680` asks an assurance to be sent with.
+///
+/// Two seconds, as the text says. The row that reads it is Soft, because
+/// "roughly" is not a number a node can be hard-failed on.
+pub const ASSURANCE_LEAD_MS: i64 = 2_000;
 
 /// Every N4 check.
 pub fn all(ctx: &N4Ctx) -> Vec<Check> {
@@ -845,7 +870,9 @@ mod tests {
     }
 
     /// Lateness is soft: the spec says "roughly" two seconds, and a node
-    /// cannot be hard-failed on a word like that.
+    /// cannot be hard-failed on a word like that. Half a second of lead is
+    /// late; the measurement is time left in the slot, so it is never
+    /// negative and a row asking only for "positive" asked nothing.
     #[test]
     fn a_late_assurance_is_soft() {
         let ctx = N4Ctx {
@@ -854,7 +881,7 @@ mod tests {
                 anchor: [0x22; 32],
                 cores: vec![0],
                 fault: None,
-                lead_ms: -500,
+                lead_ms: 500,
                 reported_cores: vec![0],
             }],
             ..Default::default()

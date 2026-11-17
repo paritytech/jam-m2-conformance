@@ -447,6 +447,105 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             }
         }
 
+        Message::MakeAvailable {
+            bundle,
+            segments,
+            shard_count,
+        } => {
+            let count = shard_count as usize;
+            let bundle_shards = match jam_node::hazmat::erasure::erasure_shards(&bundle, count) {
+                Ok(shards) => shards,
+                Err(e) => return Message::Error(format!("coding the bundle: {e:?}")),
+            };
+            let mut fixed = Vec::with_capacity(segments.len());
+            for (i, segment) in segments.iter().enumerate() {
+                let Ok(array) = <[u8; jam_types::SEGMENT_LEN]>::try_from(segment.as_slice()) else {
+                    return Message::Error(format!(
+                        "segment {i} is {} bytes, not {}",
+                        segment.len(),
+                        jam_types::SEGMENT_LEN
+                    ));
+                };
+                fixed.push(Box::new(array));
+            }
+            let segment_shards = match jam_node::hazmat::erasure::segments_shards(&fixed, count) {
+                Ok(shards) => shards,
+                Err(e) => return Message::Error(format!("coding the segments: {e:?}")),
+            };
+
+            // The erasure tree's leaves pair each validator's bundle-shard
+            // hash with the root of its segment slices. Both halves are the
+            // engine's, and the pairing is `pack_erasure_tree_entry` rather
+            // than a concatenation written here: that is the step a second
+            // implementation would get subtly wrong.
+            let segment_roots: Vec<_> = segment_shards
+                .iter()
+                .map(|slices| jam_node::hazmat::merkle::merkle_root(slices, slices.len()))
+                .collect();
+            let bundle_hashes: Vec<_> = bundle_shards
+                .iter()
+                .map(|shard| jam_std_common::hash_raw(shard))
+                .collect();
+            let entries: Vec<_> = bundle_hashes
+                .iter()
+                .zip(segment_roots.iter())
+                .map(|(hash, root)| {
+                    jam_node::hazmat::merkle::pack_erasure_tree_entry(hash, root)
+                })
+                .collect();
+            let (erasure_root, shard_proofs) =
+                jam_node::hazmat::merkle::merkle_proofs(&entries[..], entries.len());
+
+            let mut shard_justifications = Vec::with_capacity(count);
+            let mut audit_justifications = Vec::with_capacity(count);
+            let mut segment_justifications = Vec::with_capacity(count);
+            for (index, proof) in shard_proofs.iter().enumerate() {
+                let elements = jam_node::hazmat::availability::bundle_justification(proof);
+                let co_path = encode_elements(&elements);
+                // CE 138 appends the segment root as a final `0 ++ Hash`.
+                // Appended as bytes rather than as the element type, which
+                // `hazmat` does not export: that is the derived encoding of
+                // the enum's first variant, and the same layout this
+                // oracle's `bundle_elements` reads back.
+                let mut with_root = co_path.clone();
+                with_root.push(0);
+                with_root.extend_from_slice(segment_roots[index].as_ref());
+                shard_justifications.push(co_path);
+                audit_justifications.push(with_root);
+
+                // One justification per segment: the bundle co-path, the
+                // bundle-shard hash, then the path down this validator's own
+                // segment tree.
+                let slices = &segment_shards[index];
+                let (_, segment_proofs) =
+                    jam_node::hazmat::merkle::merkle_proofs(slices, slices.len());
+                segment_justifications.push(
+                    segment_proofs
+                        .iter()
+                        .map(|segment_proof| {
+                            encode_elements(&jam_node::hazmat::availability::segment_justification(
+                                proof,
+                                bundle_hashes[index],
+                                segment_proof,
+                            ))
+                        })
+                        .collect(),
+                );
+            }
+
+            Message::AvailableShards {
+                erasure_root,
+                bundle_shards,
+                segment_shards: segment_shards
+                    .into_iter()
+                    .map(|slices| slices.into_inner())
+                    .collect(),
+                shard_justifications,
+                audit_justifications,
+                segment_justifications,
+            }
+        }
+
         Message::CheckSegmentShard {
             erasure_root,
             shard_index,
@@ -836,6 +935,20 @@ fn with(
 
 fn hex8(bytes: &[u8; 32]) -> String {
     bytes[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Concatenate a justification's elements the way the wire carries them.
+///
+/// Back to back with no count in front of them, which is what
+/// `write_encoded_seq` does and what the reader reads back until the message
+/// runs out. The element types are not exported from `hazmat`, so they are
+/// encoded through the trait rather than named.
+fn encode_elements<T: Encode>(elements: &[T]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for element in elements {
+        element.encode_to(&mut out);
+    }
+    out
 }
 
 /// Split a CE 137/138 justification into its elements, without decoding them.

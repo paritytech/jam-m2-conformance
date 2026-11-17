@@ -438,8 +438,8 @@ rule the node does not enforce — and which also failed in this run.
 
 ## 9. The hazmat availability export cannot build a justification
 
-**Status:** open upstream; the harness is pinned to the proposed branch.
-Found 2026-11-17, starting N4.
+**Status:** open upstream; the harness is pinned to the proposed branch,
+and with it the whole of N4 is now reachable. Found 2026-11-17, starting N4.
 
 polkajam #1378 exported erasure coding and the justification builders so the
 harness could produce availability artifacts outside the node, and that is
@@ -465,11 +465,18 @@ itself does to turn a bundle into a servable shard
 usable. So the harness can **verify** a node's justification and cannot
 **construct** its own.
 
-**What that costs.** Five of DESIGN's seven N4 rows are the node producing
+**What that cost.** Five of DESIGN's seven N4 rows are the node producing
 and the harness checking -- CE 137/138/139/140 serve, CE 141 send, CE 141
-receive to inclusion -- and all are reachable now. The two where the
-*harness* must serve shards to the node, CE 137 fetch and CE 139/140 fetch,
-are not.
+receive to inclusion -- and those were reachable with the verify half alone.
+The two where the *harness* must serve shards to the node, CE 137 fetch and
+CE 139/140 fetch, were not.
+
+**And what it cost that was not obvious.** Without the construct half there
+is also no way to *simulate* a node that serves shards, so none of the five
+reachable rows could be shown to fail. Checks nobody has seen fail are
+checks nobody knows are checks, and this harness has already paid for that
+twice. With the pin moved, `m2-sim` holds a real coded bundle and
+`n4_sim_it` drives eleven faults through it.
 
 **Proposed upstream**, on polkajam branch `jv-export-n4`: `util::merkle`
 becomes `pub(crate)` and `hazmat::merkle` re-exports `merkle_proofs`,
@@ -610,3 +617,40 @@ do with the assurance being invalid. So the honest round and the spoiled
 round sit three slots apart, against different blocks. With a supermajority
 threshold of 5 of 6, that also keeps the honest round complete enough for
 `n4_availability_threshold_reached` to mean something.
+
+## 13. A timing row that could never fail — CLOSED 2026-11-17
+
+**Status:** closed. Found by writing the simulated node that should have
+broken it, which is the only reason it was found at all.
+
+`n4_ce141_sent_before_the_slot` read:
+
+```rust
+seen.lead_ms > 0
+```
+
+against a `lead_ms` computed as the time remaining in the slot the assurance
+arrived in. That quantity is positive by construction — it is bounded by
+`(0, slot_period]` — so the row passed on every node, conforming or not,
+and would have gone on passing forever.
+
+`simple.md:679-680` asks for roughly two seconds' lead. The row now asks for
+that, as a **floor** rather than a window: assuring *early* is not a defect,
+since a node with nothing left to wait for may send as soon as it has
+verified its shard, so only too little lead is reported. It stays Soft,
+because "roughly" is not a number a node can be hard-failed on.
+
+Two things worth keeping from this.
+
+**The row looked fine in review and in its unit test.** The test fed
+`lead_ms: -500` and watched the row fail — a value the real measurement
+cannot produce. A unit test that fabricates its input can only prove the
+comparison does what it says, never that the input can reach the values it
+compares against. The simulated node is what closes that gap, because it
+produces the measurement the way a run does.
+
+**The first attempt at the fault did not work either.** `AssuranceLate`
+slept one whole slot period before sending, which lands at exactly the same
+phase of the next slot and reads as punctual. It now holds until the slot has
+nearly run out. A fault that fails to break the thing it is aimed at looks
+identical to a check that works.
