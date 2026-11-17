@@ -339,3 +339,53 @@ not. So:
   the checkout under `~/.cargo/git/checkouts/polkajam-*/<short rev>/crates/`.
 - Worth asking upstream whether a published version can be tagged, so a
   revision and a release can be matched without diffing them.
+
+## 7. The harness and the oracle resolved different codec versions
+
+**Status:** fixed 2026-11-17, and worth a guard it does not yet have.
+
+`jam-codec` is the codec both sides of the oracle socket encode and decode
+with. The workspace and `oracle/` are separate cargo trees with separate
+lockfiles, and both asked for `"0.1.1"` -- a caret requirement. They resolved
+differently: the workspace to **0.1.1**, the oracle to **0.1.2**.
+
+Encoding is identical. A probe over 2,199 values -- every power-of-two
+boundary from 2^0 to 2^63, each ±1, plus a pseudorandom spread -- produced
+byte-identical output from both. On that evidence alone the skew looks
+cosmetic, and this finding nearly said so.
+
+Decoding is not identical. polkajam's own `8d9495219` ("Non-canonical compact
+lenghts are rejected", #1392) names the change:
+
+```
+input           0.1.1                  0.1.2
+80 00           Ok(0)                  Err(Codec error)
+c0 00 00 00     Ok(0), 1 byte left     Err(Codec error)
+80 01           Ok(1)                  Err(Codec error)
+00  canonical   Ok(0)                  Ok(0)
+```
+
+0.1.1 accepts a compact integer written in more bytes than it needs; 0.1.2
+rejects it. The harness decodes what the node under test sends, so on 0.1.1
+the harness was **laxer than the node it grades**: a node emitting a
+non-canonical length would have been accepted here while polkajam itself
+rejects it. That is a missed detection rather than a wrong verdict, which is
+the gentler of the two directions, but it is the wrong one for a conformance
+harness.
+
+Both trees are pinned to 0.1.2 now and the lockfiles agree.
+
+**The guard that is still missing.** Nothing checks that they agree. Two
+independently-resolved lockfiles can drift again on the next `cargo update`,
+and the symptom would be a decoder disagreement across the socket with no
+error anywhere -- the same shape as findings §6 and as the two defects the
+oracle split introduced. DESIGN §8 states the rule this breaks: anything both
+sides must compute identically belongs in one place. The codec is exactly
+that, and it cannot live in `m2-oracle-proto` because each tree resolves its
+own copy.
+
+The cheap version: each side's `build.rs` reads the resolved `jam-codec`
+version out of its own `Cargo.lock` -- the oracle's already reads its manifest
+for the polkajam revision -- and the handshake compares them, the way it
+already compares the protocol version. About fifteen lines, and it turns a
+silent divergence into a refusal to start.

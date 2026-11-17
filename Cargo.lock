@@ -1220,9 +1220,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jam-codec"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb948eace373d99de60501a02fb17125d30ac632570de20dccc74370cdd611b9"
+checksum = "28bea45000fdcf0e396813dc40f62e25c4db84d7d83954f0a712f93844217055"
 dependencies = [
  "arrayvec",
  "bitvec",
@@ -1237,9 +1237,9 @@ dependencies = [
 
 [[package]]
 name = "jam-codec-derive"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "319af585c4c8a6b5552a52b7787a1ab3e4d59df7614190b1f85b9b842488789d"
+checksum = "44571936196507bf05764da4d51ded95e203f9ff126e3869365018e8e5a9ffe6"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",

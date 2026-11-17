@@ -17,7 +17,7 @@ m2-oracle-proto = { path = "../crates/m2-oracle-proto" }
 jam-node = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a", features = ["hazmat"] }
 jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
 jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "e3d216c24740be75a67339edf5842550821a940a" }
-codec = { package = "jam-codec", version = "0.1.1", default-features = false, features = ["derive", "max-encoded-len"] }
+codec = { package = "jam-codec", version = "0.1.2", default-features = false, features = ["derive", "max-encoded-len"] }
 
 # `jam-node`'s build script embeds the `jam-bootstrap-service` blob only when
 # the profile has no debug info. These overrides moved here from the
