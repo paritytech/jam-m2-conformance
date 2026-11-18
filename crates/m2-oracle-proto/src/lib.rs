@@ -30,7 +30,7 @@ use codec::{Decode, Encode};
 /// Bumped whenever a message changes shape. The client refuses a mismatch
 /// rather than guessing, because a silently misread response is a wrong
 /// conformance verdict rather than an error.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// Largest frame either side will read, matching the fuzz protocol's.
 pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
@@ -559,6 +559,26 @@ pub enum Message {
         bundle: Vec<u8>,
         guarantee: Vec<u8>,
     } = 29,
+    /// Pool a guaranteed work-report, so the next block this session
+    /// authors can carry it.
+    ///
+    /// The counterpart of [`Message::SubmitAssurances`], and it exists for
+    /// the same reason: a node's guarantees extrinsic carries what its peers
+    /// distributed to it over CE 135, not only what it refined itself, and
+    /// nothing could put a *received* guarantee into a block.
+    ///
+    /// Taken as already verified: the engine's entry point notes it into
+    /// the guarantee table without checking it. Unlike
+    /// [`Message::SubmitAssurances`] that is survivable, because block
+    /// composition re-checks every guarantee it holds and skips the ones
+    /// that do not hold up -- so pooling rubbish costs a block its
+    /// guarantee, not its validity.
+    SubmitGuarantee {
+        session: SessionId,
+        /// An encoded `ReportGuarantee`.
+        guarantee: Vec<u8>,
+    } = 60,
+
     /// The whole core-to-validators table at a slot, in one answer.
     ///
     /// One message rather than four. `guarantors_for`, `core_for` and their
@@ -775,6 +795,10 @@ mod tests {
             Message::SubmitAssurances {
                 session: 1,
                 assurances: vec![vec![0x5b; 100], vec![0x5c; 100]],
+            },
+            Message::SubmitGuarantee {
+                session: 1,
+                guarantee: vec![0x5d; 100],
             },
             Message::MakeSegments {
                 segments: vec![vec![0x60; 8], vec![0x61; 8]],

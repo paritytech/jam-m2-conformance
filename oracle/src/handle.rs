@@ -808,6 +808,21 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             Message::Done
         }),
 
+        Message::SubmitGuarantee { session, guarantee } => with(sessions, session, |s| {
+            let mut cursor = &guarantee[..];
+            let guarantee = match jam_std_common::ReportGuarantee::decode(&mut cursor) {
+                // As above: bytes left over mean the caller and the engine
+                // disagree about the shape, and that is worth finding.
+                Ok(_) if !cursor.is_empty() => {
+                    return Message::Error("a guarantee decoded and left bytes over".to_string())
+                }
+                Ok(guarantee) => guarantee,
+                Err(e) => return Message::Error(format!("a guarantee did not decode: {e}")),
+            };
+            s.harness.submit_guarantee(guarantee);
+            Message::Done
+        }),
+
         Message::BuildPackage {
             session,
             items,
