@@ -107,7 +107,6 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         segments_root,
         shard_count: SHARD_COUNT,
         segment_indices: (0..SEGMENTS as u16).collect(),
-        cores: vec![REPORTED_CORE],
         honest_slot: now + 1,
         // Two slots of offers: this test grades what the node *serves* and
         // what it sends, not what it carries, so one honest offer and one

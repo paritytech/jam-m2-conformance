@@ -135,9 +135,6 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         segments_root: [0u8; 32],
         shard_count: jam_types::max_val_count(),
         segment_indices: Vec::new(),
-        // An honest assurance claims the cores that carried a report, and
-        // none did.
-        cores: Vec::new(),
         honest_slot: offers_from,
         assurance_slots: period,
         spoiled_from: offers_from + period / 2,

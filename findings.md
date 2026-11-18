@@ -1050,13 +1050,14 @@ test found was the harness.
 
 ---
 
-## 21. Every assurance a live run sends is for a core that carries nothing
+## 21. Every assurance a live run sends is for a core that carries nothing — CLOSED 2026-11-18
 
-**Status:** open, half fixed. Found 2026-11-18 on the third live run
-(`sessions/n3n4-3`); the first half landed the same day and the fourth run
-(`sessions/n3n4-4`) measured the difference. The reason N4's assurance rows
-could not be graded against a real node, and the reason §20's fix made
-things worse rather than better.
+**Status:** both halves landed. Found on the third live run
+(`sessions/n3n4-3`), the first half the same day
+(`sessions/n3n4-4` measured it), the second after PR #16
+(`sessions/n4-cores-1`). A residual remains and belongs to §22 rather than
+here: the harness now reads the engaged cores correctly, and what is left
+is what a node does with an assurance that was valid when it was sent.
 
 An assurance says "I hold my shard of the report on core *c*". It is valid
 only where core *c* is **engaged** — carrying a report that is on chain
@@ -1119,15 +1120,38 @@ them, where every earlier run reported `n4_ce141_not_exercised` — and the
 first in which `n4_ce141_valid_assurance_included` was graded at all, three
 times. Two of N4's rows went from never-asked to asked in one change.
 
-It is half, not whole. The node still lost five authoring slots to `core not
-engaged`, because `AvailPlan.cores` is still a value fixed when the plan was
-written: a core engaged then is freed once its report is available, and the
-harness goes on assuring it for the rest of the window. Closing that is the
-second bullet above.
+**What the second half changed.** `AvailPlan.cores` is gone.
+`drive_availability` reads the engaged cores per slot through a closure,
+exactly as it reads the anchor, because both are chain state and change for
+the same reasons. The oracle answers from `Harness::engaged_cores()` —
+`yolo_availability`, the same thing the assurances extrinsic is checked
+against — so the harness asks the question the node will ask. No upstream
+export was needed.
 
-Until it lands, a run still sends assurances that cost the node blocks, and
-the honest reading of N4's assurance verdicts is that they are not yet
-evidence about polkajam.
+Measured over three runs, the node's own authoring slots:
+
+| | opportunities | lost to `core not engaged` |
+|---|---|---|
+| before either half (`n3n4-4`) | 8 | 5 |
+| first half only (`n3n4-5`) | 5 | 2 |
+| both halves (`n4-cores-1`) | 7 | 2 |
+
+and `n4_ce141_valid_assurance_included` went 3 → 5 → **9** graded, with
+`n4_availability_threshold_reached` passing for the first time: a report
+the harness assured actually became available.
+
+**What is left, and why it is not this.** Two slots still went to `core not
+engaged`, consecutively and right after availability completed. The harness
+reads the engaged cores about two seconds before the slot and the node
+checks them when it authors; a core freed in between leaves an assurance
+that was valid when sent and stale when used. Whether the reference's view
+also lags the node's by a block fetch is not yet separated out — a run now
+prints the engaged set whenever it moves, which is what will tell them
+apart.
+
+Either way the harness is no longer claiming a core it has reason to think
+is free, so what remains is a question about the node dropping a stale
+assurance rather than refusing to author. That is §22.
 
 Related: §14, the same mistake about the same protocol — a value fixed at
 plan time that is a function of chain state. §20, which made it visible by
@@ -1135,10 +1159,13 @@ making it bigger.
 
 ---
 
-## 22. The node pools an assurance for an unengaged core and then cannot author
+## 22. The node loses a block to an assurance that was valid when it was sent
 
-**Status:** open, observed 2026-11-18 (`sessions/n3n4-3`), and it needs the
-same settling §4 and §5 do before it is called a defect.
+**Status:** open, and now the strongest candidate for a real polkajam
+defect this harness has produced. First seen 2026-11-18
+(`sessions/n3n4-3`) when the harness's own assurances were all invalid;
+reproduced in `sessions/n4-cores-1` after §21 closed, when they were not.
+Still needs the settling §4 and §5 do before it is reported.
 
 The other half of §21, read from the node's side. Sent an assurance naming a
 core that carries no report, polkajam **accepted it into its pool** and then
@@ -1169,13 +1196,54 @@ that only ever looks at blocks cannot see a missing one.
    send it, or is an unauthored slot the accepted cost of a bad peer? The
    practical reading is that one peer should not be able to cost a validator
    its blocks by sending one malformed assurance.
-3. Observed in one run, and in a run whose assurances were all invalid for
-   the harness's own reason. Reproduce against a run that sends valid ones
-   — which means §21 first.
+3. ~~Observed in one run, and in a run whose assurances were all invalid
+   for the harness's own reason. Reproduce against a run that sends valid
+   ones — which means §21 first.~~ §21 is closed, and the behaviour
+   survives it.
 
-Until 3 is done this is an observation, not a finding about polkajam. It is
-recorded now because the evidence is in `sessions/n3n4-3/logs` and will not
-be reproducible once §21 changes what the harness sends.
+**What §21 closing did to this.** With the engaged cores read per slot, the
+node still lost two of seven authoring slots (`sessions/n4-cores-1`), and
+the two were consecutive and immediately after availability completed. So
+the sharpened question is narrower and better than the one first recorded:
+
+> The harness reads the engaged cores about two seconds before the slot and
+> the node checks them when it authors. A core freed in between leaves an
+> assurance that was **valid when it was sent** and stale when it is used.
+> polkajam refuses to author at all rather than dropping it.
+
+That is not a harness aiming badly any more. It is a validator losing a
+block to a peer that did nothing wrong, and in a real network reports
+become available constantly, so the window this needs is not rare.
+
+**How wide the window is.** A run now prints the engaged set whenever it
+moves, and the answer is that it moves constantly
+(`sessions/n4-cores-2`, one validator's view):
+
+```
+slot 9884653 -> []
+slot 9884654 -> [1]
+slot 9884655 -> [0]
+...
+slot 9884665 -> []
+```
+
+A core is engaged for about a slot at a time. Against that turnover a
+two-second lead is most of the life of the value, so "valid when sent,
+stale when used" is not an edge case — it is the ordinary case, and it is
+why the harness reading the set correctly still leaves the node losing
+blocks.
+
+That also disposes of the lag question: the harness is tracking the set
+slot by slot and sending what it sees. What is stale by authoring time is
+the assurance already sitting in the node's pool, which no sender can do
+anything about. In a real network reports become available constantly and
+every validator's pool is full of assurances for cores that have since
+been freed.
+
+Guarantees are the instructive contrast, verified while writing §21: block
+composition re-checks every guarantee it holds and **skips** the ones that
+no longer apply. Assurances are fatal instead. Whether that asymmetry is
+deliberate is the first question to put to the conformance group.
 
 ---
 

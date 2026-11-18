@@ -30,7 +30,7 @@ use codec::{Decode, Encode};
 /// Bumped whenever a message changes shape. The client refuses a mismatch
 /// rather than guessing, because a silently misread response is a wrong
 /// conformance verdict rather than an error.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Largest frame either side will read, matching the fuzz protocol's.
 pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
@@ -579,6 +579,23 @@ pub enum Message {
         guarantee: Vec<u8>,
     } = 60,
 
+    /// Which cores carry a report awaiting availability, right now.
+    ///
+    /// Chain state, and it has to be read like chain state rather than
+    /// fixed when a plan is written: a core is engaged when a block carries
+    /// its guarantee and freed once the report is available, so a value
+    /// read once is wrong for most of a run. Assuring a core that has been
+    /// freed is what cost a live node every authoring slot it owned, with
+    /// `assurances error: core not engaged` in its log (`findings.md` §21).
+    ///
+    /// The engine's own answer rather than something derived from blocks
+    /// the harness happened to see. `yolo_availability` is what the
+    /// assurances extrinsic is checked against, so this is the same
+    /// question the node will ask when it authors.
+    EngagedCores(SessionId) = 61,
+    /// The cores [`Message::EngagedCores`] found, ascending.
+    Cores(Vec<u16>) = 62,
+
     /// The whole core-to-validators table at a slot, in one answer.
     ///
     /// One message rather than four. `guarantors_for`, `core_for` and their
@@ -800,6 +817,8 @@ mod tests {
                 session: 1,
                 guarantee: vec![0x5d; 100],
             },
+            Message::EngagedCores(1),
+            Message::Cores(vec![0, 1]),
             Message::MakeSegments {
                 segments: vec![vec![0x60; 8], vec![0x61; 8]],
             },

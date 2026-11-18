@@ -193,6 +193,27 @@ impl RefChain {
             ))),
         }
     }
+
+    /// The cores carrying a report awaiting availability, right now.
+    ///
+    /// Read every time rather than held, because that is what the value is:
+    /// a core is engaged when a block carries its guarantee and freed once
+    /// the report is available. An assurance claiming a core that has been
+    /// freed is invalid, and a harness that decided which cores to assure
+    /// when it wrote its plan went on claiming a freed one for the rest of
+    /// the run -- which cost a live node every authoring slot it owned
+    /// (`findings.md` §21).
+    ///
+    /// The same shape as the anchor, and for the same reason: both are
+    /// chain state, and both have to be read at send time.
+    pub fn engaged_cores(&self) -> Result<Vec<u16>, ChainError> {
+        match self.ask(Message::EngagedCores(self.session()))? {
+            Message::Cores(cores) => Ok(cores),
+            other => Err(ChainError::Oracle(format!(
+                "EngagedCores answered {other:?}"
+            ))),
+        }
+    }
 }
 
 /// A work package's exported segments, with the root they sit under.
