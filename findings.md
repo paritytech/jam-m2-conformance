@@ -720,3 +720,43 @@ half that matters: a node's assurances extrinsic carries what its *peers*
 sent it. `AuthoringHarness::submit_assurance` is the entry point, pushed to
 the same branch as the Merkle exports (§9) and open as
 **paritytech/polkajam#1401**.
+
+## 15. The same shape-model defect in CE 146 and CE 148 — CLOSED 2026-11-18
+
+**Status:** closed for these two. The CE 137/138/139/140 response types are
+still shape models; see below.
+
+§11 found the availability codecs modelling *shapes* rather than the wire,
+and fixed the ones the N4 lane reads. `BundleSubmission` (CE 146) and
+`SegmentResponse` (CE 148) had the same defect and were not touched, because
+nothing used them yet. Found by going to use them.
+
+CE 146 is five messages and CE 148's reply is two. Both types derived
+`Encode`/`Decode` over one structure, which writes a length prefix in front
+of the work-package and of every extrinsic, segment and proof. A guarantor
+reading that takes the prefix as package content. Worse for CE 146 than for
+CE 137: the whole reason the bundle is split across messages is so a
+guarantor can authorize the package *before* downloading the rest
+(`simple.md:381-384`), and a single value throws that away even when the
+bytes happen to parse.
+
+Both are now per-message, matching `WorkPackageSubmission`, which had been
+written correctly for CE 133 and whose `decode_extrinsics` both protocols
+now share — the extrinsic message has one rule and it lives in one place.
+
+**The test vectors were wrong, again.** `ce148_response_vector` and
+`ce146_vector` asserted the derived bytes, so the suite confirmed the defect
+rather than catching it. This is the second time (§11 found the same thing
+in `assurance_vector_2byte_bitfield`). A vector written from the
+implementation tests nothing; it has to be written from the grammar.
+
+**What is left.** `ShardResponse`, `AuditShardResponse`,
+`SegmentShardsResponse` and `ProvenSegmentShardsResponse` are still single
+derived structures. Nothing grades through them — `m2-emu::avail_io` reads
+those replies by position off the stream, which is what §11 changed — and
+the only caller is `jamnp-s::proto`, a trace decoder nothing in the
+workspace drives yet. They are left as the trap they are rather than
+quietly: a frame is one message, and `proto`'s one-frame-one-message model
+cannot represent a multi-message reply at all. CE 129, CE 133, CE 146 and CE
+148 are each special-cased there for exactly that reason, and the four above
+want the same treatment when something starts reading traces.
