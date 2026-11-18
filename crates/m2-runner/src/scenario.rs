@@ -505,17 +505,25 @@ pub(crate) fn fabricated_run_ctx(
     const FAB_SHARED_HASH: [u8; 32] = [0x6b; 32];
     let n3 = N3Ctx {
         nut_index: FAB_NUT_INDEX,
-        submissions: vec![m2_scenario::scenarios::n3::SubmittedPackage {
-            peer: n0::PEER_1,
-            core: 0,
-            slot: fab_block_slot,
-            package_hash: [0x5a; 32],
-            sent_at_wall_ms: submitted_at,
-            refused: false,
-            reset_code: None,
-            fault: None,
-            co_guarantors: fab_co_guarantors.clone(),
-        }],
+        // One over each submission protocol. CE 146 is graded by the same
+        // rules as CE 133 but under its own row names, so a baseline with
+        // only one of them reports the other's rows unexercised -- and the
+        // test below holds the baseline to grading every row it has.
+        submissions: [133u16, 146]
+            .into_iter()
+            .map(|protocol| m2_scenario::scenarios::n3::SubmittedPackage {
+                peer: n0::PEER_1,
+                protocol,
+                core: 0,
+                slot: fab_block_slot,
+                package_hash: [0x5a; 32],
+                sent_at_wall_ms: submitted_at,
+                refused: false,
+                reset_code: None,
+                fault: None,
+                co_guarantors: fab_co_guarantors.clone(),
+            })
+            .collect(),
         shares: fab_co_guarantors
             .iter()
             .enumerate()

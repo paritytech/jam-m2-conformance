@@ -98,7 +98,8 @@ pub struct ReportSeen {
     pub at_wall_ms: u64,
 }
 
-/// A CE 133 submission the harness made, and what the node did with it.
+/// A CE 133 or CE 146 submission the harness made, and what the node did
+/// with it.
 ///
 /// The counterpart of N2's `DeliveredTicket`: the refusal goes on the record
 /// of the submission it answers, not into the observation log alone. A stream
@@ -113,6 +114,13 @@ pub struct SubmittedPackage {
     /// the validator range so no lane reads the builder's traffic as a
     /// validator's.
     pub peer: u16,
+    /// Which protocol carried it: 133 or 146.
+    ///
+    /// The rules are the same -- DESIGN §11 N3 grades CE 146 "as 133" -- so
+    /// the two share their grading and differ only in the row names and the
+    /// size cap. Reporting them under one name would let a run that
+    /// exercised one claim both.
+    pub protocol: u16,
     /// Core the submission was addressed to.
     pub core: u16,
     /// Slot it was submitted in.
@@ -264,19 +272,59 @@ pub const MIN_GUARANTEE_SIGNATURES: usize = 2;
 /// would otherwise pass every row here without the node having been asked a
 /// single question.
 pub fn n3_ce133_submission(ctx: &N3Ctx) -> Check {
+    submission_check(ctx, 133)
+}
+
+/// N3 — CE 146: the same package over the whole-bundle protocol
+/// (`simple.md:378-404`, DESIGN §11 N3).
+///
+/// Graded "as 133", which is what DESIGN asks and what the rules say: a
+/// guarantor that takes a package over one and not the other is a guarantor
+/// with a framing defect, not a policy. The rows are named apart so that a
+/// run which exercised one cannot report both as answered, and the size cap
+/// differs: CE 133 caps the core index and package together, CE 146 the
+/// package alone.
+///
+/// **The import-proof fault is not posed.** DESIGN §11 N3 asks for a bundle
+/// with a bad import proof as well, and this run's package imports no
+/// segments, so it carries no proofs to spoil. Breaking one would mean first
+/// exporting segments from an earlier package and importing them here, which
+/// is work the lane does not do yet. Said here rather than left for a reader
+/// to notice the fault missing from the report.
+pub fn n3_ce146_submission(ctx: &N3Ctx) -> Check {
+    submission_check(ctx, 146)
+}
+
+/// The shared body of the two submission checks, over one protocol's
+/// submissions.
+///
+/// One implementation because there is one rule. Two copies would be two
+/// readings of it, and the first time they drifted the report would say the
+/// node handled CE 133 correctly and CE 146 wrongly when nothing about the
+/// node had changed.
+fn submission_check(ctx: &N3Ctx, protocol: u16) -> Check {
     let ctx = ctx.clone();
-    check("n3_ce133_submission", Severity::Hard, move |_obs| {
+    let name = leak(format!("n3_ce{protocol}_submission"));
+    let absent = leak(format!("n3_ce{protocol}_not_exercised"));
+    check(name, Severity::Hard, move |_obs| {
+        let mine: Vec<&SubmittedPackage> = ctx
+            .submissions
+            .iter()
+            .filter(|s| s.protocol == protocol)
+            .collect();
         let control = Control::new(
-            "n3_ce133_not_exercised",
-            "a work package submitted to the NUT",
-            !ctx.submissions.is_empty(),
+            absent,
+            leak(format!(
+                "a work package submitted to the NUT over CE {protocol}"
+            )),
+            !mine.is_empty(),
         );
         if !control.present() {
-            return vec![control.absent("n3_ce133_not_exercised")];
+            return vec![control.absent(absent)];
         }
 
         let mut results = Vec::new();
-        for submitted in &ctx.submissions {
+        for submitted in mine {
             // A faulty submission is graded by its own rule, not by the
             // honest one's. Two of the four ask for a reset and two ask for
             // silence, so "was it accepted" is the wrong question for half.
@@ -285,13 +333,13 @@ pub fn n3_ce133_submission(ctx: &N3Ctx) -> Check {
                 continue;
             }
             results.push(log::check_detail(
-                "n3_ce133_accepted",
+                leak(format!("n3_ce{protocol}_accepted")),
                 !submitted.refused,
                 Severity::Hard,
                 || {
                     format!(
-                        "the NUT reset the CE 133 stream for the package {} on core {} \
-                         with code {}",
+                        "the NUT reset the CE {protocol} stream for the package {} on \
+                         core {} with code {}",
                         short(&submitted.package_hash),
                         submitted.core,
                         submitted
@@ -318,7 +366,7 @@ pub fn n3_ce133_submission(ctx: &N3Ctx) -> Check {
 
             for co_guarantor in &submitted.co_guarantors {
                 results.push(log::check_detail(
-                    "n3_ce133_shares_with_both_co_guarantors",
+                    leak(format!("n3_ce{protocol}_shares_with_both_co_guarantors")),
                     reached.contains(co_guarantor),
                     Severity::Hard,
                     || {
@@ -370,7 +418,7 @@ pub fn n3_ce133_submission(ctx: &N3Ctx) -> Check {
             if let Some(first) = answering.iter().map(|s| s.at_wall_ms).min() {
                 let took = first.saturating_sub(submitted.sent_at_wall_ms);
                 results.push(log::check_detail(
-                    "n3_ce133_shares_within_the_window",
+                    leak(format!("n3_ce{protocol}_shares_within_the_window")),
                     took <= SHARE_WINDOW_MS,
                     Severity::Soft,
                     || format!("the NUT took {took} ms to open CE 134, past {SHARE_WINDOW_MS} ms"),
@@ -568,6 +616,7 @@ fn grade_fault(
     submitted: &SubmittedPackage,
     fault: SubmissionFault,
 ) -> Vec<crate::dsl::CheckResult> {
+    let protocol = submitted.protocol;
     // Shares that answer this submission, by time. A node that shared
     // something else earlier in the run has not shared *this*.
     let shared_after: Vec<u16> = ctx
@@ -582,21 +631,29 @@ fn grade_fault(
         // must not be made to download a huge package before it can check
         // the authorization.
         SubmissionFault::Oversized => vec![log::check_detail(
-            "n3_ce133_oversized_reset",
+            leak(format!("n3_ce{protocol}_oversized_reset")),
             submitted.refused,
             Severity::Hard,
             || {
+                // Two caps, because the two protocols put the core index in
+                // different messages: CE 133 carries it with the package and
+                // caps the pair, CE 146 gives the package a message of its
+                // own.
+                let cap = if protocol == 146 {
+                    jamnp_s::codec::ce137_148::WORK_PACKAGE_MAX
+                } else {
+                    jamnp_s::codec::ce131_136::WORK_PACKAGE_INITIAL_MAX as usize
+                };
                 format!(
-                    "the NUT accepted a first message over the {} byte cap instead of \
-                     resetting the stream",
-                    jamnp_s::codec::ce131_136::WORK_PACKAGE_INITIAL_MAX
+                    "the NUT accepted a CE {protocol} work-package message over the {cap} \
+                     byte cap instead of resetting the stream"
                 )
             },
         )],
         // The extrinsic message did not match the lengths the package
         // declares, which the node reads exactly and so must notice.
         SubmissionFault::ExtrinsicSizeMismatch => vec![log::check_detail(
-            "n3_ce133_extrinsic_mismatch_reset",
+            leak(format!("n3_ce{protocol}_extrinsic_mismatch_reset")),
             submitted.refused,
             Severity::Hard,
             || {
@@ -608,7 +665,7 @@ fn grade_fault(
         // Not a reset but silence: the node is not a guarantor of that core,
         // so the package is none of its business and it must not share it.
         SubmissionFault::NotAGuarantor => vec![log::check_detail(
-            "n3_ce133_not_a_guarantor_ignored",
+            leak(format!("n3_ce{protocol}_not_a_guarantor_ignored")),
             shared_after.is_empty(),
             Severity::Hard,
             || {
@@ -622,7 +679,7 @@ fn grade_fault(
         // Authorization is the one check `simple.md:410-415` puts before
         // sharing, so an unauthorized package must not be shared on.
         SubmissionFault::Unauthorized => vec![log::check_detail(
-            "n3_ce133_unauthorized_not_shared",
+            leak(format!("n3_ce{protocol}_unauthorized_not_shared")),
             shared_after.is_empty(),
             Severity::Hard,
             || {
@@ -633,6 +690,15 @@ fn grade_fault(
             },
         )],
     }
+}
+
+/// Row names are `&'static str` and CE 133 and CE 146 share their rules, so
+/// the shared grader builds the name per protocol.
+///
+/// Leaked rather than threaded through as an owned string: a check's name
+/// outlives the call that produced it, and there are at most a dozen.
+fn leak(name: String) -> &'static str {
+    Box::leak(name.into_boxed_str())
 }
 
 /// N3 — CE 134 receive: the NUT refines a bundle it is sent and answers with
@@ -725,6 +791,7 @@ pub fn n3_ce134_receive(ctx: &N3Ctx) -> Check {
 pub fn all(ctx: &N3Ctx) -> Vec<Check> {
     vec![
         n3_ce133_submission(ctx),
+        n3_ce146_submission(ctx),
         n3_ce134_receive(ctx),
         n3_ce135_distribution(ctx),
         n3_ce135_inclusion(ctx),
@@ -774,6 +841,7 @@ mod tests {
     fn submission(refused: bool) -> SubmittedPackage {
         SubmittedPackage {
             peer: 1,
+            protocol: 133,
             core: CORE,
             slot: 100,
             package_hash: PACKAGE,

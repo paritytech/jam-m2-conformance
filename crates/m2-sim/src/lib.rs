@@ -30,13 +30,14 @@ use jamnp_s::clock;
 use jamnp_s::codec::ce128_129::{
     BlockRequest, BlockResponse, BoundaryNode, Direction, KeyValue, StateRequest, StateResponse,
 };
-use jamnp_s::codec::ce131_136::{Ticket, TicketDistribution};
+use jamnp_s::codec::ce131_136::{self, Ticket, TicketDistribution};
+use jamnp_s::codec::ce137_148;
 use jamnp_s::codec::ce141_145::Assurance;
 use jamnp_s::codec::up0::{Announcement, Final, Handshake};
 use jamnp_s::endpoint::{EndpointConfig, EndpointError};
 use jamnp_s::framing::{
-    frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE137, CE138, CE139, CE140,
-    CE141, UP,
+    frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE133, CE134, CE137, CE138,
+    CE139, CE140, CE141, CE146, UP,
 };
 use jamnp_s::transport::{Conn, RecvHalf, SendHalf, Transport};
 use m2_reference::chain::RefChain;
@@ -194,6 +195,20 @@ pub enum SimFault {
     AssuranceEmptyCore,
     /// Send the assurance after its slot has begun rather than before it.
     AssuranceLate,
+    /// Reset every CE 133 and CE 146 submission stream.
+    ///
+    /// A guarantor that takes no work at all. The shape of a node that is
+    /// wrong about which core it holds, without posing that as the fault.
+    RefusesPackages,
+    /// Take a work-package over its protocol's size cap.
+    ///
+    /// The rule the cap exists for is that a guarantor must not be made to
+    /// download a huge package before it can check the authorization
+    /// (`simple.md:362-364`, `simple.md:381-384`), so accepting one is the
+    /// whole defect -- the node need do nothing else wrong.
+    AcceptsOversizedPackage,
+    /// Share a taken package with one co-guarantor instead of both.
+    SharesWithOneCoGuarantor,
     /// Carry an assurance that should have been refused.
     ///
     /// About assurances the node *receives*, where the four above are about
@@ -265,6 +280,12 @@ pub struct SimNode {
     /// every availability request the way a real one does when it has no
     /// such root: by refusing.
     available: Mutex<Option<Available>>,
+    /// Validators this node opens CE 134 to when it takes a package.
+    ///
+    /// Injected, like everything else here: which validators hold a core
+    /// with it is a fact about the chain, and a stand-in that worked it out
+    /// would be grading the harness against its own arithmetic.
+    sharing_peers: Mutex<Vec<u16>>,
     /// Assurances this node checked and refused, kept for the one fault
     /// that carries them anyway.
     refused_assurances: Mutex<Vec<jam_std_common::AvailabilityAssurance>>,
@@ -305,9 +326,16 @@ impl SimNode {
             own_blocks: Mutex::new(Vec::new()),
             forwarded: Mutex::new(Vec::new()),
             available: Mutex::new(None),
+            sharing_peers: Mutex::new(Vec::new()),
             refused_assurances: Mutex::new(Vec::new()),
             reported_cores: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Say which validators hold a core with this node, so a package it
+    /// takes is shared with them over CE 134.
+    pub fn shares_with(&self, peers: &[u16]) {
+        *self.sharing_peers.lock().expect("sim sharing peers") = peers.to_vec();
     }
 
     /// Say which cores this node has a report pending availability on.
@@ -794,10 +822,112 @@ impl SimNode {
             CE131 | CE132 => self.receive_ticket(&mut send, kind, &content).await,
             CE137 | CE138 => self.serve_bundle_shard(&mut send, kind, &content).await,
             CE139 | CE140 => self.serve_segment_shards(&mut send, kind, &content).await,
+            CE133 | CE146 => {
+                self.receive_package(&mut send, kind, &mut reader, &content)
+                    .await
+            }
             CE141 => self.receive_assurance(&content, peer).await,
             // A real node resets an unserved kind; this one is not graded on
             // that, so it drops the stream.
             _ => {}
+        }
+    }
+
+    /// Receive a work-package submission over CE 133 or CE 146
+    /// (`simple.md:351-376`, `simple.md:378-404`).
+    ///
+    /// Two messages on CE 133, five on CE 146, then the node either FINs to
+    /// take the package or resets to refuse it. The one rule applied here is
+    /// the size cap, because it is the one a guarantor must apply *before*
+    /// reading the rest -- that is what the message split is for.
+    ///
+    /// Where the cap falls is the whole difference between the protocols:
+    /// CE 133 carries the core index with the package and caps the pair,
+    /// CE 146 gives the package a message of its own and caps it alone. A
+    /// node reading either as one value gets both wrong.
+    async fn receive_package(
+        &self,
+        send: &mut SendHalf,
+        kind: u8,
+        reader: &mut StreamReader,
+        first: &[u8],
+    ) {
+        // The rest of the stream is read even when the package will be
+        // refused: a node that resets without draining looks, to a sender
+        // mid-write, exactly like one whose connection died.
+        let owed = if kind == CE146 { 5 } else { 2 };
+        let mut messages = vec![first.to_vec()];
+        while messages.len() < owed {
+            let Some((_, content)) = reader.next().await else {
+                break;
+            };
+            messages.push(content);
+        }
+
+        let over_cap = if kind == CE146 {
+            // Message 2 is the work-package and nothing else.
+            messages
+                .get(1)
+                .is_some_and(|package| package.len() > ce137_148::WORK_PACKAGE_MAX)
+        } else {
+            first.len() > ce131_136::WORK_PACKAGE_INITIAL_MAX as usize
+        };
+        let refuse = self.fault == SimFault::RefusesPackages
+            || (over_cap && self.fault != SimFault::AcceptsOversizedPackage);
+        if refuse {
+            send.reset(NO_DATA_CODE);
+            return;
+        }
+        send.finish();
+        self.share_package().await;
+    }
+
+    /// Open CE 134 to the co-guarantors, as a guarantor does once it has
+    /// taken a package (`simple.md:406-458`).
+    ///
+    /// The mappings are empty, which is the truthful answer for a package
+    /// that imports no segments: they map the *import* list to the roots it
+    /// comes from. The harness's lane grades the mapping row only where a
+    /// node sent mappings at all, for the same reason.
+    async fn share_package(&self) {
+        let mut peers: Vec<u16> = self
+            .sharing_peers
+            .lock()
+            .expect("sim sharing peers")
+            .clone();
+        if self.fault == SimFault::SharesWithOneCoGuarantor {
+            peers.truncate(1);
+        }
+        let context = ce131_136::SharingContext {
+            core_index: 0,
+            shard_count: jam_types::max_val_count(),
+            mappings: Vec::new(),
+        };
+        let first = frame(CE134, &context.encode());
+        let second = frame_message(
+            &ce131_136::SharingBundle {
+                bundle: vec![0xab; 32],
+            }
+            .encode(),
+        );
+        let connections: Vec<Conn> = {
+            let held = self.peers.lock().expect("sim peers");
+            peers
+                .iter()
+                .filter_map(|want| {
+                    held.iter()
+                        .find(|(index, _)| index == want)
+                        .map(|(_, conn)| conn.clone())
+                })
+                .collect()
+        };
+        for conn in connections {
+            let Ok((mut send, _recv)) = conn.open_bi().await else {
+                continue;
+            };
+            if send.write_all(&first).await.is_ok() && send.write_all(&second).await.is_ok() {
+                send.finish();
+            }
         }
     }
 

@@ -375,7 +375,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     // The harness also shares a bundle *to* the node, so
                     // the node does the refining for once. A rotation after
                     // the last submission, so the two never contend.
-                    let share_base = honest_slot + SUBMISSION_SPACING_SLOTS * 6;
+                    let share_base =
+                        honest_slot + SUBMISSION_SPACING_SLOTS * (plan.len() as u32 + 1);
                     let mut shares = Vec::new();
                     for (i, fault) in [
                         None,
@@ -943,14 +944,26 @@ fn plan_package_for_this_run(
     let mut plans = vec![m2_reference::reports::SubmissionSchedule {
         slot: plan.slot,
         core: plan.core,
+        protocol: u16::from(jamnp_s::framing::CE133),
         co_guarantors: plan.co_guarantors.clone(),
         fault: None,
     }];
-    for (i, fault) in [
-        Oversized,
-        Unauthorized,
-        ExtrinsicSizeMismatch,
-        NotAGuarantor,
+    // The CE 133 faults, then CE 146: the same package over the whole-bundle
+    // protocol, honest and then over its own size cap.
+    //
+    // CE 146 gets the honest submission that CE 133 already has because
+    // DESIGN §11 N3 grades it "as 133" -- the node should accept it and
+    // share it with both co-guarantors just the same. What is not the same
+    // is the framing: five messages instead of two, and a cap on the
+    // work-package message alone rather than on it plus the core index. A
+    // node that reads the bundle as one value gets neither right.
+    for (i, (protocol, fault)) in [
+        (jamnp_s::framing::CE133, Some(Oversized)),
+        (jamnp_s::framing::CE133, Some(Unauthorized)),
+        (jamnp_s::framing::CE133, Some(ExtrinsicSizeMismatch)),
+        (jamnp_s::framing::CE133, Some(NotAGuarantor)),
+        (jamnp_s::framing::CE146, None),
+        (jamnp_s::framing::CE146, Some(Oversized)),
     ]
     .into_iter()
     .enumerate()
@@ -965,12 +978,12 @@ fn plan_package_for_this_run(
             // themselves unexercised with no way to tell that from a node
             // that was never asked.
             eprintln!(
-                "[assignment] dropping the {fault:?} submission: slot {slot} is past the \
-                 epoch the view resolves"
+                "[assignment] dropping the CE {protocol} {fault:?} submission: slot {slot} \
+                 is past the epoch the view resolves"
             );
             continue;
         };
-        let addressed = if fault == NotAGuarantor {
+        let addressed = if fault == Some(NotAGuarantor) {
             // Deliberately the core it does *not* hold.
             (core + 1) % jam_types::core_count()
         } else {
@@ -979,13 +992,14 @@ fn plan_package_for_this_run(
         plans.push(m2_reference::reports::SubmissionSchedule {
             slot,
             core: addressed,
+            protocol: u16::from(protocol),
             co_guarantors: ref_chain
                 .guarantors_for_in_epoch(addressed, slot)?
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|v| *v != nut_index as u16)
                 .collect(),
-            fault: Some(fault),
+            fault,
         });
     }
     Ok(plans)

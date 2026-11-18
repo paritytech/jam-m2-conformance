@@ -33,6 +33,9 @@ pub type SegmentShard = Vec<u8>;
 pub type Segment = Vec<u8>;
 /// `Import-Proof = len++[Hash]` (`simple.md:392`).
 pub type ImportProof = Vec<[u8; 32]>;
+/// `Segments-Root Mappings = len++[Work-Package Hash ++ Segments-Root]`
+/// (`simple.md:393`), as CE 146's first message carries them.
+pub type SegmentsRootMappings = Vec<([u8; 32], SegmentsRoot)>;
 
 /// CE 146 work-package cap in bytes (`simple.md:383`).
 pub const WORK_PACKAGE_MAX: usize = 200 * 1024;
@@ -275,7 +278,7 @@ impl SegmentResponse {
         if segment_len == 0 {
             return Err("a segment cannot be zero bytes".into());
         }
-        if input.len() % segment_len != 0 {
+        if !input.len().is_multiple_of(segment_len) {
             return Err("the segment message is not a whole number of segments".into());
         }
         Ok(input.chunks(segment_len).map(<[u8]>::to_vec).collect())
@@ -321,9 +324,8 @@ impl SegmentResponse {
 pub struct BundleSubmission {
     /// Core index the work-package is destined for.
     pub core_index: u16,
-    /// `Segments-Root Mappings = len++[Work-Package Hash ++ Segments-Root]`
-    /// (`simple.md:393`).
-    pub mappings: Vec<([u8; 32], [u8; 32])>,
+    /// `Segments-Root Mappings` (`simple.md:393`).
+    pub mappings: SegmentsRootMappings,
     /// The GP-encoded work-package.
     ///
     /// Bytes rather than a typed package, for the reasons on
@@ -353,11 +355,9 @@ impl BundleSubmission {
     }
 
     /// Decode message 1 into `(core_index, mappings)`.
-    pub fn decode_initial(
-        input: &mut &[u8],
-    ) -> Result<(u16, Vec<([u8; 32], [u8; 32])>), codec::Error> {
+    pub fn decode_initial(input: &mut &[u8]) -> Result<(u16, SegmentsRootMappings), codec::Error> {
         let core_index = u16::decode(input)?;
-        let mappings = Vec::<([u8; 32], [u8; 32])>::decode(input)?;
+        let mappings = SegmentsRootMappings::decode(input)?;
         if !input.is_empty() {
             return Err("trailing bytes after the segments-root mappings".into());
         }

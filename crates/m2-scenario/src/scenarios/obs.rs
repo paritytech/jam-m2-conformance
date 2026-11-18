@@ -114,3 +114,11 @@ pub const SERVED_SEGMENT_SHARDS: u8 = 60;
 /// same question asked without the segment shards, and a lane that could not
 /// tell the two apart would read either as both.
 pub const SERVED_BUNDLE_SHARD: u8 = 61;
+
+/// The emulator submitted a work-package bundle to the NUT over CE 146.
+///
+/// A code of its own rather than sharing [`EMU_SENT_133`]. The two protocols
+/// carry the same package and are graded by the same rules, so a single code
+/// would let a run that exercised only one report both as exercised -- which
+/// is the mistake code 44 was retired for.
+pub const EMU_SENT_146: u8 = 62;

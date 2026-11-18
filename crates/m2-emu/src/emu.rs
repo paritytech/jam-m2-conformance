@@ -1718,9 +1718,13 @@ mod tests {
         let plan = ScheduledSubmission {
             slot: 0,
             core: 1,
+            protocol: u16::from(jamnp_s::framing::CE133),
             package: package.clone(),
             package_hash: [0x5a; 32],
             extrinsics: extrinsics.clone(),
+            mappings: Vec::new(),
+            segments: Vec::new(),
+            import_proofs: Vec::new(),
             co_guarantors: vec![2, 3],
             fault: None,
         };

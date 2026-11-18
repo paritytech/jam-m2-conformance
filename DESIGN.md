@@ -594,7 +594,7 @@ those the assertion is "not included" alone.
 | Check | Assertions | Faults |
 |---|---|---|
 | CE 133 `:351-376` (builder → NUT in NUT's rotation) | NUT FINs, opens CE 134 to both co-guarantors within ~3 s | first message > 2+200·1024 bytes → reset `:362-364`; NUT not guarantor of the core → ignore; unauthorized package → no sharing; extrinsic size mismatch → reset |
-| CE 146 `:378-404` | as 133; no CE 139/140/148 for supplied segments | bad import proof → refuse; package > 200·1024 → reset |
+| CE 146 `:378-404` | as 133, under row names of its own; the cap is on the **work-package message alone**, not on it plus the core index as CE 133's is | package > 200·1024 → reset. *(The bad-import-proof fault is not posed: this run's package imports no segments, so it carries no proof to spoil.)* |
 | CE 134 send `:406-458` | message 1 `Core ++ ShardCount(6) ++ len++[WPHash ++ SegRoot]`; message 2 bundle byte-identical to reference `:421-425`; shard count valid `:433-437` | co-guarantor replies wrong hash → its signature excluded; reset → proceed with the other |
 | CE 134 receive | NUT replies `WRHash ++ sig($jam_guarantee ++ blake(E(report)))`; hash equals reference (NUT refines) | shard count 5 or 7 → reject; bad mappings → refuse or trust `:443-445`; invalid authorization → reset |
 | CE 135 send `:460-485` | `Report ++ Slot ++ len++[(Idx,Sig)]`, 2–3 signatures sorted and valid; report equals reference; to all current validators, in the last rotation also to the next set `:469-471`; ~2 s wait for the third `:465-467` | — |

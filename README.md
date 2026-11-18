@@ -217,10 +217,14 @@ guarantor for the serve and assurance rows, and
 `m2-sim/tests/n4_inclusion_sim_it.rs` drives two more through a node that
 mishandles the assurances it is sent. Writing the second found both of
 `n4_ce141_inclusion`'s rows asking for the wrong block (`findings.md` §14).
-N3 still has the gap in places, and its CE 146 and CE 148 rows are
-unwritten. Until those close, a green N3 means "nothing contradicted the
-node" rather than "the node was checked", and the lanes are asked for by
-name so that distinction is never made silently.
+N3's submission rows are now held to it too, by
+`m2-sim/tests/n3_sim_it.rs`: a guarantor that refuses every package, one
+that takes a package over its protocol's size cap, and one that shares with
+a single co-guarantor each fail their own row, over CE 133 and CE 146 alike.
+What is still unproven in N3 is the CE 135 distribution and inclusion rows,
+and its CE 148 rows are unwritten. Until those close, a green N3 means
+"nothing contradicted the node" rather than "the node was checked", and the
+lanes are asked for by name so that distinction is never made silently.
 
 **The pin is on an unmerged branch.** `Cargo.toml` and `oracle/Cargo.toml`
 point at polkajam `0aaa2cb20` (branch `jv-export-n4`, open as
