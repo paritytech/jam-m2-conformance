@@ -40,8 +40,8 @@ repository = "https://github.com/paritytech/jam-m2-conformance"
 # has broken this workspace three times in four weeks -- so move it at most
 # once per milestone, in a commit of its own that records what changed.
 [workspace.dependencies]
-jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "43689c3de5f866ebfc734cde2c6c8598da903da8" }
-jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "43689c3de5f866ebfc734cde2c6c8598da903da8" }
+jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "0aaa2cb207b71a7b64ec4e0c84ac8fae396f4cc5" }
+jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "0aaa2cb207b71a7b64ec4e0c84ac8fae396f4cc5" }
 
 async-trait = "0.1"
 quinn = { version = "0.11", features = ["rustls", "runtime-tokio", "log"] }

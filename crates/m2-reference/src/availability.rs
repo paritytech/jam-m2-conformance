@@ -1,8 +1,12 @@
 //! Erasure coding and justification checking, as the engine does them.
 //!
-//! Four questions, all of them sessionless: coding is a function of the bytes
-//! and the shard count, and checking a proof is a function of the proof. None
-//! of them touches a chain, so none of them takes a session.
+//! Four of the five questions here are sessionless: coding is a function of
+//! the bytes and the shard count, and checking a proof is a function of the
+//! proof. None of those touches a chain, so none of them takes a session.
+//!
+//! [`RefChain::submit_assurances`] is the exception, and it has to be: an
+//! assurance a node received changes what the next block it authors carries,
+//! which is a change to one chain and not to the other.
 //!
 //! The counterpart of [`crate::assurance`], and the opposite answer to the
 //! same test. There, the whole computation lived in `jam-std-common` and both
@@ -15,7 +19,7 @@ use std::sync::Arc;
 
 use m2_oracle_proto::Message;
 
-use crate::chain::ChainError;
+use crate::chain::{ChainError, RefChain};
 use crate::oracle::Oracle;
 
 /// A bundle coded into one shard per validator.
@@ -148,6 +152,46 @@ pub fn make_available(
         other => Err(ChainError::Oracle(format!(
             "MakeAvailable answered {other:?}"
         ))),
+    }
+}
+
+impl RefChain {
+    /// Offer assurances to the authoring pool, as a node does with the ones
+    /// its peers send it over CE 141.
+    ///
+    /// The sibling of [`RefChain::submit_tickets`], and a narrow passthrough
+    /// for the same reason: the engine behind it can author, import and
+    /// mutate state, and the chain's invariants are not things a caller
+    /// should be able to step around.
+    ///
+    /// **The pool files by anchor, and the block author reads only the
+    /// entry for its parent.** An assurance anchored at anything but the
+    /// block about to be authored is pooled and never carried -- correctly,
+    /// since the on-chain rule refuses an assurances extrinsic whose anchor
+    /// is not the block's parent. The engine also keeps one anchor at a
+    /// time, so an assurance for a newer block discards the pool for an
+    /// older one.
+    ///
+    /// Taken as already verified. A node checks an assurance before pooling
+    /// it, and a simulated node that skips the check is posing the fault of
+    /// carrying one it should have refused.
+    pub fn submit_assurances(
+        &self,
+        assurances: &[jam_std_common::AvailabilityAssurance],
+    ) -> Result<(), ChainError> {
+        if assurances.is_empty() {
+            return Ok(());
+        }
+        let encoded = assurances.iter().map(jam_types::Encode::encode).collect();
+        match self.ask(Message::SubmitAssurances {
+            session: self.session(),
+            assurances: encoded,
+        })? {
+            Message::Done => Ok(()),
+            other => Err(ChainError::Oracle(format!(
+                "SubmitAssurances answered {other:?}"
+            ))),
+        }
     }
 }
 

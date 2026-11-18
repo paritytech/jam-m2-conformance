@@ -484,7 +484,8 @@ twice. With the pin moved, `m2-sim` holds a real coded bundle and
 types. The same shape as #1378 -- a re-export and a visibility bump, no
 behaviour change.
 
-The pin moved to that branch (`43689c3de`) on 2026-11-17, ahead of the PR
+The pin moved to that branch on 2026-11-17 (`43689c3de`, and `0aaa2cb20`
+once §14's export joined it), ahead of the PR
 being opened, for two reasons. `merkle_root` is needed to *check* a CE 137
 justification at all, since that protocol takes its segment root from the
 shards rather than from the justification (§11b). And `merkle_proofs` with
@@ -657,3 +658,65 @@ slept one whole slot period before sending, which lands at exactly the same
 phase of the next slot and reads as punctual. It now holds until the slot has
 nearly run out. A fault that fails to break the thing it is aimed at looks
 identical to a check that works.
+
+## 14. The inclusion rows asked for the wrong block — CLOSED 2026-11-18
+
+**Status:** closed. Found by writing the simulated node that should have
+broken `n4_ce141_inclusion`, which had never been exercised against anything.
+
+Both of its rows were wrong, in ways that compounded.
+
+**An assurance can be carried in exactly one block.** `check_signatures`
+refuses an assurances extrinsic unless every assurance in it anchors the
+block's *parent*:
+
+```rust
+if assurance.statement.anchor != parent_hash {
+    return Err(BadAttestationParent);
+}
+```
+
+So the only block that can ever carry an assurance is the child of the block
+it names. The row asked whether *any* NUT block after the offer carried it —
+and the node authors about two slots in six, so most of its blocks are not
+that child. A node keeping the rule exactly would have been failed for it.
+
+**And the anchor was the wrong block to begin with.** The harness anchored
+every offer at the last block the *NUT* had authored. The harness fills the
+slots the node does not, so that block is usually several blocks behind the
+head, and nothing is ever authored directly on top of it. Every offer named
+a block that would never be a parent again. The two defects hid each other:
+with the anchor stale, the "any later block" reading was the only one under
+which the row could ever pass.
+
+The anchor is now the chain's head, read at send time, and the rows are
+judged against the one block that could carry the assurance — the child of
+that anchor, authored at or after the slot the assurance was sent for.
+
+Two more things came out of writing it.
+
+**A node that includes an invalid assurance authors an invalid block.** A
+bad signature fails `check_signatures`; a bit for a core with no assignment
+fails with `CoreNotEngaged`. So the fault cannot be posed by pooling: the
+authoring engine refuses to produce the block. `AssuranceIncludesInvalid`
+rewrites the authored body instead, and fails N1's import row in company,
+which the test asserts rather than remarks on. The wrong-anchor fault cannot
+reach a block even then — the engine files assurances by anchor and the
+author reads only the entry for its parent — so it is the other two that
+make the exclusion row fail.
+
+**Offering once was not enough.** With the rows tied to one block, a single
+offer is graded only if the node happens to author that block. A run now
+assures the head every slot, as a validator does, half the slots honestly
+and half spoiled, so each row has several of the node's own slots to be
+judged on.
+
+### Why this took an upstream export
+
+`AssuranceTracker` is a private field of `Authoring` and `note_dummy_assurance`
+is unreachable outside `jam-node`. The authoring harness could sign its own
+assurance and never take one it was handed, so nothing could simulate the
+half that matters: a node's assurances extrinsic carries what its *peers*
+sent it. `AuthoringHarness::submit_assurance` is the entry point, pushed to
+the same branch as the Merkle exports (§9) and open as
+**paritytech/polkajam#1401**.

@@ -1250,7 +1250,7 @@ dependencies = [
 [[package]]
 name = "jam-std-common"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=43689c3de5f866ebfc734cde2c6c8598da903da8#43689c3de5f866ebfc734cde2c6c8598da903da8"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=0aaa2cb207b71a7b64ec4e0c84ac8fae396f4cc5#0aaa2cb207b71a7b64ec4e0c84ac8fae396f4cc5"
 dependencies = [
  "ark-vrf",
  "arrayvec",
@@ -1276,7 +1276,7 @@ dependencies = [
 [[package]]
 name = "jam-types"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=43689c3de5f866ebfc734cde2c6c8598da903da8#43689c3de5f866ebfc734cde2c6c8598da903da8"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=0aaa2cb207b71a7b64ec4e0c84ac8fae396f4cc5#0aaa2cb207b71a7b64ec4e0c84ac8fae396f4cc5"
 dependencies = [
  "atomic-traits",
  "base64 0.22.1",

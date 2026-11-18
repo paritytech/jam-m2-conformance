@@ -12,7 +12,10 @@
 //! not "does the engine know how" but "is there a second implementation to
 //! diverge from". Here there is not.
 
-use jam_std_common::{ed25519, AvailabilityBitfield, AvailabilityStatement, SecretKeyset};
+use jam_std_common::{
+    ed25519, AvailabilityAssurance, AvailabilityBitfield, AvailabilityStatement, SecretKeyset,
+    ValSignature,
+};
 use jam_types::HeaderHash;
 use jamnp_s::codec::ce141_145::Assurance;
 
@@ -118,17 +121,7 @@ pub fn check_assurance(
     // Rebuilt rather than trusted: the signature is over the *statement*, so
     // checking it means forming the statement the signer should have formed
     // and seeing whether the signature matches that one.
-    let mut bitfield = AvailabilityBitfield::new();
-    for core in 0..cores {
-        let byte = assurance.bitfield[core as usize / 8];
-        if byte & (1 << (core % 8)) != 0 {
-            bitfield.set(core);
-        }
-    }
-    let statement = AvailabilityStatement {
-        anchor: assurance.anchor,
-        bitfield,
-    };
+    let statement = statement_of(assurance);
     let public = SecretKeyset::trivial(u32::from(index)).ed25519.public();
     public
         .verify(
@@ -136,6 +129,51 @@ pub fn check_assurance(
             &ed25519::Signature(assurance.signature.into()),
         )
         .map_err(|_| AssuranceFault::BadSignature)
+}
+
+/// The statement a wire assurance says it is signing.
+///
+/// Only the first `core_count()` bits are read, so the spare bits a
+/// fixed-width bitfield leaves over cannot smuggle a core in. The caller
+/// that cares whether any of them were set asks [`check_assurance`], which
+/// refuses that separately rather than quietly dropping it here.
+fn statement_of(assurance: &Assurance) -> AvailabilityStatement {
+    let mut bitfield = AvailabilityBitfield::new();
+    for core in 0..jam_types::core_count() {
+        let byte = assurance
+            .bitfield
+            .get(core as usize / 8)
+            .copied()
+            .unwrap_or(0);
+        if byte & (1 << (core % 8)) != 0 {
+            bitfield.set(core);
+        }
+    }
+    AvailabilityStatement {
+        anchor: assurance.anchor,
+        bitfield,
+    }
+}
+
+/// The engine's form of an assurance that arrived over CE 141.
+///
+/// `index` comes from the connection rather than the message: CE 141 carries
+/// no validator index, so who sent it is the receiver's own knowledge of
+/// which peer it is talking to. That is also why a signature by somebody
+/// else is a fault the receiver can catch at all -- the statement is sound
+/// and only the hand that signed it is wrong.
+///
+/// No checking here. [`check_assurance`] is the check, and keeping the two
+/// apart is what lets a simulated node pool an assurance it should have
+/// refused.
+pub fn as_received(assurance: &Assurance, index: u16) -> AvailabilityAssurance {
+    AvailabilityAssurance {
+        statement: statement_of(assurance),
+        signature: ValSignature {
+            val_index: index,
+            signature: ed25519::Signature(assurance.signature.into()),
+        },
+    }
 }
 
 /// Which cores an assurance claims.
@@ -276,6 +314,50 @@ mod tests {
             }),
             "with no blocks to check against, nothing is anchored"
         );
+    }
+
+    /// The wire form and the engine form have to be the same assurance.
+    ///
+    /// Not a formality: [`as_received`] rebuilds the statement from the
+    /// bitfield's bytes, and the signature on the wire was made over the
+    /// statement the *sender* built. If the two readings of those bytes ever
+    /// part company, a node pooling what the harness sent would carry an
+    /// assurance whose signature does not verify, and its block would be
+    /// refused for a reason nothing in the lane names.
+    #[test]
+    fn a_signed_assurance_survives_the_trip_into_the_engines_form() {
+        let cores = tiny();
+        let anchor = [0x5a; 32];
+        let wire = sign_assurance(3, anchor, &(0..cores).collect::<Vec<_>>());
+        let received = as_received(&wire, 3);
+        assert_eq!(received.signature.val_index, 3);
+        assert_eq!(received.statement.anchor.0, anchor);
+        let public = SecretKeyset::trivial(3).ed25519.public();
+        assert!(
+            public
+                .verify(
+                    &ed25519::Message::Assurance(received.statement.hash()),
+                    &received.signature.signature,
+                )
+                .is_ok(),
+            "the statement the engine rebuilds must be the one that was signed"
+        );
+        assert_eq!(
+            jam_types::Encode::encode(&received.statement.bitfield),
+            wire.bitfield,
+            "and its bitfield must be the bytes the wire carried"
+        );
+    }
+
+    /// The index is the connection's, not the message's.
+    #[test]
+    fn the_validator_index_comes_from_the_caller() {
+        tiny();
+        let wire = sign_assurance(3, [0x5a; 32], &[0]);
+        // CE 141 carries no index, so nothing in these bytes contradicts a
+        // receiver that files them under the wrong validator -- which is
+        // exactly how the bad-signature fault is posed.
+        assert_eq!(as_received(&wire, 4).signature.val_index, 4);
     }
 
     /// Two readings of the same rule, and they have to agree.

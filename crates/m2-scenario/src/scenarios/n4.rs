@@ -22,12 +22,10 @@
 //! `n4_ce141_sent_before_the_slot` asked whether the lead was positive,
 //! which it is by construction.
 //!
-//! The exception is [`n4_ce141_inclusion`]. Its rows ask whether the node
-//! carries valid assurances in its blocks and leaves invalid ones out, and
-//! the stand-in authors through the reference chain, so it cannot put a
-//! received assurance into a block. Those rows are still unproven, and a
-//! green `n4_ce141_valid_assurance_included` should be read as "nothing
-//! contradicted the node" rather than "the node was checked".
+//! [`n4_ce141_inclusion`] was the last of them to be proved. The stand-in
+//! authors through the reference chain, and until `submit_assurance` was
+//! exported there was no way to put an assurance it *received* into a block
+//! -- so both of its rows passed on every node, conforming or not.
 
 use crate::dsl::{check, log, Check, Control, Severity};
 
@@ -555,6 +553,14 @@ pub fn n4_ce141_send(ctx: &N4Ctx) -> Check {
 
 /// CE 141 receive: the NUT includes valid assurances and leaves out the
 /// rest.
+///
+/// Judged against **one** block, the child of the block each assurance
+/// anchors. An assurances extrinsic is refused unless every assurance in it
+/// anchors the block's parent, so that is the only block the assurance could
+/// ever appear in, and a node that authored no such block owed nothing. An
+/// earlier version asked whether *any* later block carried it, which fails a
+/// conforming node for authoring at a slot that was not the anchor's child
+/// -- most of its slots (findings.md §14).
 pub fn n4_ce141_inclusion(ctx: &N4Ctx) -> Check {
     let ctx = ctx.clone();
     check("n4_ce141_inclusion", Severity::Hard, move |_obs| {
@@ -575,7 +581,7 @@ pub fn n4_ce141_inclusion(ctx: &N4Ctx) -> Check {
                 results.push(
                     Control::new(
                         "n4_ce141_inclusion_not_exercised",
-                        "a NUT block authored after the assurance was offered",
+                        "a NUT block whose parent is the block the assurance anchors",
                         false,
                     )
                     .absent("n4_ce141_inclusion_not_exercised"),
@@ -589,8 +595,8 @@ pub fn n4_ce141_inclusion(ctx: &N4Ctx) -> Check {
                     Severity::Hard,
                     || {
                         format!(
-                            "the NUT authored a block after validator {}'s assurance for \
-                             anchor {} and did not carry it",
+                            "the NUT authored the child of validator {}'s assurance anchor \
+                             {} and did not carry it",
                             offered.validator,
                             short(&offered.anchor)
                         )

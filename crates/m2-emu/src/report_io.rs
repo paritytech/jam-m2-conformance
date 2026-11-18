@@ -271,7 +271,17 @@ pub async fn spawn_report_sender(
         slot,
     ) {
         Ok(Some(plan)) => plan,
-        Ok(None) => return,
+        // Said rather than returned silently, the same as the arm below. A
+        // report that could not be composed leaves the CE 135 rows with
+        // nothing to grade, and a reader has no way to tell that from a node
+        // that ignored a report it was sent.
+        Ok(None) => {
+            eprintln!(
+                "[distributor] no report to distribute in slot {slot}: the NUT holds no core \
+                 there in the epoch view, or there is only one core"
+            );
+            return;
+        }
         Err(e) => {
             eprintln!("[distributor] could not compose the report: {e}");
             return;

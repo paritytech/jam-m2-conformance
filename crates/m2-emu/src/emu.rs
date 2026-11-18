@@ -890,7 +890,7 @@ fn start_availability(connection: &Conn, peer: u16, shared: &EmuShared) {
         let Some(plan) = lock(&shared.avail_plan).clone() else {
             return;
         };
-        let nut_blocks = Arc::clone(&shared.nut_blocks);
+        let ref_chain = Arc::clone(&shared.ref_chain);
         crate::avail_io::drive_availability(
             &connection,
             peer,
@@ -900,16 +900,17 @@ fn start_availability(connection: &Conn, peer: u16, shared: &EmuShared) {
             &shared.shards_served,
             &shared.segment_shards_served,
             &shared.assurances_offered,
-            // Read at send time, not planned: the block to assure is
-            // whichever one the chain is on two seconds before the slot,
-            // and a hash chosen when the plan was written names a block
-            // several slots old by then.
-            move || {
-                lock(&nut_blocks)
-                    .iter()
-                    .max_by_key(|nut| nut.block.header.slot)
-                    .map(|nut| nut.block.header.hash().0)
-            },
+            // The chain's head, read at send time: the block to assure is
+            // whichever one the chain is on, and a hash chosen when the plan
+            // was written names a block several slots old by then.
+            //
+            // The *chain's* head, not the last block the NUT authored. The
+            // node authors two slots in six and the harness fills the rest,
+            // so the last NUT block is usually several blocks behind the
+            // head -- and an assurance anchored there can never be carried,
+            // because the on-chain rule refuses an assurances extrinsic
+            // whose anchor is not the block's parent (findings.md §14).
+            move || ref_chain.best_block().ok().map(|(hash, _)| hash),
         )
         .await;
     });

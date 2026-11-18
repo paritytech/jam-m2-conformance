@@ -211,21 +211,27 @@ and pins `PvmBackend::Interpreter`.
 | P4 | N7 adversarial, index rotation, IPv6, web UI | ⏳ |
 
 **Why N3 and N4 are not in the default lane set.** A check nobody has seen
-fail is a check nobody knows is a check. N4's serve and assurance rows are
-held to that bar by `m2-sim/tests/n4_sim_it.rs`, which drives eleven faults
-through a simulated guarantor; `n4_ce141_inclusion` is not, because a
-stand-in that authors through the reference chain cannot carry a received
-assurance in a block. N3 has the same gap in places. Until they close, a
-green N3 or N4 means "nothing contradicted the node" rather than "the node
-was checked", and the lanes are asked for by name so that distinction is
-never made silently.
+fail is a check nobody knows is a check. Every N4 check is now held to that
+bar: `m2-sim/tests/n4_sim_it.rs` drives eleven faults through a simulated
+guarantor for the serve and assurance rows, and
+`m2-sim/tests/n4_inclusion_sim_it.rs` drives two more through a node that
+mishandles the assurances it is sent. Writing the second found both of
+`n4_ce141_inclusion`'s rows asking for the wrong block (`findings.md` §14).
+N3 still has the gap in places, and its CE 146 and CE 148 rows are
+unwritten. Until those close, a green N3 means "nothing contradicted the
+node" rather than "the node was checked", and the lanes are asked for by
+name so that distinction is never made silently.
 
 **The pin is on an unmerged branch.** `Cargo.toml` and `oracle/Cargo.toml`
-point at polkajam `43689c3de` (branch `jv-export-n4`, open as
-polkajam#1401), which exports `hazmat::merkle`. Checking a CE 137 justification needs `merkle_root`, and
-building one at all — which is what lets a simulated node serve shards —
-needs `merkle_proofs` and `pack_erasure_tree_entry`. The pin goes back to a
-merge commit once that PR lands; see `findings.md` §9.
+point at polkajam `0aaa2cb20` (branch `jv-export-n4`, open as
+polkajam#1401), which exports two things the harness cannot do without.
+`hazmat::merkle` is what checks and builds a CE 137 justification —
+`merkle_root` to check one, `merkle_proofs` and `pack_erasure_tree_entry` to
+build one, which is what lets a simulated node serve shards at all.
+`AuthoringHarness::submit_assurance` is what lets one carry an assurance it
+*received*, without which the CE 141 inclusion rows cannot be shown to fail.
+The pin goes back to a merge commit once that PR lands; see `findings.md`
+§9 and §14.
 
 Iterate-later items: full 2-epoch observation + epoch-boundary alignment of the ticket window;
 independent (non-`import_block`) seal/entropy VRF re-verification; full M1-style keyvals diff on

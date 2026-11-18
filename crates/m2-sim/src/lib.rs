@@ -31,6 +31,7 @@ use jamnp_s::codec::ce128_129::{
     BlockRequest, BlockResponse, BoundaryNode, Direction, KeyValue, StateRequest, StateResponse,
 };
 use jamnp_s::codec::ce131_136::{Ticket, TicketDistribution};
+use jamnp_s::codec::ce141_145::Assurance;
 use jamnp_s::codec::up0::{Announcement, Final, Handshake};
 use jamnp_s::endpoint::{EndpointConfig, EndpointError};
 use jamnp_s::framing::{
@@ -193,6 +194,19 @@ pub enum SimFault {
     AssuranceEmptyCore,
     /// Send the assurance after its slot has begun rather than before it.
     AssuranceLate,
+    /// Carry an assurance that should have been refused.
+    ///
+    /// About assurances the node *receives*, where the four above are about
+    /// the one it sends. Posed by rewriting the authored body rather than by
+    /// pooling the assurance, because the pool will not take it: an
+    /// assurances extrinsic with a bad signature or a bit for an unengaged
+    /// core makes the block invalid, and the authoring engine refuses to
+    /// produce one. That is the fact underneath the row -- a node that
+    /// includes an invalid assurance authors an invalid block -- so this
+    /// fault fails N1's import rows in company, and the test says so.
+    AssuranceIncludesInvalid,
+    /// Pool nothing, so no assurance a peer sends is ever carried.
+    AssuranceOmitsValid,
 }
 
 /// Application error code the node resets a refused ticket stream with.
@@ -251,6 +265,17 @@ pub struct SimNode {
     /// every availability request the way a real one does when it has no
     /// such root: by refusing.
     available: Mutex<Option<Available>>,
+    /// Assurances this node checked and refused, kept for the one fault
+    /// that carries them anyway.
+    refused_assurances: Mutex<Vec<jam_std_common::AvailabilityAssurance>>,
+    /// Cores this node believes carry a report pending availability.
+    ///
+    /// Empty unless a test says otherwise, which is the truthful answer for
+    /// a chain nothing has been guaranteed on. An assurance claiming a core
+    /// outside this set is claiming one with nothing on it, and a real node
+    /// refuses it -- so does this one, unless it is posing
+    /// [`SimFault::AssuranceIncludesInvalid`].
+    reported_cores: Mutex<Vec<u16>>,
 }
 
 /// A bundle this node can serve shards of.
@@ -280,7 +305,19 @@ impl SimNode {
             own_blocks: Mutex::new(Vec::new()),
             forwarded: Mutex::new(Vec::new()),
             available: Mutex::new(None),
+            refused_assurances: Mutex::new(Vec::new()),
+            reported_cores: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Say which cores this node has a report pending availability on.
+    ///
+    /// What a real node reads out of its own state. Injected here for the
+    /// same reason everything else in this stand-in is: it has no state
+    /// machine, and a value it invented would be this harness agreeing with
+    /// itself.
+    pub fn reports_on_cores(&self, cores: &[u16]) {
+        *self.reported_cores.lock().expect("sim reported cores") = cores.to_vec();
     }
 
     /// Code `bundle` and `segments` into shards this node will serve.
@@ -424,6 +461,9 @@ impl SimNode {
     /// Only the body: the header is left as authored, so the block keeps the
     /// hash it was announced under and the harness can still fetch it.
     fn rewrite_body(&self, block: Block) -> Block {
+        if self.fault == SimFault::AssuranceIncludesInvalid {
+            return self.carry_refused_assurances(block);
+        }
         let tail = block.header.slot % jam_types::epoch_period() >= jam_types::epoch_tail_start();
         let seed = match self.fault {
             SimFault::ServesDuplicateTicket if !tail => block.extrinsic.tickets.first().cloned(),
@@ -446,6 +486,47 @@ impl SimNode {
         };
         for _ in 0..repeats {
             if extrinsic.tickets.try_push(ticket.clone()).is_err() {
+                break;
+            }
+        }
+        let mut block = block;
+        block.extrinsic = Arc::new(extrinsic);
+        block
+    }
+
+    /// Add the refused assurances this block's parent was assured by.
+    ///
+    /// Only the ones anchored at the parent. An assurance naming any other
+    /// block cannot be carried here at all -- the on-chain rule refuses an
+    /// assurances extrinsic whose anchor is not the block's parent -- so the
+    /// wrong-anchor fault stays out even on a node checking nothing, and it
+    /// is the other two that make the row fail.
+    fn carry_refused_assurances(&self, block: Block) -> Block {
+        let parent = block.header.parent;
+        let refused: Vec<jam_std_common::AvailabilityAssurance> = self
+            .refused_assurances
+            .lock()
+            .expect("sim refused assurances")
+            .iter()
+            .filter(|a| a.statement.anchor == parent)
+            .cloned()
+            .collect();
+        if refused.is_empty() {
+            return block;
+        }
+        let mut extrinsic = (*block.extrinsic).clone();
+        for assurance in refused {
+            // Sorted by validator index, which is what the extrinsic's own
+            // rule asks for. A node this careless about the assurances would
+            // plausibly be careless about the order too, but an unsorted
+            // extrinsic is a *second* defect and the row would no longer say
+            // which one it caught.
+            let at = extrinsic
+                .assurances
+                .iter()
+                .position(|a| a.signature.val_index > assurance.signature.val_index)
+                .unwrap_or(extrinsic.assurances.len());
+            if extrinsic.assurances.try_insert(at, assurance).is_err() {
                 break;
             }
         }
@@ -478,7 +559,7 @@ impl SimNode {
                 // Serve it too: the peer sends tickets on whichever
                 // connection it has, so a node that served only inbound ones
                 // silently ignores every ticket proxied over an outbound.
-                tokio::spawn(Arc::clone(self).serve_connection(conn));
+                tokio::spawn(Arc::clone(self).serve_connection(conn, Some(*index)));
             }
         }
     }
@@ -679,23 +760,29 @@ impl SimNode {
                     continue;
                 };
                 let node = Arc::clone(&node);
-                tokio::spawn(node.serve_connection(connection));
+                tokio::spawn(node.serve_connection(connection, None));
             }
         });
         Ok((bound, task))
     }
 
     /// One task per stream, for as long as the peer keeps the connection.
-    async fn serve_connection(self: Arc<Self>, connection: Conn) {
+    ///
+    /// `peer` is which validator is on the other end, where this node knows:
+    /// it dialled them, so it chose the index. On a connection it accepted
+    /// it is `None`, because this transport carries no peer identity and
+    /// guessing one would file an assurance under a validator that never
+    /// sent it.
+    async fn serve_connection(self: Arc<Self>, connection: Conn, peer: Option<u16>) {
         while let Ok((send, recv)) = connection.accept_bi().await {
             let node = Arc::clone(&self);
-            tokio::spawn(node.serve_stream(send, recv));
+            tokio::spawn(node.serve_stream(send, recv, peer));
         }
     }
 
     /// Dispatch one accepted stream on the kind byte its opening frame
     /// carries (`simple.md:122-124`).
-    async fn serve_stream(self: Arc<Self>, mut send: SendHalf, recv: RecvHalf) {
+    async fn serve_stream(self: Arc<Self>, mut send: SendHalf, recv: RecvHalf, peer: Option<u16>) {
         let mut reader = StreamReader::new(recv);
         let Some((kind, content)) = reader.next().await else {
             return;
@@ -707,10 +794,74 @@ impl SimNode {
             CE131 | CE132 => self.receive_ticket(&mut send, kind, &content).await,
             CE137 | CE138 => self.serve_bundle_shard(&mut send, kind, &content).await,
             CE139 | CE140 => self.serve_segment_shards(&mut send, kind, &content).await,
+            CE141 => self.receive_assurance(&content, peer).await,
             // A real node resets an unserved kind; this one is not graded on
             // that, so it drops the stream.
             _ => {}
         }
+    }
+
+    /// Receive a CE 141 assurance: check it, and pool it if it holds up.
+    ///
+    /// The whole of what `n4_ce141_inclusion` grades happens here and in the
+    /// block the node goes on to author. A node carries the valid assurances
+    /// its peers sent it and leaves the rest out, so the two rows are one
+    /// decision seen from the block: whether these bytes reached the pool.
+    ///
+    /// The check is the harness's own [`m2_reference::assurance`], which is
+    /// what a stand-in is for -- the independence that matters is between
+    /// the node and the *grading*, and the grading reads the block. What
+    /// makes the rows provable is that the two faults move this decision
+    /// without touching anything else.
+    async fn receive_assurance(&self, content: &[u8], peer: Option<u16>) {
+        // Nobody to attribute it to. A real node reads the index off the
+        // connection's certificate; this one knows only the peers it dialled.
+        let Some(peer) = peer else { return };
+        let Ok(assurance) = Assurance::decode(&mut &content[..]) else {
+            return;
+        };
+        if self.fault == SimFault::AssuranceOmitsValid {
+            return;
+        }
+        let received = m2_reference::assurance::as_received(&assurance, peer);
+        if self.assurance_holds(&assurance, peer) {
+            let _ = self.chain.submit_assurances(&[received]);
+            return;
+        }
+        // Refused, and remembered only by the node that carries what it
+        // refused. The pool is not where that fault can be posed: an
+        // assurance it should have turned away is one the block would be
+        // invalid for carrying, and the engine will not author such a block.
+        if self.fault == SimFault::AssuranceIncludesInvalid {
+            self.refused_assurances
+                .lock()
+                .expect("sim refused assurances")
+                .push(received);
+        }
+    }
+
+    /// Everything a node checks before pooling an assurance.
+    ///
+    /// Three questions, and the lane grades the answers separately because a
+    /// node that gets one wrong is not the same node as one that gets
+    /// another wrong (`simple.md:675-695`): is it shaped right and signed by
+    /// the validator it came from, does it name a block this node has, and
+    /// does every core it claims carry a report.
+    fn assurance_holds(&self, assurance: &Assurance, peer: u16) -> bool {
+        // Asked of the chain rather than remembered: the anchor must be a
+        // block this node has, and the chain is the only thing that knows
+        // which those are.
+        let anchor = assurance.anchor.0;
+        if !matches!(self.chain.storage_root(&anchor), Ok(Some(_))) {
+            return false;
+        }
+        if m2_reference::assurance::check_assurance(assurance, peer, &[anchor]).is_err() {
+            return false;
+        }
+        let reported = self.reported_cores.lock().expect("sim reported cores");
+        m2_reference::assurance::assured_cores(assurance)
+            .iter()
+            .all(|core| reported.contains(core))
     }
 
     /// Serve CE 137 or CE 138: the bundle shard, CE 137's segment shards,

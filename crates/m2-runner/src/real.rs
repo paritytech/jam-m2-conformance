@@ -322,23 +322,8 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
         },
     );
 
-    // Whether an offered assurance was carried, and whether the node ever
-    // had the chance. A block authored before the offer owed nothing.
     let mut assurances_offered = lock(&data.assurances_offered).clone();
-    for offered in &mut assurances_offered {
-        let later: Vec<&NutBlock> = nut_blocks
-            .iter()
-            .filter(|nut| nut.block.header.slot > offered.sent_in_slot)
-            .collect();
-        offered.had_opportunity = !later.is_empty();
-        offered.included = later.iter().any(|nut| {
-            nut.block
-                .extrinsic
-                .assurances
-                .iter()
-                .any(|a| a.signature.val_index == offered.validator)
-        });
-    }
+    resolve_assurance_inclusion(&mut assurances_offered, nut_blocks);
 
     N4Ctx {
         nut_index: data.nut_index as u16,
@@ -348,6 +333,39 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
         assurances_offered,
         availability_threshold: jam_types::supermajority_threshold(jam_types::max_val_count()),
         assured_by_core: assured_by_core(nut_blocks),
+    }
+}
+
+/// Decide, for each assurance the harness offered, whether the node carried
+/// it and whether it ever had the chance.
+///
+/// **One block, not "some later block".** An assurances extrinsic is refused
+/// unless every assurance in it anchors the block's *parent*
+/// (`BadAttestationParent`), so an assurance can be carried in exactly one
+/// block: the child of the block it names. A node that authored some other
+/// block owed nothing, and grading it against "any later block" fails a node
+/// doing exactly the right thing (findings.md §14).
+///
+/// Public because `m2-sim`'s inclusion test grades the same facts the runner
+/// does, through this function rather than a second copy of the rule.
+pub fn resolve_assurance_inclusion(offered: &mut [AssuranceOffered], nut_blocks: &[NutBlock]) {
+    for offer in offered {
+        // `sent_in_slot` is the slot the assurance was sent *for*: it goes
+        // out a couple of seconds before that slot begins, aiming at the
+        // block authored in it. A block of that slot or later is one the
+        // node could still have put it in; an earlier one was already
+        // authored when the assurance arrived.
+        let child: Option<&NutBlock> = nut_blocks.iter().find(|nut| {
+            nut.block.header.parent.0 == offer.anchor && nut.block.header.slot >= offer.sent_in_slot
+        });
+        offer.had_opportunity = child.is_some();
+        offer.included = child.is_some_and(|nut| {
+            nut.block
+                .extrinsic
+                .assurances
+                .iter()
+                .any(|a| a.signature.val_index == offer.validator)
+        });
     }
 }
 

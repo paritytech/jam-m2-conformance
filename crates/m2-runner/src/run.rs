@@ -387,7 +387,17 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         let slot = share_base + SUBMISSION_SPACING_SLOTS * i as u32;
                         match ref_chain.share_to_nut(nut_index as u16, slot, fault) {
                             Ok(Some(share)) => shares.push(share),
-                            Ok(None) => {}
+                            // Said rather than dropped, the same as the
+                            // sibling above. A run where no share could be
+                            // planned grades the CE 134 receive rules as
+                            // unexercised, and a reader looking at a report
+                            // with nothing in those rows needs to know the
+                            // harness never asked -- not be left to guess
+                            // whether the node stayed silent.
+                            Ok(None) => eprintln!(
+                                "[assignment] no bundle to share at slot {slot}: the NUT holds \
+                                 no core there in the epoch view"
+                            ),
                             Err(e) => conn_findings.push(no_package_plan_finding(&e)),
                         }
                     }
@@ -1198,7 +1208,10 @@ async fn plan_availability(
         // A slot ahead, so the fetches have somewhere to finish before the
         // assurance that follows them.
         honest_slot: now + 1,
-        spoiled_slot: now + 1 + SPOILED_ASSURANCE_GAP_SLOTS,
+        assurance_slots: ASSURANCE_SLOTS,
+        // Half honest, half spoiled. Either half has to contain a slot the
+        // node authors the child of, or its row goes ungraded.
+        spoiled_from: now + 1 + ASSURANCE_SLOTS / 2,
     };
     eprintln!(
         "[availability] planning against root {} coded into {} shards, {} segment(s)",
@@ -1210,14 +1223,14 @@ async fn plan_availability(
     planner.set(plan);
 }
 
-/// Slots between the honest assurances and the deliberately spoiled ones.
+/// Slots a run assures for, starting at the first.
 ///
-/// They must land on different blocks. A validator that sent an honest
-/// assurance and a spoiled one for the *same* anchor would have the second
-/// dropped as a duplicate, and the row asking whether the node excludes
-/// invalid assurances would pass for a reason that has nothing to do with
-/// their being invalid.
-const SPOILED_ASSURANCE_GAP_SLOTS: u32 = 3;
+/// A validator assures the head every slot, and an assurance is carried in
+/// exactly one block: the child of the block it anchors. The node authors
+/// about two slots in six, so a single offer would leave the inclusion rows
+/// unexercised most runs -- not failing, but saying nothing. A full epoch's
+/// worth of slots puts several of the node's own among them.
+const ASSURANCE_SLOTS: u32 = 12;
 
 /// Most segment indices a run asks for over CE 139/140.
 ///

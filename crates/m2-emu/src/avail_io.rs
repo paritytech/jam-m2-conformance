@@ -313,16 +313,30 @@ pub struct AvailPlan {
     /// Cores the harness believes carried a report, which is what an honest
     /// assurance claims.
     pub cores: Vec<u16>,
-    /// Slot the honest assurances go out in.
+    /// First slot an assurance goes out for.
     pub honest_slot: u32,
-    /// Slot the deliberately spoiled ones go out in.
+    /// How many slots in a row to assure for, starting at `honest_slot`.
     ///
-    /// A different slot, and so a different anchor, on purpose. A validator
-    /// that sent an honest assurance and a spoiled one for the *same* block
-    /// would have its second dropped as a duplicate, and the row asking
-    /// whether the node excludes invalid assurances would pass for the wrong
-    /// reason.
-    pub spoiled_slot: u32,
+    /// A validator assures the head every slot, and an assurance can be
+    /// carried in exactly one block -- the child of the block it anchors.
+    /// Offering in a single slot would leave the inclusion rows exercised
+    /// only if the node happened to author that one slot's child, which is
+    /// about one slot in three.
+    pub assurance_slots: u32,
+    /// First slot whose offer is spoiled instead of honest.
+    ///
+    /// A boundary rather than one named slot. An assurance is carried in
+    /// exactly one block -- the child of the block it anchors -- so a single
+    /// spoiled offer is graded only if the node happens to author that one
+    /// block, and the row asking whether invalid assurances are excluded
+    /// would spend most runs unexercised.
+    ///
+    /// The two halves are kept apart because they must land on different
+    /// blocks. A validator that sent an honest assurance and a spoiled one
+    /// for the *same* anchor would have its second dropped as a duplicate,
+    /// and the exclusion row would pass for a reason that has nothing to do
+    /// with the assurance being invalid.
+    pub spoiled_from: u32,
 }
 
 /// Run one emulated validator's availability exchange against the NUT.
@@ -387,47 +401,52 @@ pub async fn drive_availability(
         }
     }
 
-    // The honest one first. Its anchor is read now rather than planned: the
-    // block to assure is whichever one the chain is on, and a hash chosen
-    // when the plan was written would name a block several slots old.
-    sleep_until_slot(plan.honest_slot).await;
-    if let Some(anchor) = anchor_of() {
-        let assurance = m2_reference::assurance::sign_assurance(peer, anchor, &plan.cores);
+    // One assurance per slot, which is what a validator does: it assures the
+    // head, and the head moves every slot. The anchor is read at send time
+    // rather than planned, because an assurance names the block it is about
+    // and a hash chosen when the plan was written names a block several
+    // slots old by then.
+    let kind = spoil_for(peer);
+    let mut previous: Option<[u8; 32]> = None;
+    for slot in plan.honest_slot..plan.honest_slot.saturating_add(plan.assurance_slots) {
+        sleep_until_lead(slot).await;
+        let Some(anchor) = anchor_of() else { continue };
+        // The head has not moved, so there is nothing new to assure. Sending
+        // anyway would put two assurances from this validator under one
+        // anchor -- and if one of them were the spoiled one, the two rows
+        // would be judging the same block against opposite expectations.
+        if previous == Some(anchor) {
+            continue;
+        }
+        previous = Some(anchor);
+
+        let (assurance, cores, fault) = if slot >= plan.spoiled_from {
+            // `None` where this validator cannot pose its fault -- there is
+            // no empty core to claim when every core carried a report.
+            // Sending some other fault instead would mean the run graded a
+            // different rule from the one it recorded.
+            match spoil(peer, anchor, &plan.cores, kind) {
+                Some((assurance, claimed)) => (assurance, claimed, Some(kind)),
+                None => continue,
+            }
+        } else {
+            (
+                m2_reference::assurance::sign_assurance(peer, anchor, &plan.cores),
+                plan.cores.clone(),
+                None,
+            )
+        };
         if send_assurance(connection, &assurance, peer, trace, obs).await {
             lock(assurances_offered).push(AssuranceOffered {
                 validator: peer,
-                anchor,
-                cores: plan.cores.clone(),
-                sent_in_slot: plan.honest_slot,
+                anchor: assurance.anchor.0,
+                cores,
+                sent_in_slot: slot,
                 included: false,
                 had_opportunity: false,
-                fault: None,
+                fault,
             });
         }
-    }
-
-    // Then one that is wrong on purpose, so the row asking whether the node
-    // leaves invalid assurances out is exercised rather than merely absent.
-    sleep_until_slot(plan.spoiled_slot).await;
-    let Some(anchor) = anchor_of() else { return };
-    let kind = spoil_for(peer);
-    // `None` where this validator cannot pose its fault -- there is no
-    // empty core to claim when every core carried a report. Sending some
-    // other fault instead would mean the run graded a different rule from
-    // the one it recorded.
-    let Some((assurance, claimed_cores)) = spoil(peer, anchor, &plan.cores, kind) else {
-        return;
-    };
-    if send_assurance(connection, &assurance, peer, trace, obs).await {
-        lock(assurances_offered).push(AssuranceOffered {
-            validator: peer,
-            anchor: assurance.anchor.0,
-            cores: claimed_cores,
-            sent_in_slot: plan.spoiled_slot,
-            included: false,
-            had_opportunity: false,
-            fault: Some(kind),
-        });
     }
 }
 
@@ -496,9 +515,16 @@ fn spoil(
     }
 }
 
-/// Wait until `slot` begins.
-async fn sleep_until_slot(slot: u32) {
-    let target_ms = crate::emu::slot_start_ms(slot);
+/// Wait until an assurance for `slot` is due: the lead `simple.md:679-680`
+/// asks for, before the slot begins.
+///
+/// Sent then rather than at the slot's start because that is when the anchor
+/// is right. The block to assure is the head at that instant, which is the
+/// parent of the block about to be authored -- and an assurance anchored at
+/// anything but that block's parent cannot be carried in it at all.
+async fn sleep_until_lead(slot: u32) {
+    let target_ms = crate::emu::slot_start_ms(slot)
+        .saturating_sub(m2_scenario::scenarios::n4::ASSURANCE_LEAD_MS as u64);
     loop {
         let now = wall_ts();
         if now >= target_ms {

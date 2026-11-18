@@ -711,6 +711,32 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             Message::Done
         }),
 
+        Message::SubmitAssurances {
+            session,
+            assurances,
+        } => with(sessions, session, |s| {
+            let mut decoded = Vec::with_capacity(assurances.len());
+            for bytes in &assurances {
+                let mut cursor = &bytes[..];
+                match jam_std_common::AvailabilityAssurance::decode(&mut cursor) {
+                    // Trailing bytes mean the caller and the engine disagree
+                    // about the shape, which is the disagreement worth
+                    // finding rather than ignoring.
+                    Ok(_) if !cursor.is_empty() => {
+                        return Message::Error(
+                            "an assurance decoded and left bytes over".to_string(),
+                        )
+                    }
+                    Ok(assurance) => decoded.push(assurance),
+                    Err(e) => return Message::Error(format!("an assurance did not decode: {e}")),
+                }
+            }
+            for assurance in &decoded {
+                s.harness.submit_assurance(assurance);
+            }
+            Message::Done
+        }),
+
         Message::BuildPackage {
             session,
             items,

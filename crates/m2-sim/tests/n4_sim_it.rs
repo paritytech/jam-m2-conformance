@@ -109,7 +109,12 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         segment_indices: (0..SEGMENTS as u16).collect(),
         cores: vec![REPORTED_CORE],
         honest_slot: now + 1,
-        spoiled_slot: now + 2,
+        // Two slots of offers: this test grades what the node *serves* and
+        // what it sends, not what it carries, so one honest offer and one
+        // spoiled one are all it needs. `n4_inclusion_sim_it` is the test
+        // that needs a run of them.
+        assurance_slots: 2,
+        spoiled_from: now + 2,
     });
 
     // The node's own assurance, which is what `n4_ce141_send` grades. Sent
