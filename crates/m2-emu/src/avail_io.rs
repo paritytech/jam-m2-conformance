@@ -420,63 +420,64 @@ pub async fn drive_availability(
     connection: &Conn,
     peer: u16,
     plan: &AvailPlan,
+    // Whether to fetch shards and segments, or go straight to assuring.
+    // False on a reconnection: the fetches are a one-off per validator and
+    // the node is right to refuse a repeat once the report has left the
+    // core (`findings.md` §24).
+    fetch_shards: bool,
     trace: &Arc<Mutex<Trace>>,
     obs: &Arc<Mutex<ObsLog>>,
     shards_served: &Arc<Mutex<Vec<ShardServed>>>,
     segment_shards_served: &Arc<Mutex<Vec<SegmentShardsServed>>>,
     segments_served: &Arc<Mutex<Vec<SegmentsServed>>>,
     assurances_offered: &Arc<Mutex<Vec<AssuranceOffered>>>,
+    // The last anchor each validator assured, shared across this peer's
+    // connections. A peer can have two live ones -- dialled and accepted --
+    // and both drive this loop; a `previous` local to each would put two
+    // assurances from one validator under one anchor.
+    last_assured: &Arc<Mutex<std::collections::HashMap<u16, [u8; 32]>>>,
     anchor_of: impl Fn() -> Option<[u8; 32]>,
-) {
+) -> bool {
     // Its own index, because that is the shard a validator is entitled to:
     // `simple.md:523-556` is a validator fetching the piece it must assure.
     let shard_index = peer;
 
-    for protocol in [CE137, CE138] {
-        if let Some(served) = request_shard(
-            connection,
-            protocol,
-            plan.erasure_root,
-            shard_index,
-            // The lane leaves the byte comparison unmade: the harness did
-            // not build this bundle, the node did, so it has nothing to
-            // compare against. Predicting it would mean refining the
-            // package a second time and calling the result authoritative.
-            None,
-            peer,
-            trace,
-            obs,
-        )
-        .await
-        {
-            lock(shards_served).push(served);
-        }
-    }
-
-    if !plan.segment_indices.is_empty() {
-        // The whole-segment shortcut first. A requester is meant to try CE
-        // 148 and fall back to CE 139/140 (`simple.md:660`), and asking in
-        // that order is also what lets the lane see a node that serves one
-        // and not the other.
-        if let Some(served) = request_segments(
-            connection,
-            plan.segments_root,
-            plan.segment_indices.clone(),
-            peer,
-            trace,
-            obs,
-        )
-        .await
-        {
-            lock(segments_served).push(served);
-        }
-        for protocol in [CE139, CE140] {
-            if let Some(served) = request_segment_shards(
+    // Whether the fetches actually reached the node. A refusal counts --
+    // that is an answer, and the serve rows grade it. What does not count
+    // is a stream that never opened, which is a connection dying rather
+    // than a node saying no, and the caller retries that on the next one.
+    let mut reached = false;
+    if fetch_shards {
+        for protocol in [CE137, CE138] {
+            if let Some(served) = request_shard(
                 connection,
                 protocol,
                 plan.erasure_root,
                 shard_index,
-                plan.shard_count,
+                // The lane leaves the byte comparison unmade: the harness did
+                // not build this bundle, the node did, so it has nothing to
+                // compare against. Predicting it would mean refining the
+                // package a second time and calling the result authoritative.
+                None,
+                peer,
+                trace,
+                obs,
+            )
+            .await
+            {
+                reached = true;
+                lock(shards_served).push(served);
+            }
+        }
+
+        if !plan.segment_indices.is_empty() {
+            // The whole-segment shortcut first. A requester is meant to try CE
+            // 148 and fall back to CE 139/140 (`simple.md:660`), and asking in
+            // that order is also what lets the lane see a node that serves one
+            // and not the other.
+            if let Some(served) = request_segments(
+                connection,
+                plan.segments_root,
                 plan.segment_indices.clone(),
                 peer,
                 trace,
@@ -484,7 +485,24 @@ pub async fn drive_availability(
             )
             .await
             {
-                lock(segment_shards_served).push(served);
+                lock(segments_served).push(served);
+            }
+            for protocol in [CE139, CE140] {
+                if let Some(served) = request_segment_shards(
+                    connection,
+                    protocol,
+                    plan.erasure_root,
+                    shard_index,
+                    plan.shard_count,
+                    plan.segment_indices.clone(),
+                    peer,
+                    trace,
+                    obs,
+                )
+                .await
+                {
+                    lock(segment_shards_served).push(served);
+                }
             }
         }
     }
@@ -495,18 +513,31 @@ pub async fn drive_availability(
     // and a hash chosen when the plan was written names a block several
     // slots old by then.
     let kind = spoil_for(peer);
-    let mut previous: Option<[u8; 32]> = None;
     for slot in plan.honest_slot..plan.honest_slot.saturating_add(plan.assurance_slots) {
+        // A reconnection restarts this loop at the plan's first slot, which
+        // is by then in the past: `sleep_until_lead` returns at once and the
+        // offer would be recorded against a slot its anchor has nothing to
+        // do with. The inclusion rows read `sent_in_slot`, so a stale one
+        // makes them look at the wrong blocks.
+        if slot < m2_reference::chain::wall_clock_slot() {
+            continue;
+        }
         sleep_until_lead(slot).await;
         let Some(anchor) = anchor_of() else { continue };
         // The head has not moved, so there is nothing new to assure. Sending
         // anyway would put two assurances from this validator under one
         // anchor -- and if one of them were the spoiled one, the two rows
         // would be judging the same block against opposite expectations.
-        if previous == Some(anchor) {
-            continue;
+        //
+        // Checked and claimed under one lock, because this peer's other
+        // connection may be in the same place at the same moment.
+        {
+            let mut held = lock(last_assured);
+            if held.get(&peer) == Some(&anchor) {
+                continue;
+            }
+            held.insert(peer, anchor);
         }
-        previous = Some(anchor);
 
         let (assurance, cores, fault) = if slot >= plan.spoiled_from {
             // `None` where this validator cannot pose its fault -- there is
@@ -536,6 +567,7 @@ pub async fn drive_availability(
             });
         }
     }
+    reached
 }
 
 /// Which fault this validator poses.

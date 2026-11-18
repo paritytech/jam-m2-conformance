@@ -283,6 +283,9 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
     );
     let mut segments_served = lock(&data.segments_served).clone();
     verify_import_proofs(data.ref_chain.oracle(), &mut segments_served);
+    // Read once: the chain is another process and this is asked for twice,
+    // here and for the engaged cores below.
+    let reference_blocks = data.ref_chain.chain_blocks().unwrap_or_default();
     // Every block the harness has seen the node on. Which one it assures is
     // its own choice -- the head two seconds before a slot -- so the rule is
     // that the anchor names a block that exists, not a block the harness
@@ -290,25 +293,32 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
     let known_anchors: Vec<[u8; 32]> = nut_blocks
         .iter()
         .map(|nut| nut.block.header.hash().0)
-        .chain(
-            data.ref_chain
-                .chain_blocks()
-                .unwrap_or_default()
-                .iter()
-                .map(|block| block.header.hash().0),
-        )
+        .chain(reference_blocks.iter().map(|block| block.header.hash().0))
         .collect();
     // Cores that carried a report at those blocks, which is what an
-    // assurance may claim. Read off the node's own blocks: a report it
-    // included is one it put on chain.
+    // assurance may claim.
+    //
+    // Off the whole chain, not only the node's own blocks. A core is
+    // engaged by whichever block carries the guarantee, and the node
+    // authors one slot in six -- so a report the *reference* included
+    // engages a core just as much, and reading only the node's blocks
+    // misses nearly all of them.
+    //
+    // And off the report, not off `guarantees_prehashed`. That returns
+    // `(WorkReportHash, Slot, &GuaranteeSignatures)` and this read its
+    // second element as a core index -- a truncated slot, which no core
+    // index can equal, so `n4_ce141_bits_have_reports` failed every
+    // assurance the node ever sent (`findings.md` §23).
     let reported_cores: Vec<u16> = nut_blocks
         .iter()
-        .flat_map(|nut| {
-            nut.block
+        .map(|nut| &nut.block)
+        .chain(reference_blocks.iter())
+        .flat_map(|block| {
+            block
                 .extrinsic
-                .guarantees_prehashed()
-                .into_iter()
-                .map(|(_, core, _)| core as u16)
+                .guarantees
+                .iter()
+                .map(|guarantee| guarantee.report.core_index)
         })
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -355,7 +365,7 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
 /// Public because `m2-sim`'s inclusion test grades the same facts the runner
 /// does, through this function rather than a second copy of the rule.
 pub fn resolve_assurance_inclusion(offered: &mut [AssuranceOffered], nut_blocks: &[NutBlock]) {
-    for offer in offered {
+    for offer in &mut *offered {
         // `sent_in_slot` is the slot the assurance was sent *for*: it goes
         // out a couple of seconds before that slot begins, aiming at the
         // block authored in it. A block of that slot or later is one the
@@ -373,6 +383,36 @@ pub fn resolve_assurance_inclusion(offered: &mut [AssuranceOffered], nut_blocks:
                 .any(|a| a.signature.val_index == offer.validator)
         });
     }
+    report_inclusion_opportunity(offered, nut_blocks);
+}
+
+/// Say why no assurance had an opportunity, when none did.
+///
+/// The same reason the `Ok(None)` arms elsewhere say why they returned
+/// nothing: `n4_ce141_inclusion` reports *not exercised* both when the
+/// harness offered nothing and when it offered plenty and the node never
+/// authored the one block that could have carried any of them. Those are
+/// different facts about a run and they print the same line, which is how a
+/// reader concludes the rows are broken when the window simply missed.
+///
+/// Printed rather than made a finding: it is a fact about this run's
+/// timing, not about the node.
+fn report_inclusion_opportunity(offered: &[AssuranceOffered], nut_blocks: &[NutBlock]) {
+    if offered.is_empty() || offered.iter().any(|offer| offer.had_opportunity) {
+        return;
+    }
+    let slots: Vec<u32> = offered.iter().map(|offer| offer.sent_in_slot).collect();
+    let (first, last) = (
+        slots.iter().min().copied().unwrap_or(0),
+        slots.iter().max().copied().unwrap_or(0),
+    );
+    let authored: Vec<u32> = nut_blocks.iter().map(|n| n.block.header.slot).collect();
+    eprintln!(
+        "[availability] none of {} assurance offer(s) across slots {first}..={last} could be \
+         carried: an assurance is valid in exactly one block, the child of the block it \
+         anchors, and the NUT authored slots {authored:?}",
+        offered.len()
+    );
 }
 
 /// Ask the engine whether each served bundle shard's justification proves it.

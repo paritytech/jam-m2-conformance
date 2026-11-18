@@ -225,10 +225,31 @@ that takes a package over its protocol's size cap, and one that shares with
 a single co-guarantor each fail their own row, over CE 133 and CE 146 alike.
 CE 148 is written and proven too, in N4 rather than N3: it asks by a
 segments root the node exported, so it rides the same mid-run plan the rest
-of availability does. What is still unproven is N3's CE 135 distribution and
-inclusion rows. Until those close, a green N3 means
-"nothing contradicted the node" rather than "the node was checked", and the
-lanes are asked for by name so that distinction is never made silently.
+of availability does. CE 135 is proven at both ends:
+`m2-sim/tests/n3_ce135_sim_it.rs` drives five faults through a guarantor
+that distributes wrongly, and `m2-sim/tests/n3_ce135_inclusion_sim_it.rs`
+drives one through a node that drops a report distributed to it.
+
+What is still unproven is N3's **CE 134 receive** rows — `n3_ce134_answered`,
+`n3_ce134_hash_equals_the_reference`, `n3_ce134_shares_the_submitted_package`
+and `n3_ce134_wrong_shard_count_refused`. The simulated node opens CE 134
+and has never been asked to answer one, so those four have never been seen
+to fail. Until they close, a green N3 means "nothing contradicted the node"
+rather than "the node was checked", and the lanes are asked for by name so
+that distinction is never made silently.
+
+**N4's assurance rows have now been answered by a real node.** As of
+2026-11-18 a live run grades `n4_ce141_well_formed`,
+`n4_ce141_bits_have_reports` and both inclusion rows —
+`n4_ce141_valid_assurance_included` and
+`n4_ce141_invalid_assurance_excluded` — against polkajam, and it passes all
+four. Getting there took seven runs and six harness fixes
+(`findings.md` §19 to §25): until then no live run had ever
+engaged a core, so the node never sent an assurance and the rows reported
+themselves *not exercised* — which on a green report reads exactly like a
+node that did nothing. One piece is still open, §21's second half: the
+engaged cores are read when the availability plan is written rather than at
+send time, so a run still costs the node two or three authoring slots.
 
 **The pin is on an unmerged branch.** `Cargo.toml` and `oracle/Cargo.toml`
 point at polkajam `b1ea8aca4` (branch `jv-export-n4`, open as

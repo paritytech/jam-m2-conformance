@@ -42,7 +42,8 @@ pub(crate) struct Evaluation {
 
 /// Where a run's checks read observations from.
 pub(crate) enum ObsSource {
-    /// Live emulator log (real run); `_emu` keeps its runtime alive.
+    /// Live emulator log (real run); `emu` keeps its runtime alive, and the
+    /// run reads it once the window closes to ask what went unclaimed.
     ///
     /// Boxed only for its size: the emulator is much larger than the
     /// fabricated variant and grows with every record the lanes collect, so
@@ -52,7 +53,7 @@ pub(crate) enum ObsSource {
         trace: Arc<Mutex<Trace>>,
         ce128_probes: Arc<Mutex<Vec<Ce128Probe>>>,
         ce129_probes: Arc<Mutex<Vec<Ce129Probe>>>,
-        _emu: Box<Emulator>,
+        emu: Box<Emulator>,
     },
     /// Deterministic fabricated log + empty trace (dry-run).
     Fabricated { log: ObsLog, trace: Trace },

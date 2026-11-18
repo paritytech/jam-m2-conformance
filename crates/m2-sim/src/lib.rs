@@ -1230,11 +1230,33 @@ impl SimNode {
     /// makes the rows provable is that the two faults move this decision
     /// without touching anything else.
     async fn receive_assurance(&self, content: &[u8], peer: Option<u16>) {
-        // Nobody to attribute it to. A real node reads the index off the
-        // connection's certificate; this one knows only the peers it dialled.
-        let Some(peer) = peer else { return };
         let Ok(assurance) = Assurance::decode(&mut &content[..]) else {
             return;
+        };
+        // A real node reads the sender's index off the connection's
+        // certificate. This transport carries no peer identity, so that
+        // works only for connections this node opened -- and once the
+        // emulator started driving availability on both sides
+        // (`findings.md` §25), a validator's assurance could arrive on one
+        // it merely accepted.
+        //
+        // Recovered from the signature instead, which answers the same
+        // question from what is on the wire: CE 141 carries no index, but
+        // exactly one validator's key verifies it.
+        let peer = match peer {
+            Some(peer) => peer,
+            None => {
+                let anchor = assurance.anchor.0;
+                match (0..jam_types::max_val_count()).find(|&index| {
+                    m2_reference::assurance::check_assurance(&assurance, index, &[anchor]).is_ok()
+                }) {
+                    Some(peer) => peer,
+                    // No key verifies it, so there is nobody to attribute
+                    // it to and nothing to pool. A node that cannot say who
+                    // sent an assurance cannot carry it.
+                    None => return,
+                }
+            }
         };
         if self.fault == SimFault::AssuranceOmitsValid {
             return;

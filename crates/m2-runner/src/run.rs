@@ -481,7 +481,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                 trace,
                 ce128_probes,
                 ce129_probes,
-                _emu: Box::new(emu),
+                emu: Box::new(emu),
             },
             count,
             dial_tasks,
@@ -503,6 +503,21 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         task.abort();
     }
     drop(dial_tasks);
+
+    // A report nobody claimed never went out, and `n3_ce135_inclusion`
+    // reports that the same way it reports a node that ignored one it was
+    // sent. Only one validator in the cohort may distribute it, so a plan
+    // still sitting here means the run never had a connection to that
+    // validator -- a fact about the run's topology, not about the node.
+    if let ObsSource::Emulator { emu, .. } = &source {
+        if let Some(plan) = emu.unclaimed_report_plan() {
+            eprintln!(
+                "[distributor] the report for slot {} was never distributed: no connection to \
+                 validator {}, the only member of core {}'s cohort that may send it",
+                plan.slot, plan.sender, plan.core
+            );
+        }
+    }
 
     let t_ctx = std::time::Instant::now();
     let run_ctx = match &source {
@@ -1216,6 +1231,20 @@ async fn plan_availability(
     // does not exist, and a node is right to refuse it.
     let segment_indices: Vec<u16> = (0..spec.exports_count.min(MAX_SEGMENTS_ASKED)).collect();
     let now = m2_reference::chain::wall_clock_slot();
+    // Assure for the rest of the window, not a fixed stretch of it. The
+    // node authors about one slot in six and a run cannot choose which, so
+    // the only thing that reliably puts one of its slots among the offers
+    // is offering in all of them.
+    //
+    // A fixed epoch's worth was not enough, and the way it failed is worth
+    // keeping: a live run offered across slots 9880681..=9880692 while the
+    // node authored 9880662, 9880670, 9880675 and then 9880693 -- one slot
+    // past the last offer. Every inclusion row reported itself unexercised,
+    // which reads exactly like a node that carried nothing.
+    let left = deadline.saturating_sub(jamnp_s::clock::current().wall_ms());
+    let assurance_slots = (left / m2_scenario::ctx::SLOT_PERIOD_MS)
+        .saturating_sub(u64::from(ASSURANCE_TAIL_SLOTS))
+        .max(u64::from(MIN_ASSURANCE_SLOTS)) as u32;
     let plan = m2_emu::avail_io::AvailPlan {
         erasure_root: spec.erasure_root,
         segments_root: spec.exports_root,
@@ -1225,10 +1254,10 @@ async fn plan_availability(
         // A slot ahead, so the fetches have somewhere to finish before the
         // assurance that follows them.
         honest_slot: now + 1,
-        assurance_slots: ASSURANCE_SLOTS,
+        assurance_slots,
         // Half honest, half spoiled. Either half has to contain a slot the
         // node authors the child of, or its row goes ungraded.
-        spoiled_from: now + 1 + ASSURANCE_SLOTS / 2,
+        spoiled_from: now + 1 + assurance_slots / 2,
     };
     eprintln!(
         "[availability] planning against root {} coded into {} shards, {} segment(s)",
@@ -1240,14 +1269,21 @@ async fn plan_availability(
     planner.set(plan);
 }
 
-/// Slots a run assures for, starting at the first.
+/// Slots left unassured at the end of the window.
+///
+/// An assurance offered in the last slot of a run has no child block to be
+/// carried in, because the run ends before one is authored and fetched. Two
+/// slots of headroom keeps the final offers gradeable rather than reporting
+/// themselves unexercised.
+const ASSURANCE_TAIL_SLOTS: u32 = 2;
+
+/// Fewest slots a run assures for, however little window is left.
 ///
 /// A validator assures the head every slot, and an assurance is carried in
 /// exactly one block: the child of the block it anchors. The node authors
-/// about two slots in six, so a single offer would leave the inclusion rows
-/// unexercised most runs -- not failing, but saying nothing. A full epoch's
-/// worth of slots puts several of the node's own among them.
-const ASSURANCE_SLOTS: u32 = 12;
+/// about one slot in six, so a short stretch of offers leaves the inclusion
+/// rows unexercised -- not failing, but saying nothing.
+const MIN_ASSURANCE_SLOTS: u32 = 12;
 
 /// Most segment indices a run asks for over CE 139/140.
 ///

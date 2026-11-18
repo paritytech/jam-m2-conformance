@@ -228,8 +228,12 @@ which closes the sampling gap this entry was left with.
 
 ## 4. The node accepts a CE 133 first message over the size cap
 
-**Status:** open, observed once, and it may be the spec rather than the node.
-Opened 2026-11-15.
+**Status:** open, reproduced, and it may be the spec rather than the node.
+Opened 2026-11-15; seen again 2026-11-18 on the `b1ea8aca4` pin
+(`sessions/n3n4-1`), and this time over **CE 146 as well as CE 133** —
+`n3_ce146_oversized_reset` failed against its own 204,800-byte cap in the
+same run. The two protocols cap different messages and the node accepted
+both, which is what the extension below predicted.
 
 The CE 133 fault rows put a deliberately oversized first message on the wire:
 **205,076 bytes against the cap of 204,802** (`2 + 200 * 1024`), read off the
@@ -259,7 +263,9 @@ question for the conformance group rather than for the harness:
 2. If normative, what is a guarantor meant to do -- reset, or read and
    discard? The rationale is about not being *forced to download*, which
    argues for a reset before the body arrives.
-3. Seen once. It should be reproduced before anything is filed.
+3. ~~Seen once. It should be reproduced before anything is filed.~~
+   Reproduced 2026-11-18, over both protocols, which leaves 1 and 2 as the
+   open questions.
 
 This is the first N3 row that failed for a reason that is not plainly the
 harness's. Every earlier one was ours.
@@ -277,7 +283,10 @@ rediscovered when the CE 146 row first fails against a live node.
 
 ## 5. The node resets a well-formed CE 134 share with `NoError`
 
-**Status:** open, observed once. Opened 2026-11-16.
+**Status:** open, and now reproduced. Opened 2026-11-16, seen again
+2026-11-18 on the `b1ea8aca4` pin (`sessions/n3n4-1`) with the same message
+to the byte, down to the core and the code. Point 3 below is answered: it
+is not a one-off.
 
 The CE 134 receive row shares a bundle *with* the node, on a core the node
 holds at that slot, offering the active validator count as the shard count.
@@ -303,7 +312,8 @@ Worth establishing before this is called a defect:
 2. Whether the harness should be sharing at that slot at all. The share goes
    out one slot after a run's own submissions, so the node may still be busy
    with one of those.
-3. Seen once. Reproduce before filing.
+3. ~~Seen once. Reproduce before filing.~~ Reproduced 2026-11-18, two pins
+   and two days apart, which leaves 1 and 2 as the open questions.
 
 ## 6. crates.io 0.1.29 is not the pinned 0.1.29, and the difference is on the wire
 
@@ -412,8 +422,9 @@ silent divergence into a refusal to start.
 
 ## 8. The node accepts a CE 133 extrinsic message of the wrong size
 
-**Status:** open, observed once, and it may be a change in the node rather
-than a standing defect. Seen 2026-11-17.
+**Status:** open, reproduced, and it may be a change in the node rather
+than a standing defect. Seen 2026-11-17; seen again 2026-11-18 on the
+`b1ea8aca4` pin (`sessions/n3n4-1`), so it is not a one-run artefact.
 
 CE 133's second message carries the extrinsic data, and `simple.md:373` gives
 its size as the sum of the lengths the work-package declares. polkajam itself
@@ -942,3 +953,394 @@ simulated.
 
 Related: §2 and §14, both of which were a row asking a question adjacent to
 the one its rule is about.
+
+---
+
+## 19. The CE 135 report was never distributed, and nothing said so — CLOSED 2026-11-18
+
+**Status:** found and fixed the same day, by the second live run on the
+`b1ea8aca4` pin (`sessions/n3n4-2`). A race, so earlier runs may have
+distributed and later ones not.
+
+`n3_ce135_inclusion` reported *not exercised* on a live run that had planned
+a report and said so:
+
+```
+[assignment] distributing report on core 0 in slot 9880524
+```
+
+The emulator gates every plan behind one `watch` channel, `plans_set`, and
+the plans are written at different times: the ticket plans first, then the
+report, the shares and the submission. Each connection task waited for the
+gate, checked once, and returned:
+
+```rust
+while !*plans_set.borrow_and_update() { ... }
+let Some(plan) = shared.claim_report_plan(peer) else { return };
+```
+
+So every task woke on the *ticket* plans, found no report plan yet, and gave
+up. What saved the shares is that any connection may claim them and
+connections keep arriving through a run, so a late one took them. The report
+cannot be claimed by just any connection — only one validator in the cohort
+may distribute it — and a run with no new connection to that validator after
+the plan was written never distributed it at all.
+
+The run said nothing, because a plan nobody claimed and a report nobody
+answered leave the same rows empty. A diagnostic now reports it, and it is
+what named the bug:
+
+```
+[distributor] the report for slot 9880680 was never distributed: no
+  connection to validator 2, the only member of core 0's cohort that may
+  send it
+```
+
+**The fix.** `claim_when_planned` in `m2-emu/src/emu.rs`: wait for the gate,
+try the claim, and go back to waiting if there is nothing to claim yet.
+Claiming is the only thing that ends the wait. Used by the report and the
+shares alike, so the surviving half of the race is gone too.
+
+Related: §13 and §18. All three are the same lesson from different angles —
+a row that reports nothing is not a row that passed, and the run has to say
+which it was.
+
+---
+
+## 20. The assurance window missed every slot the node authored — CLOSED 2026-11-18
+
+**Status:** found and fixed 2026-11-18, on the second live run
+(`sessions/n3n4-2`). Not a defect in the inclusion rows §14 fixed; a defect
+in giving them anything to grade.
+
+Every one of 32 assurance offers reported *not exercised*. The diagnostic
+added in the same run says why:
+
+```
+[availability] none of 32 assurance offer(s) across slots 9880681..=9880692
+  could be carried: an assurance is valid in exactly one block, the child of
+  the block it anchors, and the NUT authored slots [9880662, 9880670,
+  9880675, 9880693, 9880699, 9880704, 9880717, 9880718]
+```
+
+The node authored eight blocks in the window and the offers spanned twelve
+slots that contained none of them — the nearest, 9880693, is one slot past
+the last offer. `ASSURANCE_SLOTS` was a fixed epoch's worth, chosen when the
+reasoning was "a full epoch puts several of the node's own slots among
+them". With six validators the node authors about one slot in six, and
+twelve slots is not several of anything.
+
+**The fix.** The offers now run for whatever is left of the observation
+window, less two slots of tail so the last offer still has a child block to
+be carried in, with a floor of twelve. A run cannot choose which slots are
+the node's, so the only thing that reliably puts one among the offers is
+offering in all of them.
+
+**What this cost.** Two live runs in which the N4 inclusion rows — the ones
+PR #15 was written to fix — reported themselves unexercised, which on a
+green report reads exactly like a node that carried nothing. §14 fixed what
+the rows ask; this fixed whether they are ever asked.
+
+**What widening it exposed.** Two defects that were already there and too
+small to see: §24, a reconnection re-fetching shards the node had rightly
+let go, which a twelve-slot window hid behind one or two repeats; and §23,
+a row that had never been reached at all. Neither was caused by this
+change. A longer run is a stronger test, and the first thing a stronger
+test found was the harness.
+
+---
+
+## 21. Every assurance a live run sends is for a core that carries nothing
+
+**Status:** open, half fixed. Found 2026-11-18 on the third live run
+(`sessions/n3n4-3`); the first half landed the same day and the fourth run
+(`sessions/n3n4-4`) measured the difference. The reason N4's assurance rows
+could not be graded against a real node, and the reason §20's fix made
+things worse rather than better.
+
+An assurance says "I hold my shard of the report on core *c*". It is valid
+only where core *c* is **engaged** — carrying a report that is on chain
+awaiting availability. The harness picks the core once, when the
+availability plan is written:
+
+```rust
+cores: vec![decoded.core_index],
+```
+
+read off the report the NUT *distributed over CE 135*. Distributing a report
+does not put it on chain. Some validator has to include it in a block, and
+in a live run nobody does: the NUT's own blocks carried none
+(`n3_ce135_report_included` failed with `the NUT's blocks carried []`), and
+the reference chain — which authors five slots in six — never pools what the
+NUT distributes at all. Nothing in the runner calls `submit_guarantee`.
+
+So no core is ever engaged, and **every assurance the run sends is invalid**,
+the honest half included. The node's log says so three times:
+
+```
+ERROR authoring  Error authoring block: block execution error:
+  assurances error: core not engaged
+```
+
+**What it cost.** The node had six authoring opportunities in the run. The
+three outside the assurance window succeeded; the three inside it — slots
+9880826, 9880840 and 9880859 — all failed. The harness took away every slot
+it owned while assurances were in flight, which is precisely the window the
+inclusion rows need a block in. §20 widened that window from 12 slots to 35
+and so widened the damage: run 2 lost some slots unnoticed, run 3 lost all
+of them.
+
+It also produced a false negative in another lane. `n3_ce135_inclusion`
+failed — the first time it has ever been graded, §19 having just made it
+reachable — with "the report ... distributed in slot 9880824 was never
+included". True, and not the node's doing: it had no valid slot between the
+distribution and the guarantee going stale.
+
+**What this is not.** It is not evidence about how polkajam handles
+availability. Nothing in three live runs has put a valid assurance in front
+of it.
+
+**What would close it.** The engaged cores are chain state and have to be
+read like chain state — at send time, from the anchor, exactly as the
+*anchor* itself had to be (§14). Two pieces:
+
+- the reference chain should pool the reports the NUT distributes, so a core
+  becomes engaged at all. `RefChain::submit_guarantee` now exists — it was
+  added for the CE 135 inclusion rows — and `reports_seen` already holds
+  what to pool;
+- `AvailPlan.cores` should become a read rather than a value, answered per
+  slot. `Harness::engaged_cores()` is public in polkajam and is not in the
+  oracle protocol yet, so this is one new message and no upstream export.
+
+**What the first half changed.** The emulator now pools what the NUT
+distributes (`pool_distributed_report`), so a core engages. The fourth run
+is the first in which polkajam **sent an assurance of its own** — 45 of
+them, where every earlier run reported `n4_ce141_not_exercised` — and the
+first in which `n4_ce141_valid_assurance_included` was graded at all, three
+times. Two of N4's rows went from never-asked to asked in one change.
+
+It is half, not whole. The node still lost five authoring slots to `core not
+engaged`, because `AvailPlan.cores` is still a value fixed when the plan was
+written: a core engaged then is freed once its report is available, and the
+harness goes on assuring it for the rest of the window. Closing that is the
+second bullet above.
+
+Until it lands, a run still sends assurances that cost the node blocks, and
+the honest reading of N4's assurance verdicts is that they are not yet
+evidence about polkajam.
+
+Related: §14, the same mistake about the same protocol — a value fixed at
+plan time that is a function of chain state. §20, which made it visible by
+making it bigger.
+
+---
+
+## 22. The node pools an assurance for an unengaged core and then cannot author
+
+**Status:** open, observed 2026-11-18 (`sessions/n3n4-3`), and it needs the
+same settling §4 and §5 do before it is called a defect.
+
+The other half of §21, read from the node's side. Sent an assurance naming a
+core that carries no report, polkajam **accepted it into its pool** and then
+could not author:
+
+```
+ERROR authoring  Error authoring block: block execution error:
+  assurances error: core not engaged
+```
+
+Three of three authoring slots lost, in one run, to assurances from peers.
+The node is right that the core is not engaged — that is §21, the harness's
+error — but it discovered this while composing its own block, not while
+deciding whether to pool what a peer sent it.
+
+This is what `n4_ce141_invalid_assurance_excluded` exists to catch, and the
+node's failure mode is worse than the row models. The row asks whether an
+invalid assurance stayed out of the block; this node answers by not
+producing a block at all, which the row scores as *not exercised*. A lane
+that only ever looks at blocks cannot see a missing one.
+
+**Before this is reported as a node defect it needs settling:**
+
+1. Does JAMNP-S require a receiver to validate an assurance against the
+   engaged cores *before* pooling it? `simple.md` is thinner here than the
+   on-chain rule is.
+2. Is a validator expected to defend its own authoring against what peers
+   send it, or is an unauthored slot the accepted cost of a bad peer? The
+   practical reading is that one peer should not be able to cost a validator
+   its blocks by sending one malformed assurance.
+3. Observed in one run, and in a run whose assurances were all invalid for
+   the harness's own reason. Reproduce against a run that sends valid ones
+   — which means §21 first.
+
+Until 3 is done this is an observation, not a finding about polkajam. It is
+recorded now because the evidence is in `sessions/n3n4-3/logs` and will not
+be reproducible once §21 changes what the harness sends.
+
+---
+
+## 23. The row grading a node's assurance bits compared them against a slot — CLOSED 2026-11-18
+
+**Status:** found and fixed the same day, on the fourth live run
+(`sessions/n3n4-4`) — the first run in which polkajam ever sent an assurance
+of its own, which is the only reason the row ran at all.
+
+`n4_ce141_bits_have_reports` asks whether every core an assurance claims
+carried a report. It failed 45 times out of 45, with evidence that gives
+itself away:
+
+```
+the assurance for anchor 2e13e595 claims core(s) [0] that carried no report;
+  cores with reports were [50520]
+```
+
+There are two cores in `tiny`. `50520` is a slot number truncated to `u16`.
+The set was built from
+
+```rust
+.guarantees_prehashed().into_iter().map(|(_, core, _)| core as u16)
+```
+
+and `Extrinsic::guarantees_prehashed` returns
+`(WorkReportHash, Slot, &GuaranteeSignatures)`. The second element is the
+slot the guarantors attested at; the core index lives on the report. So the
+row compared core indices against truncated slots, which can never match,
+and **failed every assurance a conforming node sent**.
+
+The same helper is used correctly a few lines away in N3's `included`, where
+only the hash is taken, which is presumably how the shape passed review.
+
+**The fix.** Read `guarantee.report.core_index` off the guarantees
+themselves — and off the **whole chain**, not only the node's own blocks,
+which was a second defect in the same three lines. A core is engaged by
+whichever block carries the guarantee; the node authors one slot in six, and
+now that the reference pools what the node distributes (§21) the engaging
+block is usually the reference's. Reading only the node's blocks would have
+left the row failing for a new reason as soon as the old one was fixed.
+
+**Why nothing caught it.** The row needs the node to send an assurance, and
+until §21's first half landed no live run had ever engaged a core, so
+polkajam never assured and the row never ran. The simulated node's
+assurances go through `n4_inclusion_sim_it.rs`, which builds its context
+directly and does not exercise this derivation. A row can be wrong for
+months if nothing ever reaches it.
+
+Related: §18, the same kind of row — one that could not pass a conforming
+node — found the same way, by a live run finally reaching it.
+
+---
+
+## 24. A reconnection re-fetched shards the node had rightly let go — CLOSED 2026-11-18
+
+**Status:** found and fixed 2026-11-18 on the fifth live run
+(`sessions/n3n4-5`). A regression §20 introduced and §20's own widening
+exposed, which is the tidiest kind to find.
+
+`n4_ce137_answered` and `n4_ce138_answered` failed 19 times each against a
+node that had answered the first request correctly:
+
+```
+the NUT reset the CE 137 stream for root 5969ac3b index 1
+```
+
+Five passes, nineteen failures — one pass per emulated validator, then
+failures. The availability exchange is spawned per **connection**, not per
+run, and a run re-dials. Every reconnection re-ran the whole thing: fetch
+the shard, fetch the segments, then assure. By the later rounds the report
+had left the core and the node no longer held the bundle, so it refused —
+correctly — and the lane scored each refusal as a hard failure.
+
+It was latent before. With §20's twelve-slot window a peer reconnected once
+or twice and the repeats were few enough to pass unnoticed; widening the
+window to the rest of the run turned two repeats into five and the rows
+went red.
+
+**The fix.** The fetches are claimed once per validator per run, in
+`EmuShared::fetched_shards`. Assuring is deliberately *not* claimed: a
+validator assures every slot, and a reconnection should pick that back up —
+which is the whole reason the exchange is spawned per connection in the
+first place.
+
+The claim is taken *before* the attempt, so two connections for one
+validator cannot both fetch, and given back if the attempt never reached
+the node. A refusal counts as reached — that is an answer, and the serve
+rows grade it — but a stream that never opened is a connection dying, and
+without the give-back that validator would lose its fetch for the whole
+run. The first cut of this fix claimed unconditionally and the next live
+run graded three validators' fetches instead of five, which is how the
+distinction showed up.
+
+Reconnection had a second, smaller effect on the assurance loop, fixed with
+it: the loop restarts at the plan's first slot, which is by then in the
+past, so `sleep_until_lead` returned at once and the offer was recorded
+against a slot its anchor had nothing to do with. The inclusion rows read
+`sent_in_slot`, so a stale one sends them looking at the wrong blocks. Slots
+already past are now skipped.
+
+**What it says about the others.** §20 widened the window for a good
+reason, and widening it turned a latent defect into a visible one and then
+found a second (§23) by finally reaching a row. Both were already there.
+A longer run is a stronger test, and this is the third time in one day that
+making the harness ask more questions has found the harness wrong before it
+found the node wrong.
+
+Related: §21, the same shape — an availability plan written once and
+re-used while the chain moves past what it describes.
+
+---
+
+## 25. Only the validators the node dialled ever asked it for anything — CLOSED 2026-11-18
+
+**Status:** found and fixed 2026-11-18 on the seventh live run
+(`sessions/n3n4-7`), by comparing subject counts between runs rather than
+looking for red.
+
+The availability exchange — the CE 137/138 shard fetch, the CE 139/140/148
+segment fetches, and the assurances that follow — was started on the accept
+path only, the connections the **NUT** opened to the harness. N0's
+preferred-initiator rule means the node dials some peers and waits for the
+rest, so roughly half the emulated validators never ran it at all. A run
+fetched shards for three validators out of five.
+
+Nothing failed. Three passing rows and five passing rows read alike, and the
+missing two produced no row to be missing. It surfaced only because §24
+changed the count and the two runs either side were compared.
+
+This is the same defect, in the same function, as the one the dial path
+already carries a comment about:
+
+> This was missing, so a run whose designated sender was a peer the emulator
+> dialled had no distributor at all and sent nothing — the node never saw a
+> CE 135 and the inclusion row failed with no trace of why, in half the runs.
+
+That note was written for `start_report_distribution` and
+`start_availability` never got the same treatment.
+
+**The fix.** Start it on both paths, with one correction that the second
+path makes necessary: a peer can now have two live connections driving the
+exchange at once, and the assurance loop's "the head has not moved" guard
+was a local, so two loops would each think they were first and put two
+assurances from one validator under one anchor — the exact thing the guard
+exists to prevent. The last anchor assured is now shared per validator and
+checked and claimed under one lock. The shard fetch was already claimed per
+validator by §24.
+
+**What it broke, and what that exposed.** Driving the exchange from both
+sides made `m2-sim`'s N4 inclusion test fail for exactly one validator in
+five — the one the test has dial the node. The mock transport carries no
+peer identity, so the stand-in could attribute an assurance only on
+connections *it* had opened; once a validator's assurance could arrive on
+one the node merely accepted, it was dropped unattributed.
+
+A real node reads the sender's index off the connection's certificate. The
+stand-in now recovers it from the signature instead: CE 141 carries no
+validator index, but exactly one validator's key verifies a given
+assurance. That answers the same question from what is on the wire, and
+leaves the stand-in no longer dependent on which side opened the
+connection.
+
+**What it says about coverage.** Three of the defects found today were
+invisible as failures: §19 and §20 showed as rows reporting *nothing*, and
+this one as fewer subjects than the run deserved. A report that is green
+because a question went unasked looks exactly like a report that is green
+because the answer was right.
