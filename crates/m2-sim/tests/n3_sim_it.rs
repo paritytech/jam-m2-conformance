@@ -206,6 +206,128 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     rows
 }
 
+/// Submit a package for a core the node does not hold, then an honest one,
+/// and grade whether the node is credited with ignoring the first.
+///
+/// The arrangement is the point. `n3_ce133_not_a_guarantor_ignored` asks
+/// what the node did *not* do, and a run where nothing else is shared
+/// cannot tell a node that ignored the package from one the harness never
+/// looked past. An honest submission behind it supplies shares the node was
+/// right to make, and a lane that attributes them to the misaddressed
+/// submission fails a node that did everything right -- which is how both
+/// silence rows came to be unpassable (`findings.md` §18).
+async fn grade_misaddressed(fault: SimFault) -> Vec<(&'static str, Outcome)> {
+    let transport = Arc::new(MockNetwork::new()) as Arc<dyn Transport>;
+    let oracle = m2_reference::oracle::Oracle::for_tests();
+    let harness_chain = Arc::new(RefChain::tiny(&oracle, NUT_INDEX).expect("the harness chain"));
+    let node_chain = Arc::new(RefChain::tiny_for(&oracle, NUT_INDEX).expect("the node's chain"));
+    let genesis = harness_chain.genesis_hash();
+
+    let node = Arc::new(SimNode::at_index(Arc::clone(&node_chain), fault, NUT_INDEX));
+    node.shares_with(&CO_GUARANTORS);
+    // The one test that tells the node which core is its own, because it is
+    // the one that submits to another.
+    node.guards_core(CORE);
+
+    let (nut_addr, serving) = Arc::clone(&node)
+        .listen(
+            Arc::clone(&transport),
+            SigningKey::from([0x94u8; 32]),
+            "127.0.0.1:9902".parse::<SocketAddr>().expect("an address"),
+        )
+        .await
+        .expect("the simulated node binds");
+
+    let emu = m2_emu::emu::Emulator::n0_on(
+        Arc::clone(&transport),
+        EMU_INDICES.to_vec(),
+        genesis,
+        41_200,
+    )
+    .await
+    .expect("the emulated validators bind");
+    let accepting = emu.accept_loop(Arc::clone(&harness_chain));
+
+    let peers: Vec<(u16, SocketAddr, String)> = EMU_INDICES
+        .iter()
+        .zip(emu.local_addrs())
+        .map(|(&index, addr)| (index as u16, addr, san_of(index)))
+        .collect();
+    node.connect_to(&transport, SigningKey::from([0x95u8; 32]), &peers)
+        .await;
+
+    let slot = m2_reference::chain::wall_clock_slot();
+    // The misaddressed one first, the honest one after it: the order a run
+    // uses, and the order in which the bug shows.
+    for (i, posed) in [Some(SubmissionFault::NotAGuarantor), None]
+        .into_iter()
+        .enumerate()
+    {
+        let mut plan = submission(133, slot, 1_024);
+        if posed.is_some() {
+            // The core the node does not hold. Two cores under `tiny`, so
+            // there is exactly one other.
+            plan.core = (CORE + 1) % jam_types::core_count();
+        }
+        plan.fault = posed;
+        let connection = transport
+            .connect(
+                EndpointConfig {
+                    genesis_hash: genesis,
+                    builder: true,
+                },
+                SigningKey::from([0xc0u8 + i as u8; 32]),
+                san_of(NUT_INDEX),
+                nut_addr,
+            )
+            .await
+            .expect("the builder connects");
+        m2_emu::report_io::spawn_package_sender(
+            connection.clone(),
+            plan,
+            emu.trace(),
+            emu.obs(),
+            emu.submissions(),
+            BUILDER_PEER,
+        )
+        .await;
+        // Long enough for the share the node opens in reply to arrive, and
+        // for the two submissions to carry different wall-clock stamps.
+        clock::current().sleep(Duration::from_millis(200)).await;
+        drop(connection);
+    }
+
+    let submissions = emu.submissions();
+    let submissions = submissions.lock().expect("the submissions").clone();
+    let shares = emu.sharing_seen();
+    let shares = shares.lock().expect("the shares").clone();
+
+    let ctx = N3Ctx {
+        nut_index: NUT_INDEX as u16,
+        submissions,
+        shares,
+        reports: Vec::new(),
+        answers_sharing: false,
+        expected_report_hash: None,
+        emulated_peers: EMU_INDICES.iter().map(|&i| i as u16).collect(),
+        shared_to_nut: Vec::new(),
+        distributed: Vec::new(),
+        included: Vec::new(),
+        authored_slots: Vec::new(),
+    };
+
+    let obs = emu.obs();
+    let obs = obs.lock().expect("the observation log");
+    let rows = (n3::n3_ce133_submission(&ctx).run)(&obs)
+        .into_iter()
+        .map(|row| (row.name, row.outcome))
+        .collect();
+
+    accepting.abort();
+    serving.abort();
+    rows
+}
+
 /// Every outcome reported under `row`, because a check reports one per
 /// subject and reading only the first is how a fault that broke one of two
 /// looked like a pass.
@@ -297,4 +419,29 @@ async fn the_submission_checks_catch_a_guarantor_that_mishandles_a_package() {
             )
         );
     }
+
+    // A package for a core the node does not hold, with an honest
+    // submission behind it. Both halves matter: the honest node must be
+    // credited with ignoring it even though it shared the next one, and
+    // the node that shares it anyway must be caught.
+    let ignored = grade_misaddressed(SimFault::None).await;
+    assert!(
+        passed(&ignored, "n3_ce133_not_a_guarantor_ignored"),
+        "a node that ignores a package for a core it does not hold must pass the silence \
+         row, whatever it shared for the submission after it; it reported {:?}",
+        outcomes_of(&ignored, "n3_ce133_not_a_guarantor_ignored")
+    );
+    assert!(
+        passed(&ignored, "n3_ce133_shares_with_both_co_guarantors"),
+        "and the honest submission behind it must still be graded; it reported {:?}",
+        outcomes_of(&ignored, "n3_ce133_shares_with_both_co_guarantors")
+    );
+
+    let shared = grade_misaddressed(SimFault::SharesForeignCore).await;
+    assert!(
+        failed(&shared, "n3_ce133_not_a_guarantor_ignored"),
+        "a node that shares a package for a core it does not hold must fail the silence \
+         row; it reported {:?}",
+        outcomes_of(&shared, "n3_ce133_not_a_guarantor_ignored")
+    );
 }

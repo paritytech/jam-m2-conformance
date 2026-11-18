@@ -845,3 +845,100 @@ than a guess. Until then:
   against, which is better than nothing and is not the same as a node.
 
 Related: §12, which is why the plan is mid-run at all.
+
+---
+
+## 18. Two N3 rows could not pass a conforming node — CLOSED 2026-11-18
+
+**Status:** found and fixed the same day, by the first live run of N3 and N4
+on the `b1ea8aca4` pin (`sessions/n3n4-1`). The mirror image of §13: that
+was a row that could never fail, this is a pair that could never pass.
+
+`n3_ce133_unauthorized_not_shared` and `n3_ce133_not_a_guarantor_ignored`
+both ask whether the node *refrained* from sharing a package. The lane
+answers by looking at the shares it saw:
+
+```rust
+let shared_after: Vec<u16> = ctx
+    .shares
+    .iter()
+    .filter(|share| share.at_wall_ms >= submitted.sent_at_wall_ms)
+    .map(|share| share.peer)
+    .collect();
+```
+
+That is every CE 134 share in the rest of the run, not every share *of this
+package*. A run submits seven packages a slot apart and two of them are
+honest, so any submission with an honest one after it is graded against
+shares the node was right to make. Both rows failed, with the same evidence:
+
+```
+n3_ce133_unauthorized_not_shared: the NUT shared a package built against an
+  authorizer no core accepts; it reached [0, 1, 1, 0]
+n3_ce133_not_a_guarantor_ignored: the NUT shared a package addressed to core
+  1, which it does not hold at slot 9880528; it reached [0, 1, 1, 0]
+```
+
+`[0, 1, 1, 0]` is four shares to two peers — two co-guarantors twice over.
+The honest CE 146 submission sits two slots after the second of these in the
+plan, and the oversized CE 146 submission the node also accepted sits one
+slot after that. Neither row is reading anything the package it names
+caused.
+
+**What this is not.** It is not evidence that polkajam shares unauthorized
+packages or packages for cores it does not hold. The run says nothing either
+way about those rules, which is the point: a row whose evidence is "somebody
+shared something later" cannot distinguish a node that broke the rule from
+one that kept it.
+
+The positive direction has the same defect and it is the more comfortable
+one: `n3_ce133_shares_with_both_co_guarantors` collects `answering` the same
+way, so a node that ignored a submission can still pass that row on the
+shares of a later one.
+
+**Why nothing caught it.** `m2-sim/tests/n3_sim_it.rs` poses one honest
+submission and one oversized one per protocol, and the two faults these rows
+grade — `Unauthorized` and `NotAGuarantor` — are not posed at all. The
+simulated node has never been asked to ignore a package while another
+submission is in flight, which is the only arrangement in which the bug
+shows.
+
+**What would close it.** A correlation that names the package. Two keys are
+available and neither is currently used:
+
+- the share's bundle carries the work-package verbatim, so the harness can
+  ask whether the bundle it received contains the package it sent;
+- `SharingContext.core_index`, which separates the not-a-guarantor
+  submission from the honest ones but not the unauthorized one.
+
+**The fix.** `shares_answering` in `scenarios/n3.rs`, used by both
+directions: a share answers the submission it followed, bounded by the next
+submission the *node* saw — across both protocols, because bounding by the
+next CE 133 submission alone would let the CE 146 one between them keep
+attributing its shares backwards.
+
+The key is the window, not the package, and the reason is that nothing a
+share carries names one. `SharingContext.mappings` is keyed by the
+work-package hash but is empty for a package that imports no segments, which
+is every package this harness builds; the bundle in message 2 carries the
+package but would have to go back to the engine to be read as one. The
+window is sound here because the lane also grades how long the node took —
+`shares_within_the_window` holds it to about three seconds while submissions
+are a whole slot apart — so a share late enough to land in the wrong window
+has already failed a row of its own.
+
+**Proven.** `m2-sim/tests/n3_sim_it.rs` now poses the arrangement: a package
+for a core the node does not hold, with an honest submission behind it. The
+honest node passes the silence row and the new `SimFault::SharesForeignCore`
+fails it. Reverting the bound to the old filter makes the honest node fail,
+which is the bug reproduced on demand.
+
+**What is still weaker than it reads.** `Unauthorized` is not posed
+separately. The simulated node does not decode packages, so it cannot tell
+an authorized one from an unauthorized one without being told, and the row
+it feeds is graded by the same `shares_answering` the not-a-guarantor row
+is. The correlation is proven; the node's judgement of authorization is not
+simulated.
+
+Related: §2 and §14, both of which were a row asking a question adjacent to
+the one its rule is about.

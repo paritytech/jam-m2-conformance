@@ -269,6 +269,12 @@ pub enum SimFault {
     /// Pool no guarantee, so a report distributed to this node is never
     /// included in a block it authors.
     ReportNotIncluded,
+    /// Share a package addressed to a core this node does not hold.
+    ///
+    /// The package is none of its business (`simple.md:410-415`), so the
+    /// honest answer is to take the stream and do nothing with it. Sharing
+    /// it is the defect `n3_ce133_not_a_guarantor_ignored` names.
+    SharesForeignCore,
 }
 
 /// Application error code the node resets a refused ticket stream with.
@@ -351,6 +357,12 @@ pub struct SimNode {
     /// guarantee distributes nothing -- which is what a node that was never
     /// given a package does.
     guarantee: Mutex<Option<GuaranteeOffer>>,
+    /// The core this node holds, when a test has told it.
+    ///
+    /// `None` is a node that does not check which core a submission names,
+    /// which is what every test but the not-a-guarantor one wants: there is
+    /// one core in play and every package belongs to it.
+    own_core: Mutex<Option<u16>>,
 }
 
 /// What a simulated guarantor distributes, and what it would take to get it
@@ -422,6 +434,7 @@ impl SimNode {
             refused_assurances: Mutex::new(Vec::new()),
             reported_cores: Mutex::new(Vec::new()),
             guarantee: Mutex::new(None),
+            own_core: Mutex::new(None),
         }
     }
 
@@ -435,6 +448,16 @@ impl SimNode {
     /// takes is shared with them over CE 134.
     pub fn shares_with(&self, peers: &[u16]) {
         *self.sharing_peers.lock().expect("sim sharing peers") = peers.to_vec();
+    }
+
+    /// Say which core this node guarantees on, so it can tell a package
+    /// that is its business from one that is not.
+    ///
+    /// Injected like the rest of the assignment. `None` -- the default --
+    /// is a node that does not check, which takes and shares whatever it is
+    /// sent.
+    pub fn guards_core(&self, core: u16) {
+        *self.own_core.lock().expect("sim own core") = Some(core);
     }
 
     /// Say which cores this node has a report pending availability on.
@@ -988,8 +1011,39 @@ impl SimNode {
             return;
         }
         send.finish();
+
+        // A package for a core this node does not hold is none of its
+        // business: it takes the stream -- the sender is owed an answer --
+        // and goes no further (`simple.md:410-415`). Not a reset, which is
+        // what the lane expects for a malformed submission and not for a
+        // misaddressed one.
+        if !self.holds_core_of(kind, &messages) && self.fault != SimFault::SharesForeignCore {
+            return;
+        }
         self.share_package().await;
         self.distribute_report().await;
+    }
+
+    /// Whether this node holds the core the submission names.
+    ///
+    /// True when no core was injected, which is the honest answer for a
+    /// test with one core in play: a stand-in that invented an assignment
+    /// would be grading the harness against its own arithmetic.
+    fn holds_core_of(&self, kind: u8, messages: &[Vec<u8>]) -> bool {
+        let Some(mine) = *self.own_core.lock().expect("sim own core") else {
+            return true;
+        };
+        let Some(first) = messages.first() else {
+            return true;
+        };
+        let addressed = if kind == CE146 {
+            ce137_148::BundleSubmission::decode_initial(&mut &first[..]).map(|(core, _)| core)
+        } else {
+            ce131_136::WorkPackageSubmission::decode_initial(&mut &first[..]).map(|(core, _)| core)
+        };
+        // An undecodable first message is not a question about the core.
+        // The node took it, and the rows that grade its shape are elsewhere.
+        addressed.map(|core| core == mine).unwrap_or(true)
     }
 
     /// Distribute the guaranteed work-report over CE 135
