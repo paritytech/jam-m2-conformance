@@ -269,6 +269,24 @@ pub enum SimFault {
     /// Pool no guarantee, so a report distributed to this node is never
     /// included in a block it authors.
     ReportNotIncluded,
+    /// Reset a well-formed CE 134 share instead of answering it.
+    ///
+    /// A guarantor that will not refine for its co-guarantors. The share is
+    /// sound, so nothing but the refusal is wrong with the exchange.
+    ShareRefused,
+    /// Answer a CE 134 share with a report hash that is not the one the
+    /// bundle refines to.
+    ///
+    /// The signature is genuine and over the hash sent, so the reply is
+    /// well formed and simply names the wrong report -- a node that refined
+    /// something other than what it was given.
+    ShareWrongHash,
+    /// Answer a share offering a shard count that is not the active
+    /// validator count (`simple.md:432-437`).
+    ///
+    /// The one rule a guarantor applies to a share before refining it, so
+    /// taking the bundle anyway is the whole defect.
+    ShareAcceptsBadShardCount,
     /// Share a package addressed to a core this node does not hold.
     ///
     /// The package is none of its business (`simple.md:410-415`), so the
@@ -357,6 +375,14 @@ pub struct SimNode {
     /// guarantee distributes nothing -- which is what a node that was never
     /// given a package does.
     guarantee: Mutex<Option<GuaranteeOffer>>,
+    /// The report hash this node answers a CE 134 share with.
+    ///
+    /// Injected like the guarantee it distributes, and for the same reason:
+    /// the stand-in does not refine. What the rows grade is whether it
+    /// answers at all, whether it refuses a share it should, and whether
+    /// the hash it names is the one the reference refined -- none of which
+    /// needs the refining itself to happen here.
+    refines_to: Mutex<Option<[u8; 32]>>,
     /// The core this node holds, when a test has told it.
     ///
     /// `None` is a node that does not check which core a submission names,
@@ -435,6 +461,7 @@ impl SimNode {
             reported_cores: Mutex::new(Vec::new()),
             guarantee: Mutex::new(None),
             own_core: Mutex::new(None),
+            refines_to: Mutex::new(None),
         }
     }
 
@@ -448,6 +475,11 @@ impl SimNode {
     /// takes is shared with them over CE 134.
     pub fn shares_with(&self, peers: &[u16]) {
         *self.sharing_peers.lock().expect("sim sharing peers") = peers.to_vec();
+    }
+
+    /// Say which report hash this node answers a CE 134 share with.
+    pub fn refines_to(&self, report_hash: [u8; 32]) {
+        *self.refines_to.lock().expect("sim refines to") = Some(report_hash);
     }
 
     /// Say which core this node guarantees on, so it can tell a package
@@ -957,6 +989,7 @@ impl SimNode {
                 self.receive_package(&mut send, kind, &mut reader, &content)
                     .await
             }
+            CE134 => self.receive_share(&mut send, &mut reader, &content).await,
             CE135 => self.receive_report(&content).await,
             CE141 => self.receive_assurance(&content, peer).await,
             // A real node resets an unserved kind; this one is not graded on
@@ -1116,6 +1149,62 @@ impl SimNode {
                 send.finish();
             }
         }
+    }
+
+    /// Receive a CE 134 share: refine the bundle and answer with the
+    /// report's hash and a signature over it (`simple.md:439-456`).
+    ///
+    /// Two messages in, one out. The one rule applied before refining is
+    /// the shard count, which must be the active validator count
+    /// (`simple.md:432-437`) -- a guarantor that refines a bundle coded for
+    /// a different set has agreed to something it cannot assure.
+    ///
+    /// The hash is injected rather than computed, because the stand-in does
+    /// not refine. That does not weaken the rows: what they ask is whether
+    /// the node answered, whether it refused a share it should have, and
+    /// whether the hash it named is the reference's. The faults move each
+    /// of those without touching the others.
+    async fn receive_share(&self, send: &mut SendHalf, reader: &mut StreamReader, first: &[u8]) {
+        // Drained whether or not the share will be refused: a reset without
+        // reading looks, to a sender mid-write, like a connection that died.
+        let Ok(context) = ce131_136::SharingContext::decode(&mut &first[..]) else {
+            return;
+        };
+        let _bundle = reader.next().await;
+
+        let acceptable = context.shard_count == jam_types::max_val_count();
+        let refuse = self.fault == SimFault::ShareRefused
+            || (!acceptable && self.fault != SimFault::ShareAcceptsBadShardCount);
+        if refuse {
+            send.reset(NO_DATA_CODE);
+            return;
+        }
+        // Nothing to answer with. A node that was never told what the
+        // bundle refines to has not refused it -- it has nothing to say,
+        // and the lane reports that apart from a refusal.
+        let Some(mut report_hash) = *self.refines_to.lock().expect("sim refines to") else {
+            send.finish();
+            return;
+        };
+        if self.fault == SimFault::ShareWrongHash {
+            report_hash[0] ^= 0xff;
+        }
+        // Signed over whatever hash is being sent, so the reply is well
+        // formed either way and only the hash is wrong. The signing rule is
+        // the harness's own, for the reason on `guarantee_signatures`.
+        let signature = m2_reference::reports::guarantee_signatures(
+            jam_types::WorkReportHash::from(report_hash),
+            &[self.index as u16],
+        )
+        .first()
+        .map(|(_, signature)| *signature)
+        .unwrap_or([0u8; 64]);
+        let reply = ce131_136::SharingReply {
+            report_hash: jam_types::WorkReportHash::from(report_hash),
+            signature,
+        };
+        let _ = send.write_all(&frame_message(&reply.encode())).await;
+        send.finish();
     }
 
     /// Receive a CE 135 distribution and pool it, so the next block this

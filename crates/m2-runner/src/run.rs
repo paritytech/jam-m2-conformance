@@ -1250,7 +1250,6 @@ async fn plan_availability(
         segments_root: spec.exports_root,
         shard_count: spec.erasure_shards,
         segment_indices,
-        cores: spec.cores,
         // A slot ahead, so the fetches have somewhere to finish before the
         // assurance that follows them.
         honest_slot: now + 1,
@@ -1300,7 +1299,6 @@ struct AvailSpec {
     /// different question.
     exports_root: [u8; 32],
     exports_count: u16,
-    cores: Vec<u16>,
 }
 
 /// Read the package spec out of the first report the NUT distributed.
@@ -1320,7 +1318,6 @@ fn first_package_spec(
         erasure_shards: decoded.package_spec.erasure_shards,
         exports_root: decoded.package_spec.exports_root.0,
         exports_count: decoded.package_spec.exports_count,
-        cores: vec![decoded.core_index],
     })
 }
 

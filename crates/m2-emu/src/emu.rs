@@ -978,7 +978,20 @@ fn start_availability(connection: &Conn, peer: u16, shared: &EmuShared) {
             // head -- and an assurance anchored there can never be carried,
             // because the on-chain rule refuses an assurances extrinsic
             // whose anchor is not the block's parent (findings.md §14).
-            move || ref_chain.best_block().ok().map(|(hash, _)| hash),
+            {
+                let ref_chain = Arc::clone(&ref_chain);
+                move || ref_chain.best_block().ok().map(|(hash, _)| hash)
+            },
+            // The engine's own answer, asked every slot. A core is engaged
+            // when a block carries its guarantee and freed once the report
+            // is available, so this is the same kind of value as the anchor
+            // above and is read the same way (`findings.md` §21).
+            //
+            // An unreachable oracle answers "nothing is engaged", which is
+            // the safe reading: an assurance claiming no core is vacuous,
+            // where one claiming a core that is not engaged is invalid and
+            // costs the node the block it would have authored.
+            move || ref_chain.engaged_cores().unwrap_or_default(),
         )
         .await;
         if fetch_shards && !reached {

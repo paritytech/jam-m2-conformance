@@ -381,9 +381,6 @@ pub struct AvailPlan {
     /// protocols are not exercised rather than asked for segments that do
     /// not exist.
     pub segment_indices: Vec<u16>,
-    /// Cores the harness believes carried a report, which is what an honest
-    /// assurance claims.
-    pub cores: Vec<u16>,
     /// First slot an assurance goes out for.
     pub honest_slot: u32,
     /// How many slots in a row to assure for, starting at `honest_slot`.
@@ -437,6 +434,13 @@ pub async fn drive_availability(
     // assurances from one validator under one anchor.
     last_assured: &Arc<Mutex<std::collections::HashMap<u16, [u8; 32]>>>,
     anchor_of: impl Fn() -> Option<[u8; 32]>,
+    // The cores carrying a report right now, read every slot for the same
+    // reason the anchor is: both are chain state. A core is engaged when a
+    // block carries its guarantee and freed once the report is available,
+    // so a set chosen when the plan was written is wrong for most of a run
+    // -- and assuring a freed core cost a live node every authoring slot it
+    // owned (`findings.md` §21).
+    engaged_cores: impl Fn() -> Vec<u16>,
 ) -> bool {
     // Its own index, because that is the shard a validator is entitled to:
     // `simple.md:523-556` is a validator fetching the piece it must assure.
@@ -513,6 +517,7 @@ pub async fn drive_availability(
     // and a hash chosen when the plan was written names a block several
     // slots old by then.
     let kind = spoil_for(peer);
+    let mut last_engaged: Option<Vec<u16>> = None;
     for slot in plan.honest_slot..plan.honest_slot.saturating_add(plan.assurance_slots) {
         // A reconnection restarts this loop at the plan's first slot, which
         // is by then in the past: `sleep_until_lead` returns at once and the
@@ -539,19 +544,35 @@ pub async fn drive_availability(
             held.insert(peer, anchor);
         }
 
+        // Read here rather than above the loop: the answer changes as
+        // reports are guaranteed and become available, and this slot's
+        // assurance has to claim this slot's cores.
+        let engaged = engaged_cores();
+        // Said when it moves, because when it moves is the whole question.
+        // The harness reads this a couple of seconds before the slot and
+        // the node checks it when it authors; anything that frees a core in
+        // between leaves a valid assurance looking invalid by the time it
+        // is used, which is how a node loses a slot it owned to a peer
+        // doing nothing wrong (`findings.md` §21, §22).
+        if last_engaged.as_deref() != Some(&engaged[..]) {
+            eprintln!(
+                "[availability] validator {peer} sees cores {engaged:?} engaged at slot {slot},                  was {last_engaged:?}"
+            );
+            last_engaged = Some(engaged.clone());
+        }
         let (assurance, cores, fault) = if slot >= plan.spoiled_from {
             // `None` where this validator cannot pose its fault -- there is
             // no empty core to claim when every core carried a report.
             // Sending some other fault instead would mean the run graded a
             // different rule from the one it recorded.
-            match spoil(peer, anchor, &plan.cores, kind) {
+            match spoil(peer, anchor, &engaged, kind) {
                 Some((assurance, claimed)) => (assurance, claimed, Some(kind)),
                 None => continue,
             }
         } else {
             (
-                m2_reference::assurance::sign_assurance(peer, anchor, &plan.cores),
-                plan.cores.clone(),
+                m2_reference::assurance::sign_assurance(peer, anchor, &engaged),
+                engaged,
                 None,
             )
         };

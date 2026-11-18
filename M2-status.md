@@ -157,6 +157,48 @@ it lands a run still costs the node two or three of its authoring slots.
 declares `export_count: 0`, so a live run asks nothing over any segment
 protocol. The prediction was made by reading the code; it is now measured.
 
+### After PR #16: §21 closed, CE 134 receive proven, 2026-11-18
+
+**§21's second half.** `AvailPlan.cores` is gone; the engaged cores are
+read per slot through a closure, exactly as the anchor is, answered by the
+oracle from `Harness::engaged_cores()`. No upstream export was needed.
+Measured over three runs, against the node's own authoring slots:
+
+| | opportunities | lost to `core not engaged` | `valid_assurance_included` graded |
+|---|---|---|---|
+| neither half (`n3n4-4`) | 8 | 5 | 3 |
+| first half (`n3n4-5`) | 5 | 2 | 5 |
+| both (`n4-cores-1`) | 7 | 2 | **9** |
+
+`n4_availability_threshold_reached` passed for the first time: a report the
+harness assured actually became available.
+
+**What the residual turned out to be.** Two slots still went, and a new
+diagnostic that prints the engaged set whenever it moves says why: a core
+is engaged for about **one slot at a time**. Against that turnover the
+two-second assurance lead is most of the life of the value, so an assurance
+is routinely valid when sent and stale when the node authors with it. That
+is not the harness aiming badly any more, and §22 is rewritten around it —
+*the node loses a block to an assurance that was valid when it was sent* —
+now the strongest candidate for a real polkajam defect this harness has
+produced.
+
+**CE 134 receive.** The simulated node refines a bundle it is sent and
+answers with the report's hash; three faults cost `n3_ce134_answered`,
+`n3_ce134_hash_equals_the_reference` and
+`n3_ce134_wrong_shard_count_refused` one row each.
+
+**Where that leaves the lanes.** Every row a node can cause in N3 and N4
+has now been seen to fail, except one that cannot be reached at all:
+`n3_ce134_shares_the_submitted_package` is gated on mappings, which map
+imported segments, and no package this harness builds imports any. §17 now
+lists four rows waiting on that one thing.
+
+So the *coverage* reason for keeping N3 and N4 opt-in is gone. What remains
+is a judgement: the two oversize rows are Hard against the reading §4
+records as unsettled, and defaulting these lanes would fail a third-party
+node on a **should**.
+
 ## Milestone ladder
 
 | Milestone | Lanes | Coverage | Status |

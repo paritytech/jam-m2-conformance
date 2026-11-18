@@ -823,6 +823,12 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             Message::Done
         }),
 
+        Message::EngagedCores(session) => with(sessions, session, |s| {
+            let mut cores: Vec<u16> = s.harness.engaged_cores().into_iter().collect();
+            cores.sort_unstable();
+            Message::Cores(cores)
+        }),
+
         Message::BuildPackage {
             session,
             items,
