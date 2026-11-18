@@ -264,6 +264,15 @@ question for the conformance group rather than for the harness:
 This is the first N3 row that failed for a reason that is not plainly the
 harness's. Every earlier one was ours.
 
+**CE 146 inherits the same question.** `simple.md:383` says the
+`Work-Package` message **should be limited** to `200 * 1024` bytes, in the
+same SHOULD form and with the same rationale, so `n3_ce146_oversized_reset`
+rests on the same unsettled reading as `n3_ce133_oversized_reset`. Both are
+Hard, which keeps them consistent with each other rather than with any
+answer; whatever settles one settles both, and if the cap turns out to bind
+only the sender then both rows go, not one. Noted here rather than
+rediscovered when the CE 146 row first fails against a live node.
+
 ---
 
 ## 5. The node resets a well-formed CE 134 share with `NoError`
@@ -484,7 +493,8 @@ twice. With the pin moved, `m2-sim` holds a real coded bundle and
 types. The same shape as #1378 -- a re-export and a visibility bump, no
 behaviour change.
 
-The pin moved to that branch (`43689c3de`) on 2026-11-17, ahead of the PR
+The pin moved to that branch on 2026-11-17 (`43689c3de`, then `0aaa2cb20`
+with §14's export and `b1ea8aca4` with §16's), ahead of the PR
 being opened, for two reasons. `merkle_root` is needed to *check* a CE 137
 justification at all, since that protocol takes its segment root from the
 shards rather than from the justification (§11b). And `merkle_proofs` with
@@ -657,3 +667,181 @@ slept one whole slot period before sending, which lands at exactly the same
 phase of the next slot and reads as punctual. It now holds until the slot has
 nearly run out. A fault that fails to break the thing it is aimed at looks
 identical to a check that works.
+
+## 14. The inclusion rows asked for the wrong block — CLOSED 2026-11-18
+
+**Status:** closed. Found by writing the simulated node that should have
+broken `n4_ce141_inclusion`, which had never been exercised against anything.
+
+Both of its rows were wrong, in ways that compounded.
+
+**An assurance can be carried in exactly one block.** `check_signatures`
+refuses an assurances extrinsic unless every assurance in it anchors the
+block's *parent*:
+
+```rust
+if assurance.statement.anchor != parent_hash {
+    return Err(BadAttestationParent);
+}
+```
+
+So the only block that can ever carry an assurance is the child of the block
+it names. The row asked whether *any* NUT block after the offer carried it —
+and the node authors about two slots in six, so most of its blocks are not
+that child. A node keeping the rule exactly would have been failed for it.
+
+**And the anchor was the wrong block to begin with.** The harness anchored
+every offer at the last block the *NUT* had authored. The harness fills the
+slots the node does not, so that block is usually several blocks behind the
+head, and nothing is ever authored directly on top of it. Every offer named
+a block that would never be a parent again. The two defects hid each other:
+with the anchor stale, the "any later block" reading was the only one under
+which the row could ever pass.
+
+The anchor is now the chain's head, read at send time, and the rows are
+judged against the one block that could carry the assurance — the child of
+that anchor, authored at or after the slot the assurance was sent for.
+
+Two more things came out of writing it.
+
+**A node that includes an invalid assurance authors an invalid block.** A
+bad signature fails `check_signatures`; a bit for a core with no assignment
+fails with `CoreNotEngaged`. So the fault cannot be posed by pooling: the
+authoring engine refuses to produce the block. `AssuranceIncludesInvalid`
+rewrites the authored body instead, and fails N1's import row in company,
+which the test asserts rather than remarks on. The wrong-anchor fault cannot
+reach a block even then — the engine files assurances by anchor and the
+author reads only the entry for its parent — so it is the other two that
+make the exclusion row fail.
+
+**Offering once was not enough.** With the rows tied to one block, a single
+offer is graded only if the node happens to author that block. A run now
+assures the head every slot, as a validator does, half the slots honestly
+and half spoiled, so each row has several of the node's own slots to be
+judged on.
+
+### Why this took an upstream export
+
+`AssuranceTracker` is a private field of `Authoring` and `note_dummy_assurance`
+is unreachable outside `jam-node`. The authoring harness could sign its own
+assurance and never take one it was handed, so nothing could simulate the
+half that matters: a node's assurances extrinsic carries what its *peers*
+sent it. `AuthoringHarness::submit_assurance` is the entry point, pushed to
+the same branch as the Merkle exports (§9) and open as
+**paritytech/polkajam#1401**.
+
+## 15. The same shape-model defect in CE 146 and CE 148 — CLOSED 2026-11-18
+
+**Status:** closed for these two. The CE 137/138/139/140 response types are
+still shape models; see below.
+
+§11 found the availability codecs modelling *shapes* rather than the wire,
+and fixed the ones the N4 lane reads. `BundleSubmission` (CE 146) and
+`SegmentResponse` (CE 148) had the same defect and were not touched, because
+nothing used them yet. Found by going to use them.
+
+CE 146 is five messages and CE 148's reply is two. Both types derived
+`Encode`/`Decode` over one structure, which writes a length prefix in front
+of the work-package and of every extrinsic, segment and proof. A guarantor
+reading that takes the prefix as package content. Worse for CE 146 than for
+CE 137: the whole reason the bundle is split across messages is so a
+guarantor can authorize the package *before* downloading the rest
+(`simple.md:381-384`), and a single value throws that away even when the
+bytes happen to parse.
+
+Both are now per-message, matching `WorkPackageSubmission`, which had been
+written correctly for CE 133 and whose `decode_extrinsics` both protocols
+now share — the extrinsic message has one rule and it lives in one place.
+
+**The test vectors were wrong, again.** `ce148_response_vector` and
+`ce146_vector` asserted the derived bytes, so the suite confirmed the defect
+rather than catching it. This is the second time (§11 found the same thing
+in `assurance_vector_2byte_bitfield`). A vector written from the
+implementation tests nothing; it has to be written from the grammar.
+
+**What is left.** `ShardResponse`, `AuditShardResponse`,
+`SegmentShardsResponse` and `ProvenSegmentShardsResponse` are still single
+derived structures. Nothing grades through them — `m2-emu::avail_io` reads
+those replies by position off the stream, which is what §11 changed — and
+the only caller is `jamnp-s::proto`, a trace decoder nothing in the
+workspace drives yet. They are left as the trap they are rather than
+quietly: a frame is one message, and `proto`'s one-frame-one-message model
+cannot represent a multi-message reply at all. CE 129, CE 133, CE 146 and CE
+148 are each special-cased there for exactly that reason, and the four above
+want the same treatment when something starts reading traces.
+
+## 16. CE 148 could not be checked at all — CLOSED 2026-11-18
+
+**Status:** closed by an upstream export, the third of its kind.
+
+A CE 148 reply is whole segments and one import proof each, and the only
+thing that says a proof is good is `cd_proof_root_ph`: it hashes the segment
+into a leaf and walks the path back to the segments root. That function is
+`pub` inside `jam-node`'s private `util::merkle` and was not re-exported.
+
+The asymmetry is what made it worth a finding rather than a shrug. The
+*builders* were already reachable — `cd_merkle_proof` and `cd_merkle_root`
+are public in `jam-std-common`, which this harness links — so anything
+outside the node crate could construct a proof and had no way to check one.
+A harness in that position can only grade shape: how many segments came
+back, whether the message is a whole number of them, whether a proof arrived
+for each. All true of a node serving somebody else's segments.
+
+**Open upstream** as part of **paritytech/polkajam#1401**: one more
+re-export in `hazmat::merkle`, beside the two added for the justification
+builders (§9). The same shape as those, and as `submit_assurance` (§14): a
+re-export and a visibility bump, no behaviour change.
+
+The pattern is now three for three. Every time this harness has gone to
+grade a new protocol, the engine could do the thing and could not be asked
+to do it from outside. Worth saying plainly for whoever writes the next
+lane: check what `hazmat` exports *before* designing the rows, because the
+rows that survive are the ones the engine will answer.
+
+### Where the rows live
+
+CE 148 is graded in N4, where DESIGN §11 groups it under N3. The grouping
+there is by purpose — CE 148 completes a bundle — but what decides which
+lane can ask is the plan: the request names a segments root, the only root
+the node is obliged to serve is one it exported itself, and that exists only
+once it has guaranteed a package and published a report. The same report and
+the same mid-run plan N4 already waits for (§12). DESIGN is updated to say
+so rather than left to disagree with the code.
+
+## 17. The segment protocols cannot be exercised against a live node
+
+**Status:** open. Found while writing the CE 148 rows, by asking what the
+run would actually ask for. Opened 2026-11-18.
+
+Every segment protocol — CE 139, CE 140 and now CE 148 — is driven from the
+availability plan, and the plan's `segment_indices` come from the
+`exports_count` on the report the node published:
+
+```rust
+let segment_indices: Vec<u16> = (0..spec.exports_count.min(MAX_SEGMENTS_ASKED)).collect();
+```
+
+The package this run submits is built from `work_item_with_payload`, which
+declares `export_count: 0`. So `exports_count` is zero, `segment_indices` is
+empty, and a live run asks nothing over any of the three. Their rows report
+*not exercised*, which is the truth, and a reader skimming a green report
+has no reason to look closer.
+
+This is not a defect in the rows. They are held to the bar by
+`m2-sim/tests/n4_sim_it.rs`, which drives a node holding real coded segments
+and real proofs through eight faults across the three protocols. What is
+missing is the *live* half: nothing has ever asked polkajam for a segment.
+
+**What it takes to close.** A work item that exports segments, which means
+the dev bootstrap service actually exporting them during refine —
+`export_count` is a declaration, and a refine that does not produce that many
+fails. So this is not a one-line change to the item; it is a question about
+what the service can be asked to do, and it needs a live run to settle rather
+than a guess. Until then:
+
+- a green CE 139/140 or CE 148 row against a live node means "the harness
+  never asked", and the lane's own docs say so;
+- the simulated node is the only thing those rows have been measured
+  against, which is better than nothing and is not the same as a node.
+
+Related: §12, which is why the plan is mid-run at all.

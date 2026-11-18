@@ -60,6 +60,21 @@ pub struct ScheduledSubmission {
     pub package_hash: [u8; 32],
     /// Extrinsic bodies, in the order the package declares them.
     pub extrinsics: Vec<Vec<u8>>,
+    /// Which protocol carries it: 133 or 146. See
+    /// [`SubmissionSchedule::protocol`].
+    pub protocol: u16,
+    /// CE 146's segments-root mappings (`simple.md:393`).
+    ///
+    /// Empty here, and that is the answer rather than a gap: the mappings
+    /// map the package's *imported* segments to the roots they come from,
+    /// and this run's package imports none. A harness that invented one
+    /// would be asking the node to accept a mapping for a segment nobody
+    /// exported.
+    pub mappings: Vec<([u8; 32], [u8; 32])>,
+    /// CE 146's imported segments. Empty, for the same reason.
+    pub segments: Vec<Vec<u8>>,
+    /// CE 146's import proofs, one per imported segment. Empty likewise.
+    pub import_proofs: Vec<Vec<[u8; 32]>>,
     /// What is deliberately wrong with this submission, carried through so
     /// the sender can apply the wire-level faults and the lane can say which
     /// rule it posed.
@@ -117,6 +132,15 @@ const OVERSIZED_PAYLOAD: usize = 2 + 200 * 1024;
 pub struct SubmissionSchedule {
     pub slot: u32,
     pub core: u16,
+    /// Which submission protocol to use: 133 or 146.
+    ///
+    /// The same package either way. `simple.md:378-404` makes CE 146 the
+    /// whole-bundle form of CE 133 -- five messages instead of two, so a
+    /// guarantor can authorize the package before downloading the rest --
+    /// and DESIGN §11 N3 grades it by the same rules. What differs is the
+    /// framing and where the size cap falls, which is exactly what sending
+    /// the same package over both is for.
+    pub protocol: u16,
     /// Validators holding `core` at `slot` besides the NUT.
     pub co_guarantors: Vec<u16>,
     /// What is deliberately wrong with this submission, if anything.
@@ -129,7 +153,12 @@ pub struct SubmissionSchedule {
 /// prove neither: a node refusing it could be refusing the other one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmissionFault {
-    /// Message 1 over `2 + 200 * 1024` bytes (`simple.md:362-364`).
+    /// A work-package over the cap its protocol sets.
+    ///
+    /// CE 133 caps message 1 -- core index and package together -- at
+    /// `2 + 200 * 1024` (`simple.md:362-364`); CE 146 carries the core index
+    /// in a message of its own and caps the package alone at `200 * 1024`
+    /// (`simple.md:383`). One payload clears both.
     ///
     /// Oversized by payload rather than by padding. A padded package stops
     /// decoding, and a node that refuses one has refused a malformed
@@ -391,9 +420,13 @@ impl RefChain {
                     ScheduledSubmission {
                         slot: schedule.slot,
                         core: schedule.core,
+                        protocol: schedule.protocol,
                         package: jam_types::Encode::encode(&built.package),
                         package_hash: package_hash(&built.package).0,
                         extrinsics: built.extrinsics,
+                        mappings: Vec::new(),
+                        segments: Vec::new(),
+                        import_proofs: Vec::new(),
                         fault: schedule.fault,
                         co_guarantors: schedule.co_guarantors.clone(),
                     },
@@ -410,9 +443,13 @@ impl RefChain {
             ScheduledSubmission {
                 slot: schedule.slot,
                 core: schedule.core,
+                protocol: schedule.protocol,
                 package: jam_types::Encode::encode(&work.package),
                 package_hash: package_hash(&work.package).0,
                 extrinsics: work.extrinsics,
+                mappings: Vec::new(),
+                segments: Vec::new(),
+                import_proofs: Vec::new(),
                 fault: schedule.fault,
                 co_guarantors: schedule.co_guarantors.clone(),
             },

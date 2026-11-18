@@ -68,7 +68,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     let segments: Vec<Vec<u8>> = (0..SEGMENTS)
         .map(|i| vec![0xa0 + i as u8; jam_types::SEGMENT_LEN])
         .collect();
-    let erasure_root = node
+    let (erasure_root, segments_root) = node
         .hold_available(bundle, segments, SHARD_COUNT)
         .expect("the bundle codes into servable shards");
 
@@ -105,11 +105,17 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     let now = m2_reference::chain::wall_clock_slot();
     emu.avail_planner().set(m2_emu::avail_io::AvailPlan {
         erasure_root,
+        segments_root,
         shard_count: SHARD_COUNT,
         segment_indices: (0..SEGMENTS as u16).collect(),
         cores: vec![REPORTED_CORE],
         honest_slot: now + 1,
-        spoiled_slot: now + 2,
+        // Two slots of offers: this test grades what the node *serves* and
+        // what it sends, not what it carries, so one honest offer and one
+        // spoiled one are all it needs. `n4_inclusion_sim_it` is the test
+        // that needs a run of them.
+        assurance_slots: 2,
+        spoiled_from: now + 2,
     });
 
     // The node's own assurance, which is what `n4_ce141_send` grades. Sent
@@ -141,6 +147,12 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         .expect("the served segment shards")
         .clone();
     m2_runner::real::verify_segment_shards(&oracle, SHARD_COUNT, &mut segment_shards_served);
+    let mut segments_served = emu
+        .segments_served()
+        .lock()
+        .expect("the served segments")
+        .clone();
+    m2_runner::real::verify_import_proofs(&oracle, &mut segments_served);
 
     let seen = emu.assurances_seen();
     let assurances_seen = m2_emu::avail_io::assurances_for_lane(
@@ -158,6 +170,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         nut_index: NUT_INDEX as u16,
         shards_served,
         segment_shards_served,
+        segments_served,
         assurances_seen,
         // Not graded here: this stand-in cannot carry a received assurance
         // in a block, so the inclusion rows have nothing to say.
@@ -172,6 +185,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         n4::n4_ce137_serve(&ctx),
         n4::n4_ce138_serve(&ctx),
         n4::n4_ce139_140_serve(&ctx),
+        n4::n4_ce148_serve(&ctx),
         n4::n4_ce141_send(&ctx),
     ]
     .into_iter()
@@ -223,6 +237,12 @@ async fn the_n4_availability_checks_catch_a_node_that_serves_wrongly() {
         "n4_ce139_140_slices_are_whole",
         "n4_ce139_140_one_shard_per_request",
         "n4_ce140_justifications_verify",
+        "n4_ce148_answered",
+        "n4_ce148_reply_complete",
+        "n4_ce148_segments_are_whole",
+        "n4_ce148_one_segment_per_request",
+        "n4_ce148_one_proof_per_segment",
+        "n4_ce148_proofs_verify",
         "n4_ce141_well_formed",
         "n4_ce141_bits_have_reports",
         "n4_ce141_sent_before_the_slot",
@@ -256,6 +276,11 @@ async fn the_n4_availability_checks_catch_a_node_that_serves_wrongly() {
             SimFault::SegmentJustificationBad,
             "n4_ce140_justifications_verify",
         ),
+        (SimFault::SegmentsRefused, "n4_ce148_answered"),
+        (SimFault::SegmentsRagged, "n4_ce148_segments_are_whole"),
+        (SimFault::SegmentsShort, "n4_ce148_one_segment_per_request"),
+        (SimFault::SegmentsReplyShort, "n4_ce148_reply_complete"),
+        (SimFault::SegmentProofBad, "n4_ce148_proofs_verify"),
         (SimFault::AssuranceWrongAnchor, "n4_ce141_well_formed"),
         (SimFault::AssuranceBadSignature, "n4_ce141_well_formed"),
         (SimFault::AssuranceEmptyCore, "n4_ce141_bits_have_reports"),
@@ -295,6 +320,46 @@ async fn the_n4_availability_checks_catch_a_node_that_serves_wrongly() {
         "and CE 138, which owes two messages, is untouched: {:?}",
         outcomes_of(&short, "n4_ce138_reply_complete")
     );
+
+    // CE 148 is the optional shortcut, so a node that refuses it must still
+    // serve everything it is actually obliged to. If refusing took the
+    // other protocols with it, the Soft answered row would be standing in
+    // for a hard failure elsewhere and nobody could tell.
+    let no_segments = grade(SimFault::SegmentsRefused).await;
+    for row in [
+        "n4_ce137_answered",
+        "n4_ce138_answered",
+        "n4_ce139_140_answered",
+    ] {
+        assert!(
+            passed(&no_segments, row),
+            "declining CE 148 must not disturb {row}; it reported {:?}",
+            outcomes_of(&no_segments, row)
+        );
+    }
+    assert!(
+        outcomes_of(&no_segments, "n4_ce148_answered")
+            .iter()
+            .any(|o| **o == Outcome::Fail(m2_scenario::dsl::Severity::Soft)),
+        "and declining is soft, because `simple.md:660` allows the fallback: {:?}",
+        outcomes_of(&no_segments, "n4_ce148_answered")
+    );
+
+    // A bad import proof is isolable the same way CE 140's is: the right
+    // segments arrive, in the right number, with a proof each, and only the
+    // walk fails.
+    let bad_proof = grade(SimFault::SegmentProofBad).await;
+    for row in [
+        "n4_ce148_segments_are_whole",
+        "n4_ce148_one_segment_per_request",
+        "n4_ce148_one_proof_per_segment",
+    ] {
+        assert!(
+            passed(&bad_proof, row),
+            "only the proof fails, not {row}; it reported {:?}",
+            outcomes_of(&bad_proof, row)
+        );
+    }
 
     // A bad segment justification does not disturb the slices themselves:
     // the right bytes arrive, in the right number, and only the proof over

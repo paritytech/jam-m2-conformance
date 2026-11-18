@@ -112,6 +112,7 @@ pub struct Emulator {
     avail_set: Arc<watch::Sender<bool>>,
     shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::ShardServed>>>,
     segment_shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentShardsServed>>>,
+    segments_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentsServed>>>,
     assurances_offered: Arc<Mutex<Vec<m2_scenario::scenarios::n4::AssuranceOffered>>>,
     shared_to_nut: Arc<Mutex<Vec<SharedToNut>>>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
@@ -215,6 +216,8 @@ pub struct EmuShared {
     pub shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::ShardServed>>>,
     /// CE 139/140 replies the NUT served.
     pub segment_shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentShardsServed>>>,
+    /// CE 148 replies the NUT served.
+    pub segments_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentsServed>>>,
     /// CE 141 assurances the emulator offered the NUT.
     pub assurances_offered: Arc<Mutex<Vec<m2_scenario::scenarios::n4::AssuranceOffered>>>,
     /// Tickets actually put on the wire, with the wall-clock time they were
@@ -399,6 +402,7 @@ impl Emulator {
             avail_set: Arc::new(watch::channel(false).0),
             shards_served: Arc::new(Mutex::new(Vec::new())),
             segment_shards_served: Arc::new(Mutex::new(Vec::new())),
+            segments_served: Arc::new(Mutex::new(Vec::new())),
             assurances_offered: Arc::new(Mutex::new(Vec::new())),
             deliveries: Arc::new(Mutex::new(Vec::new())),
             ce128_probes: Arc::new(Mutex::new(Vec::new())),
@@ -498,6 +502,11 @@ impl Emulator {
         Arc::clone(&self.segment_shards_served)
     }
 
+    /// CE 148 replies the NUT served.
+    pub fn segments_served(&self) -> Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentsServed>>> {
+        Arc::clone(&self.segments_served)
+    }
+
     /// CE 141 assurances the emulator offered the NUT.
     pub fn assurances_offered(
         &self,
@@ -555,6 +564,7 @@ impl Emulator {
             avail_set: self.avail_set.subscribe(),
             shards_served: Arc::clone(&self.shards_served),
             segment_shards_served: Arc::clone(&self.segment_shards_served),
+            segments_served: Arc::clone(&self.segments_served),
             assurances_offered: Arc::clone(&self.assurances_offered),
             shared_to_nut: Arc::clone(&self.shared_to_nut),
             deliveries: Arc::clone(&self.deliveries),
@@ -890,7 +900,7 @@ fn start_availability(connection: &Conn, peer: u16, shared: &EmuShared) {
         let Some(plan) = lock(&shared.avail_plan).clone() else {
             return;
         };
-        let nut_blocks = Arc::clone(&shared.nut_blocks);
+        let ref_chain = Arc::clone(&shared.ref_chain);
         crate::avail_io::drive_availability(
             &connection,
             peer,
@@ -899,17 +909,19 @@ fn start_availability(connection: &Conn, peer: u16, shared: &EmuShared) {
             &shared.obs,
             &shared.shards_served,
             &shared.segment_shards_served,
+            &shared.segments_served,
             &shared.assurances_offered,
-            // Read at send time, not planned: the block to assure is
-            // whichever one the chain is on two seconds before the slot,
-            // and a hash chosen when the plan was written names a block
-            // several slots old by then.
-            move || {
-                lock(&nut_blocks)
-                    .iter()
-                    .max_by_key(|nut| nut.block.header.slot)
-                    .map(|nut| nut.block.header.hash().0)
-            },
+            // The chain's head, read at send time: the block to assure is
+            // whichever one the chain is on, and a hash chosen when the plan
+            // was written names a block several slots old by then.
+            //
+            // The *chain's* head, not the last block the NUT authored. The
+            // node authors two slots in six and the harness fills the rest,
+            // so the last NUT block is usually several blocks behind the
+            // head -- and an assurance anchored there can never be carried,
+            // because the on-chain rule refuses an assurances extrinsic
+            // whose anchor is not the block's parent (findings.md §14).
+            move || ref_chain.best_block().ok().map(|(hash, _)| hash),
         )
         .await;
     });
@@ -1717,9 +1729,13 @@ mod tests {
         let plan = ScheduledSubmission {
             slot: 0,
             core: 1,
+            protocol: u16::from(jamnp_s::framing::CE133),
             package: package.clone(),
             package_hash: [0x5a; 32],
             extrinsics: extrinsics.clone(),
+            mappings: Vec::new(),
+            segments: Vec::new(),
+            import_proofs: Vec::new(),
             co_guarantors: vec![2, 3],
             fault: None,
         };

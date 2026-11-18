@@ -1,8 +1,12 @@
 //! Erasure coding and justification checking, as the engine does them.
 //!
-//! Four questions, all of them sessionless: coding is a function of the bytes
-//! and the shard count, and checking a proof is a function of the proof. None
-//! of them touches a chain, so none of them takes a session.
+//! Four of the five questions here are sessionless: coding is a function of
+//! the bytes and the shard count, and checking a proof is a function of the
+//! proof. None of those touches a chain, so none of them takes a session.
+//!
+//! [`RefChain::submit_assurances`] is the exception, and it has to be: an
+//! assurance a node received changes what the next block it authors carries,
+//! which is a change to one chain and not to the other.
 //!
 //! The counterpart of [`crate::assurance`], and the opposite answer to the
 //! same test. There, the whole computation lived in `jam-std-common` and both
@@ -15,7 +19,7 @@ use std::sync::Arc;
 
 use m2_oracle_proto::Message;
 
-use crate::chain::ChainError;
+use crate::chain::{ChainError, RefChain};
 use crate::oracle::Oracle;
 
 /// A bundle coded into one shard per validator.
@@ -147,6 +151,105 @@ pub fn make_available(
         }),
         other => Err(ChainError::Oracle(format!(
             "MakeAvailable answered {other:?}"
+        ))),
+    }
+}
+
+impl RefChain {
+    /// Offer assurances to the authoring pool, as a node does with the ones
+    /// its peers send it over CE 141.
+    ///
+    /// The sibling of [`RefChain::submit_tickets`], and a narrow passthrough
+    /// for the same reason: the engine behind it can author, import and
+    /// mutate state, and the chain's invariants are not things a caller
+    /// should be able to step around.
+    ///
+    /// **The pool files by anchor, and the block author reads only the
+    /// entry for its parent.** An assurance anchored at anything but the
+    /// block about to be authored is pooled and never carried -- correctly,
+    /// since the on-chain rule refuses an assurances extrinsic whose anchor
+    /// is not the block's parent. The engine also keeps one anchor at a
+    /// time, so an assurance for a newer block discards the pool for an
+    /// older one.
+    ///
+    /// Taken as already verified. A node checks an assurance before pooling
+    /// it, and a simulated node that skips the check is posing the fault of
+    /// carrying one it should have refused.
+    pub fn submit_assurances(
+        &self,
+        assurances: &[jam_std_common::AvailabilityAssurance],
+    ) -> Result<(), ChainError> {
+        if assurances.is_empty() {
+            return Ok(());
+        }
+        let encoded = assurances.iter().map(jam_types::Encode::encode).collect();
+        match self.ask(Message::SubmitAssurances {
+            session: self.session(),
+            assurances: encoded,
+        })? {
+            Message::Done => Ok(()),
+            other => Err(ChainError::Oracle(format!(
+                "SubmitAssurances answered {other:?}"
+            ))),
+        }
+    }
+}
+
+/// A work package's exported segments, with the root they sit under.
+#[derive(Clone, Debug)]
+pub struct SegmentTree {
+    /// The segments root: what a report calls `exports_root`, and what a CE
+    /// 148 request names.
+    pub segments_root: [u8; 32],
+    /// One import proof per segment, in segment order.
+    pub proofs: Vec<Vec<[u8; 32]>>,
+}
+
+/// Build the segments root and per-segment import proofs a guarantor serves
+/// over CE 148.
+///
+/// The builders are public in `jam-std-common` and the checker is not, which
+/// is why this goes over the socket rather than being done here: the two
+/// halves have to be the same tree, and only the engine can say whether a
+/// proof walks to the root.
+pub fn make_segments(
+    oracle: &Arc<Oracle>,
+    segments: Vec<Vec<u8>>,
+) -> Result<SegmentTree, ChainError> {
+    match oracle.expect(Message::MakeSegments { segments })? {
+        Message::SegmentProofs {
+            segments_root,
+            proofs,
+        } => Ok(SegmentTree {
+            segments_root,
+            proofs,
+        }),
+        other => Err(ChainError::Oracle(format!(
+            "MakeSegments answered {other:?}"
+        ))),
+    }
+}
+
+/// Check a CE 148 import proof the way a requester checks one it was served.
+///
+/// The segment travels whole: hashing it into a leaf is part of the rule,
+/// and a caller that did it would be the second implementation.
+pub fn check_import_proof(
+    oracle: &Arc<Oracle>,
+    segments_root: [u8; 32],
+    segment_index: u16,
+    segment: Vec<u8>,
+    proof: Vec<[u8; 32]>,
+) -> Result<ShardCheck, ChainError> {
+    match oracle.expect(Message::CheckImportProof {
+        segments_root,
+        segment_index,
+        segment,
+        proof,
+    })? {
+        Message::ShardChecked { verified, detail } => Ok(ShardCheck { verified, detail }),
+        other => Err(ChainError::Oracle(format!(
+            "CheckImportProof answered {other:?}"
         ))),
     }
 }
@@ -473,5 +576,68 @@ mod tests {
         )
         .expect_err("CE 140 does not serve bundle shards");
         assert!(format!("{error}").contains("140"), "{error}");
+    }
+
+    /// The CE 148 halves have to meet too: a proof `make_segments` builds
+    /// must verify through `check_import_proof`, for every segment.
+    ///
+    /// The same keystone as the shard round trip above, and needed for the
+    /// same reason. The builders come from `jam-std-common` and the checker
+    /// from `jam-node`, so "is the tree the engine's" is a real question
+    /// rather than a formality -- the leaf hashing alone would silently
+    /// disagree if either side did it differently.
+    #[test]
+    fn a_proof_this_builds_is_a_proof_this_accepts() {
+        let oracle = Oracle::for_tests();
+        let segments: Vec<Vec<u8>> = (0..3)
+            .map(|i| vec![0xc0 + i as u8; jam_types::SEGMENT_LEN])
+            .collect();
+        let tree = make_segments(&oracle, segments.clone()).expect("the segments build");
+        assert_eq!(tree.proofs.len(), segments.len(), "one proof per segment");
+
+        for (index, segment) in segments.iter().enumerate() {
+            let check = check_import_proof(
+                &oracle,
+                tree.segments_root,
+                index as u16,
+                segment.clone(),
+                tree.proofs[index].clone(),
+            )
+            .expect("the oracle answers");
+            assert_eq!(
+                check.verified,
+                Some(true),
+                "segment {index} must verify under its own root: {:?}",
+                check.detail
+            );
+        }
+
+        // And the proof is of *that* segment, not of any segment: swapping
+        // two is the smallest thing a node could get wrong while still
+        // sending a well-formed proof.
+        let crossed = check_import_proof(
+            &oracle,
+            tree.segments_root,
+            0,
+            segments[1].clone(),
+            tree.proofs[0].clone(),
+        )
+        .expect("the oracle answers");
+        assert_eq!(
+            crossed.verified,
+            Some(false),
+            "another segment under this proof must not verify"
+        );
+        assert!(crossed.detail.is_some(), "and it says what root it reached");
+    }
+
+    /// A segment of the wrong length is the caller's mistake, and comes back
+    /// as an error rather than as a tree built over something else.
+    #[test]
+    fn a_short_segment_is_the_callers_error() {
+        let oracle = Oracle::for_tests();
+        let error = make_segments(&oracle, vec![vec![0u8; 16]])
+            .expect_err("a 16-byte segment is not a segment");
+        assert!(format!("{error}").contains("16 bytes"), "{error}");
     }
 }

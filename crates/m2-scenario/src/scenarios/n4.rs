@@ -22,12 +22,10 @@
 //! `n4_ce141_sent_before_the_slot` asked whether the lead was positive,
 //! which it is by construction.
 //!
-//! The exception is [`n4_ce141_inclusion`]. Its rows ask whether the node
-//! carries valid assurances in its blocks and leaves invalid ones out, and
-//! the stand-in authors through the reference chain, so it cannot put a
-//! received assurance into a block. Those rows are still unproven, and a
-//! green `n4_ce141_valid_assurance_included` should be read as "nothing
-//! contradicted the node" rather than "the node was checked".
+//! [`n4_ce141_inclusion`] was the last of them to be proved. The stand-in
+//! authors through the reference chain, and until `submit_assurance` was
+//! exported there was no way to put an assurance it *received* into a block
+//! -- so both of its rows passed on every node, conforming or not.
 
 use crate::dsl::{check, log, Check, Control, Severity};
 
@@ -116,6 +114,53 @@ pub struct SegmentShardsServed {
     pub refused: bool,
 }
 
+/// A CE 148 response: whole imported segments, with a proof for each.
+///
+/// Graded in N4 rather than N3, where DESIGN §11 groups it. The grouping
+/// there is by *purpose* -- CE 148 completes a bundle -- but what decides
+/// which lane can ask the question is the plan: the request names a
+/// segments root, and the only root the node is obliged to serve is one it
+/// exported itself, which exists only once it has guaranteed a package and
+/// published a report. That is the same root, the same report and the same
+/// mid-run plan the availability lane already waits for (findings.md §12),
+/// so asking from N3 would mean building it twice.
+#[derive(Clone, Debug)]
+pub struct SegmentsServed {
+    /// The segments root asked for: the `exports_root` of a package the NUT
+    /// guaranteed.
+    pub segments_root: [u8; 32],
+    /// The segment indices asked for, in request order.
+    pub requested: Vec<u16>,
+    /// The segments the NUT returned, cut at `SEGMENT_LEN`. One per index
+    /// asked for, in the order asked: the reply carries no indices of its
+    /// own, so position is the only thing tying a segment to its index.
+    pub segments: Vec<Vec<u8>>,
+    /// The import proofs, one element per returned segment.
+    ///
+    /// A second message, and a sequence with no count: the elements are
+    /// self-delimiting and run back to back, so how many came is a fact the
+    /// lane reads rather than one the wire asserts.
+    pub proofs: Vec<Vec<[u8; 32]>>,
+    /// Per-segment verification, filled after the window by the engine.
+    pub proofs_verified: Vec<Option<bool>>,
+    /// Why a proof could not be walked, by segment, when one could not.
+    pub proof_details: Vec<Option<String>>,
+    /// The segment message was not a whole number of segments.
+    ///
+    /// Kept apart from a short reply: a ragged message says the two sides
+    /// disagree about how long a segment is, which no count would show.
+    pub ragged: bool,
+    /// The proof message did not decode as a run of import proofs.
+    pub proofs_unreadable: bool,
+    /// How many messages the NUT sent before closing the stream.
+    ///
+    /// Two are owed (`simple.md:670-671`) and nothing in either says how
+    /// long it is, so a node that stops after one looks exactly like one
+    /// that finished.
+    pub messages: usize,
+    pub refused: bool,
+}
+
 /// A CE 141 assurance the NUT broadcast.
 #[derive(Clone, Debug)]
 pub struct AssuranceSeen {
@@ -186,6 +231,8 @@ pub struct N4Ctx {
     pub shards_served: Vec<ShardServed>,
     /// CE 139/140 responses.
     pub segment_shards_served: Vec<SegmentShardsServed>,
+    /// CE 148 responses.
+    pub segments_served: Vec<SegmentsServed>,
     /// CE 141 assurances the NUT sent.
     pub assurances_seen: Vec<AssuranceSeen>,
     /// CE 141 assurances the harness sent the NUT.
@@ -355,6 +402,10 @@ fn grade_served_shard(shard: &ShardServed, prefix: &'static str) -> Vec<crate::d
 
 /// CE 139/140: segment shards for named indices, 140 with justifications
 /// (`simple.md:597-648`).
+///
+/// Never yet asked of a live node either, for the reason on
+/// [`n4_ce148_serve`]: the package this harness submits exports no segments,
+/// so there is nothing to ask for (findings.md §17).
 pub fn n4_ce139_140_serve(ctx: &N4Ctx) -> Check {
     let ctx = ctx.clone();
     check("n4_ce139_140_serve", Severity::Hard, move |_obs| {
@@ -471,6 +522,174 @@ pub fn n4_ce139_140_serve(ctx: &N4Ctx) -> Check {
     })
 }
 
+/// CE 148: the NUT serves whole imported segments with their import proofs
+/// (`simple.md:650-673`).
+///
+/// The optional counterpart of CE 139/140. A requester that wants a
+/// bundle's imports asks a guarantor for the segments outright rather than
+/// reconstructing them from shards, and falls back to 139/140 if the answer
+/// does not hold up (`simple.md:660`). So a node that refuses is not in
+/// breach -- the protocol is a shortcut, not a duty -- which is why the
+/// answered row is Soft while everything about an answer it *did* give is
+/// Hard. Serving the wrong segments is a defect; declining to serve is a
+/// choice.
+///
+/// **Never yet asked of a live node.** The plan's segment indices come from
+/// the `exports_count` on the report the node published, and the package
+/// this harness submits exports nothing, so a real run asks nothing here and
+/// the rows report themselves unexercised (findings.md §17). They are held
+/// to the bar by a simulated node that serves real segments and real proofs,
+/// which is better than nothing and is not the same as a node.
+///
+/// **The per-stream cap is not graded.** `simple.md:657-658` puts a ceiling
+/// of `W_M` segments on a request, and it binds the asker. Posing it would
+/// mean asking for more segments than any package this harness builds
+/// exports, so a node refusing has two reasons to and the row could not say
+/// which it used -- a check that cannot fail for the reason it names.
+pub fn n4_ce148_serve(ctx: &N4Ctx) -> Check {
+    let ctx = ctx.clone();
+    check("n4_ce148_serve", Severity::Hard, move |_obs| {
+        let control = Control::new(
+            "n4_ce148_not_exercised",
+            "a CE 148 segment request put to the NUT",
+            !ctx.segments_served.is_empty(),
+        );
+        if !control.present() {
+            return vec![control.absent("n4_ce148_not_exercised")];
+        }
+
+        let mut results = Vec::new();
+        for served in &ctx.segments_served {
+            results.push(log::check_detail(
+                "n4_ce148_answered",
+                !served.refused,
+                Severity::Soft,
+                || {
+                    format!(
+                        "the NUT reset the CE 148 stream for segments root {}; a requester \
+                         must fall back to CE 139/140, which `simple.md:660` allows",
+                        short(&served.segments_root)
+                    )
+                },
+            ));
+            if served.refused {
+                continue;
+            }
+
+            // Two messages are owed and neither says how long it is, so a
+            // node that stops after one looks exactly like one that
+            // finished. Counted before anything is read out of them.
+            results.push(log::check_detail(
+                "n4_ce148_reply_complete",
+                served.messages >= 2,
+                Severity::Hard,
+                || {
+                    format!(
+                        "CE 148 for segments root {} sent {} message(s) and owes 2: \
+                         `[Segment]` then `[Import-Proof]`",
+                        short(&served.segments_root),
+                        served.messages
+                    )
+                },
+            ));
+
+            results.push(log::check_detail(
+                "n4_ce148_segments_are_whole",
+                !served.ragged,
+                Severity::Hard,
+                || {
+                    format!(
+                        "CE 148 for segments root {} returned a segment message that is not \
+                         a whole number of segments",
+                        short(&served.segments_root)
+                    )
+                },
+            ));
+            if served.ragged {
+                continue;
+            }
+
+            results.push(log::check_detail(
+                "n4_ce148_one_segment_per_request",
+                served.segments.len() == served.requested.len(),
+                Severity::Hard,
+                || {
+                    format!(
+                        "CE 148 asked for {} segment(s) and {} came back",
+                        served.requested.len(),
+                        served.segments.len()
+                    )
+                },
+            ));
+
+            // One proof per segment *returned*, not per segment asked for:
+            // the two are already compared above, and a node short on both
+            // should fail one row rather than two for the same defect.
+            results.push(log::check_detail(
+                "n4_ce148_one_proof_per_segment",
+                !served.proofs_unreadable && served.proofs.len() == served.segments.len(),
+                Severity::Hard,
+                || {
+                    if served.proofs_unreadable {
+                        format!(
+                            "CE 148 for segments root {} sent a proof message that does not \
+                             read as a run of `len++[Hash]` elements",
+                            short(&served.segments_root)
+                        )
+                    } else {
+                        format!(
+                            "CE 148 returned {} segment(s) and {} proof(s)",
+                            served.segments.len(),
+                            served.proofs.len()
+                        )
+                    }
+                },
+            ));
+
+            // And the proofs have to prove *these* segments under that
+            // root. Everything above is shape; this is the only row that
+            // asks whether the node served the right bytes, and it is the
+            // engine's answer rather than the harness's.
+            let all_verified = !served.proofs_verified.is_empty()
+                && served.proofs_verified.iter().all(|v| *v == Some(true));
+            results.push(log::check_detail(
+                "n4_ce148_proofs_verify",
+                all_verified,
+                Severity::Hard,
+                || {
+                    let bad = served
+                        .proofs_verified
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| **v != Some(true))
+                        .map(|(i, v)| match v {
+                            None => format!(
+                                "{i}: unreadable ({})",
+                                served
+                                    .proof_details
+                                    .get(i)
+                                    .and_then(|d| d.as_deref())
+                                    .unwrap_or("no detail")
+                            ),
+                            Some(_) => format!("{i}: did not verify"),
+                        })
+                        .collect::<Vec<_>>();
+                    format!(
+                        "CE 148 for segments root {}: {}",
+                        short(&served.segments_root),
+                        if bad.is_empty() {
+                            "no proofs at all".to_string()
+                        } else {
+                            bad.join(", ")
+                        }
+                    )
+                },
+            ));
+        }
+        results
+    })
+}
+
 /// CE 141 send: the NUT broadcasts assurances (`simple.md:675-695`).
 pub fn n4_ce141_send(ctx: &N4Ctx) -> Check {
     let ctx = ctx.clone();
@@ -555,6 +774,14 @@ pub fn n4_ce141_send(ctx: &N4Ctx) -> Check {
 
 /// CE 141 receive: the NUT includes valid assurances and leaves out the
 /// rest.
+///
+/// Judged against **one** block, the child of the block each assurance
+/// anchors. An assurances extrinsic is refused unless every assurance in it
+/// anchors the block's parent, so that is the only block the assurance could
+/// ever appear in, and a node that authored no such block owed nothing. An
+/// earlier version asked whether *any* later block carried it, which fails a
+/// conforming node for authoring at a slot that was not the anchor's child
+/// -- most of its slots (findings.md §14).
 pub fn n4_ce141_inclusion(ctx: &N4Ctx) -> Check {
     let ctx = ctx.clone();
     check("n4_ce141_inclusion", Severity::Hard, move |_obs| {
@@ -575,7 +802,7 @@ pub fn n4_ce141_inclusion(ctx: &N4Ctx) -> Check {
                 results.push(
                     Control::new(
                         "n4_ce141_inclusion_not_exercised",
-                        "a NUT block authored after the assurance was offered",
+                        "a NUT block whose parent is the block the assurance anchors",
                         false,
                     )
                     .absent("n4_ce141_inclusion_not_exercised"),
@@ -589,8 +816,8 @@ pub fn n4_ce141_inclusion(ctx: &N4Ctx) -> Check {
                     Severity::Hard,
                     || {
                         format!(
-                            "the NUT authored a block after validator {}'s assurance for \
-                             anchor {} and did not carry it",
+                            "the NUT authored the child of validator {}'s assurance anchor \
+                             {} and did not carry it",
                             offered.validator,
                             short(&offered.anchor)
                         )
@@ -645,6 +872,7 @@ pub fn all(ctx: &N4Ctx) -> Vec<Check> {
         n4_ce137_serve(ctx),
         n4_ce138_serve(ctx),
         n4_ce139_140_serve(ctx),
+        n4_ce148_serve(ctx),
         n4_ce141_send(ctx),
         n4_ce141_inclusion(ctx),
     ]
@@ -1089,6 +1317,131 @@ mod tests {
             out.iter()
                 .any(|(n, o)| n == "n4_ce139_140_one_shard_per_request"
                     && matches!(o, Outcome::Fail(_))),
+            "{out:?}"
+        );
+    }
+
+    fn whole_segments() -> SegmentsServed {
+        SegmentsServed {
+            segments_root: [0x6e; 32],
+            requested: vec![0, 1],
+            segments: vec![vec![0x77; 4], vec![0x88; 4]],
+            proofs: vec![vec![[0x99; 32]], vec![[0xaa; 32]]],
+            proofs_verified: vec![Some(true), Some(true)],
+            proof_details: Vec::new(),
+            ragged: false,
+            proofs_unreadable: false,
+            messages: 2,
+            refused: false,
+        }
+    }
+
+    #[test]
+    fn a_well_served_ce148_passes_every_row() {
+        let ctx = N4Ctx {
+            segments_served: vec![whole_segments()],
+            ..Default::default()
+        };
+        let out = results(n4_ce148_serve(&ctx));
+        assert!(
+            out.iter().all(|(_, o)| *o == Outcome::Pass),
+            "a conforming reply fails nothing: {out:?}"
+        );
+        assert!(
+            names(n4_ce148_serve(&ctx)).contains(&"n4_ce148_proofs_verify".to_string()),
+            "and the row that matters is among them: {out:?}"
+        );
+    }
+
+    /// Declining CE 148 is a choice, not a breach: `simple.md:660` has the
+    /// requester fall back to CE 139/140.
+    #[test]
+    fn a_refused_ce148_is_soft() {
+        let ctx = N4Ctx {
+            segments_served: vec![SegmentsServed {
+                refused: true,
+                ..whole_segments()
+            }],
+            ..Default::default()
+        };
+        let out = results(n4_ce148_serve(&ctx));
+        assert!(
+            out.iter()
+                .any(|(n, o)| n == "n4_ce148_answered" && *o == Outcome::Fail(Severity::Soft)),
+            "{out:?}"
+        );
+        assert_eq!(out.len(), 1, "and nothing else is asked of it: {out:?}");
+    }
+
+    /// A reply that stopped after the segments is short, not proofless: the
+    /// count row names it, and the proof row would otherwise report the same
+    /// defect a second time under a worse description.
+    #[test]
+    fn a_ce148_reply_without_its_proofs_is_short() {
+        let ctx = N4Ctx {
+            segments_served: vec![SegmentsServed {
+                proofs: Vec::new(),
+                proofs_verified: Vec::new(),
+                messages: 1,
+                ..whole_segments()
+            }],
+            ..Default::default()
+        };
+        let out = results(n4_ce148_serve(&ctx));
+        assert!(
+            out.iter()
+                .any(|(n, o)| n == "n4_ce148_reply_complete" && matches!(o, Outcome::Fail(_))),
+            "{out:?}"
+        );
+        assert!(
+            out.iter().any(
+                |(n, o)| n == "n4_ce148_one_proof_per_segment" && matches!(o, Outcome::Fail(_))
+            ),
+            "two segments and no proofs is also a count failure: {out:?}"
+        );
+    }
+
+    /// Ragged segments stop the rows that would count things nobody could
+    /// split, the same way a ragged CE 139/140 reply does.
+    #[test]
+    fn ragged_ce148_segments_stop_the_counting() {
+        let ctx = N4Ctx {
+            segments_served: vec![SegmentsServed {
+                ragged: true,
+                segments: Vec::new(),
+                proofs_verified: Vec::new(),
+                ..whole_segments()
+            }],
+            ..Default::default()
+        };
+        let out = results(n4_ce148_serve(&ctx));
+        assert!(
+            out.iter()
+                .any(|(n, o)| n == "n4_ce148_segments_are_whole" && matches!(o, Outcome::Fail(_))),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|(n, _)| n == "n4_ce148_one_segment_per_request"),
+            "counting segments nobody could split is not a second finding: {out:?}"
+        );
+    }
+
+    /// A reply with no proofs at all must fail the verification row rather
+    /// than pass it vacuously -- the same trap CE 140 had.
+    #[test]
+    fn ce148_without_proofs_fails_rather_than_passing_vacuously() {
+        let ctx = N4Ctx {
+            segments_served: vec![SegmentsServed {
+                proofs_verified: Vec::new(),
+                ..whole_segments()
+            }],
+            ..Default::default()
+        };
+        let out = results(n4_ce148_serve(&ctx));
+        assert!(
+            out.iter()
+                .any(|(n, o)| n == "n4_ce148_proofs_verify" && matches!(o, Outcome::Fail(_))),
             "{out:?}"
         );
     }

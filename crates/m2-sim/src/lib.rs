@@ -30,12 +30,14 @@ use jamnp_s::clock;
 use jamnp_s::codec::ce128_129::{
     BlockRequest, BlockResponse, BoundaryNode, Direction, KeyValue, StateRequest, StateResponse,
 };
-use jamnp_s::codec::ce131_136::{Ticket, TicketDistribution};
+use jamnp_s::codec::ce131_136::{self, Ticket, TicketDistribution};
+use jamnp_s::codec::ce137_148;
+use jamnp_s::codec::ce141_145::Assurance;
 use jamnp_s::codec::up0::{Announcement, Final, Handshake};
 use jamnp_s::endpoint::{EndpointConfig, EndpointError};
 use jamnp_s::framing::{
-    frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE137, CE138, CE139, CE140,
-    CE141, UP,
+    frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE133, CE134, CE137, CE138,
+    CE139, CE140, CE141, CE146, CE148, UP,
 };
 use jamnp_s::transport::{Conn, RecvHalf, SendHalf, Transport};
 use m2_reference::chain::RefChain;
@@ -181,6 +183,20 @@ pub enum SimFault {
     SegmentShardsRagged,
     /// Serve fewer slices than the request asked for.
     SegmentShardsShort,
+    /// Reset every CE 148 segment request.
+    ///
+    /// Not a breach on its own: a requester is meant to fall back to CE
+    /// 139/140 (`simple.md:660`), which is why the row that catches this is
+    /// Soft. It is here so that the row has been seen to move at all.
+    SegmentsRefused,
+    /// Serve CE 148 segments one byte short of a whole number of them.
+    SegmentsRagged,
+    /// Serve fewer whole segments than the request asked for.
+    SegmentsShort,
+    /// Stop a CE 148 reply after the segments, with no proof message.
+    SegmentsReplyShort,
+    /// Serve CE 148 segments with an import proof that does not prove them.
+    SegmentProofBad,
     /// Serve CE 140 slices with justifications that do not prove them.
     SegmentJustificationBad,
     /// Assure a block that was never authored.
@@ -193,6 +209,33 @@ pub enum SimFault {
     AssuranceEmptyCore,
     /// Send the assurance after its slot has begun rather than before it.
     AssuranceLate,
+    /// Reset every CE 133 and CE 146 submission stream.
+    ///
+    /// A guarantor that takes no work at all. The shape of a node that is
+    /// wrong about which core it holds, without posing that as the fault.
+    RefusesPackages,
+    /// Take a work-package over its protocol's size cap.
+    ///
+    /// The rule the cap exists for is that a guarantor must not be made to
+    /// download a huge package before it can check the authorization
+    /// (`simple.md:362-364`, `simple.md:381-384`), so accepting one is the
+    /// whole defect -- the node need do nothing else wrong.
+    AcceptsOversizedPackage,
+    /// Share a taken package with one co-guarantor instead of both.
+    SharesWithOneCoGuarantor,
+    /// Carry an assurance that should have been refused.
+    ///
+    /// About assurances the node *receives*, where the four above are about
+    /// the one it sends. Posed by rewriting the authored body rather than by
+    /// pooling the assurance, because the pool will not take it: an
+    /// assurances extrinsic with a bad signature or a bit for an unengaged
+    /// core makes the block invalid, and the authoring engine refuses to
+    /// produce one. That is the fact underneath the row -- a node that
+    /// includes an invalid assurance authors an invalid block -- so this
+    /// fault fails N1's import rows in company, and the test says so.
+    AssuranceIncludesInvalid,
+    /// Pool nothing, so no assurance a peer sends is ever carried.
+    AssuranceOmitsValid,
 }
 
 /// Application error code the node resets a refused ticket stream with.
@@ -251,6 +294,23 @@ pub struct SimNode {
     /// every availability request the way a real one does when it has no
     /// such root: by refusing.
     available: Mutex<Option<Available>>,
+    /// Validators this node opens CE 134 to when it takes a package.
+    ///
+    /// Injected, like everything else here: which validators hold a core
+    /// with it is a fact about the chain, and a stand-in that worked it out
+    /// would be grading the harness against its own arithmetic.
+    sharing_peers: Mutex<Vec<u16>>,
+    /// Assurances this node checked and refused, kept for the one fault
+    /// that carries them anyway.
+    refused_assurances: Mutex<Vec<jam_std_common::AvailabilityAssurance>>,
+    /// Cores this node believes carry a report pending availability.
+    ///
+    /// Empty unless a test says otherwise, which is the truthful answer for
+    /// a chain nothing has been guaranteed on. An assurance claiming a core
+    /// outside this set is claiming one with nothing on it, and a real node
+    /// refuses it -- so does this one, unless it is posing
+    /// [`SimFault::AssuranceIncludesInvalid`].
+    reported_cores: Mutex<Vec<u16>>,
 }
 
 /// A bundle this node can serve shards of.
@@ -259,6 +319,14 @@ pub struct Available {
     /// How many segments were coded, which is what fixes the slice
     /// boundaries inside each row.
     segment_count: usize,
+    /// The segments themselves, kept whole for CE 148.
+    ///
+    /// CE 139/140 serve erasure-coded *slices* of these and CE 148 serves
+    /// the segments outright, so a node that holds only the coded form can
+    /// answer the first two and not the third.
+    segments: Vec<Vec<u8>>,
+    /// The root those segments sit under, with one import proof each.
+    tree: m2_reference::availability::SegmentTree,
 }
 
 impl SimNode {
@@ -280,7 +348,26 @@ impl SimNode {
             own_blocks: Mutex::new(Vec::new()),
             forwarded: Mutex::new(Vec::new()),
             available: Mutex::new(None),
+            sharing_peers: Mutex::new(Vec::new()),
+            refused_assurances: Mutex::new(Vec::new()),
+            reported_cores: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Say which validators hold a core with this node, so a package it
+    /// takes is shared with them over CE 134.
+    pub fn shares_with(&self, peers: &[u16]) {
+        *self.sharing_peers.lock().expect("sim sharing peers") = peers.to_vec();
+    }
+
+    /// Say which cores this node has a report pending availability on.
+    ///
+    /// What a real node reads out of its own state. Injected here for the
+    /// same reason everything else in this stand-in is: it has no state
+    /// machine, and a value it invented would be this harness agreeing with
+    /// itself.
+    pub fn reports_on_cores(&self, cores: &[u16]) {
+        *self.reported_cores.lock().expect("sim reported cores") = cores.to_vec();
     }
 
     /// Code `bundle` and `segments` into shards this node will serve.
@@ -293,20 +380,28 @@ impl SimNode {
         bundle: Vec<u8>,
         segments: Vec<Vec<u8>>,
         shard_count: u16,
-    ) -> Result<[u8; 32], m2_reference::chain::ChainError> {
+    ) -> Result<([u8; 32], [u8; 32]), m2_reference::chain::ChainError> {
         let segment_count = segments.len();
         let shards = m2_reference::availability::make_available(
             self.chain.oracle(),
             bundle,
-            segments,
+            segments.clone(),
             shard_count,
         )?;
-        let root = shards.erasure_root;
+        // The segments root is a second tree over the same segments, and a
+        // different question from the erasure root: one commits to the
+        // coded shards, the other to the segments themselves. A guarantor
+        // publishes both on its report, and CE 148 asks by the second.
+        let tree =
+            m2_reference::availability::make_segments(self.chain.oracle(), segments.clone())?;
+        let roots = (shards.erasure_root, tree.segments_root);
         *self.available.lock().expect("sim available") = Some(Available {
             shards,
             segment_count,
+            segments,
+            tree,
         });
-        Ok(root)
+        Ok(roots)
     }
 
     /// Announce a block this node authored, and keep it to serve.
@@ -424,6 +519,9 @@ impl SimNode {
     /// Only the body: the header is left as authored, so the block keeps the
     /// hash it was announced under and the harness can still fetch it.
     fn rewrite_body(&self, block: Block) -> Block {
+        if self.fault == SimFault::AssuranceIncludesInvalid {
+            return self.carry_refused_assurances(block);
+        }
         let tail = block.header.slot % jam_types::epoch_period() >= jam_types::epoch_tail_start();
         let seed = match self.fault {
             SimFault::ServesDuplicateTicket if !tail => block.extrinsic.tickets.first().cloned(),
@@ -446,6 +544,47 @@ impl SimNode {
         };
         for _ in 0..repeats {
             if extrinsic.tickets.try_push(ticket.clone()).is_err() {
+                break;
+            }
+        }
+        let mut block = block;
+        block.extrinsic = Arc::new(extrinsic);
+        block
+    }
+
+    /// Add the refused assurances this block's parent was assured by.
+    ///
+    /// Only the ones anchored at the parent. An assurance naming any other
+    /// block cannot be carried here at all -- the on-chain rule refuses an
+    /// assurances extrinsic whose anchor is not the block's parent -- so the
+    /// wrong-anchor fault stays out even on a node checking nothing, and it
+    /// is the other two that make the row fail.
+    fn carry_refused_assurances(&self, block: Block) -> Block {
+        let parent = block.header.parent;
+        let refused: Vec<jam_std_common::AvailabilityAssurance> = self
+            .refused_assurances
+            .lock()
+            .expect("sim refused assurances")
+            .iter()
+            .filter(|a| a.statement.anchor == parent)
+            .cloned()
+            .collect();
+        if refused.is_empty() {
+            return block;
+        }
+        let mut extrinsic = (*block.extrinsic).clone();
+        for assurance in refused {
+            // Sorted by validator index, which is what the extrinsic's own
+            // rule asks for. A node this careless about the assurances would
+            // plausibly be careless about the order too, but an unsorted
+            // extrinsic is a *second* defect and the row would no longer say
+            // which one it caught.
+            let at = extrinsic
+                .assurances
+                .iter()
+                .position(|a| a.signature.val_index > assurance.signature.val_index)
+                .unwrap_or(extrinsic.assurances.len());
+            if extrinsic.assurances.try_insert(at, assurance).is_err() {
                 break;
             }
         }
@@ -478,7 +617,7 @@ impl SimNode {
                 // Serve it too: the peer sends tickets on whichever
                 // connection it has, so a node that served only inbound ones
                 // silently ignores every ticket proxied over an outbound.
-                tokio::spawn(Arc::clone(self).serve_connection(conn));
+                tokio::spawn(Arc::clone(self).serve_connection(conn, Some(*index)));
             }
         }
     }
@@ -679,23 +818,29 @@ impl SimNode {
                     continue;
                 };
                 let node = Arc::clone(&node);
-                tokio::spawn(node.serve_connection(connection));
+                tokio::spawn(node.serve_connection(connection, None));
             }
         });
         Ok((bound, task))
     }
 
     /// One task per stream, for as long as the peer keeps the connection.
-    async fn serve_connection(self: Arc<Self>, connection: Conn) {
+    ///
+    /// `peer` is which validator is on the other end, where this node knows:
+    /// it dialled them, so it chose the index. On a connection it accepted
+    /// it is `None`, because this transport carries no peer identity and
+    /// guessing one would file an assurance under a validator that never
+    /// sent it.
+    async fn serve_connection(self: Arc<Self>, connection: Conn, peer: Option<u16>) {
         while let Ok((send, recv)) = connection.accept_bi().await {
             let node = Arc::clone(&self);
-            tokio::spawn(node.serve_stream(send, recv));
+            tokio::spawn(node.serve_stream(send, recv, peer));
         }
     }
 
     /// Dispatch one accepted stream on the kind byte its opening frame
     /// carries (`simple.md:122-124`).
-    async fn serve_stream(self: Arc<Self>, mut send: SendHalf, recv: RecvHalf) {
+    async fn serve_stream(self: Arc<Self>, mut send: SendHalf, recv: RecvHalf, peer: Option<u16>) {
         let mut reader = StreamReader::new(recv);
         let Some((kind, content)) = reader.next().await else {
             return;
@@ -707,9 +852,257 @@ impl SimNode {
             CE131 | CE132 => self.receive_ticket(&mut send, kind, &content).await,
             CE137 | CE138 => self.serve_bundle_shard(&mut send, kind, &content).await,
             CE139 | CE140 => self.serve_segment_shards(&mut send, kind, &content).await,
+            CE148 => self.serve_segments(&mut send, &content).await,
+            CE133 | CE146 => {
+                self.receive_package(&mut send, kind, &mut reader, &content)
+                    .await
+            }
+            CE141 => self.receive_assurance(&content, peer).await,
             // A real node resets an unserved kind; this one is not graded on
             // that, so it drops the stream.
             _ => {}
+        }
+    }
+
+    /// Receive a work-package submission over CE 133 or CE 146
+    /// (`simple.md:351-376`, `simple.md:378-404`).
+    ///
+    /// Two messages on CE 133, five on CE 146, then the node either FINs to
+    /// take the package or resets to refuse it. The one rule applied here is
+    /// the size cap, because it is the one a guarantor must apply *before*
+    /// reading the rest -- that is what the message split is for.
+    ///
+    /// Where the cap falls is the whole difference between the protocols:
+    /// CE 133 carries the core index with the package and caps the pair,
+    /// CE 146 gives the package a message of its own and caps it alone. A
+    /// node reading either as one value gets both wrong.
+    async fn receive_package(
+        &self,
+        send: &mut SendHalf,
+        kind: u8,
+        reader: &mut StreamReader,
+        first: &[u8],
+    ) {
+        // The rest of the stream is read even when the package will be
+        // refused: a node that resets without draining looks, to a sender
+        // mid-write, exactly like one whose connection died.
+        let owed = if kind == CE146 { 5 } else { 2 };
+        let mut messages = vec![first.to_vec()];
+        while messages.len() < owed {
+            let Some((_, content)) = reader.next().await else {
+                break;
+            };
+            messages.push(content);
+        }
+
+        let over_cap = if kind == CE146 {
+            // Message 2 is the work-package and nothing else.
+            messages
+                .get(1)
+                .is_some_and(|package| package.len() > ce137_148::WORK_PACKAGE_MAX)
+        } else {
+            first.len() > ce131_136::WORK_PACKAGE_INITIAL_MAX as usize
+        };
+        let refuse = self.fault == SimFault::RefusesPackages
+            || (over_cap && self.fault != SimFault::AcceptsOversizedPackage);
+        if refuse {
+            send.reset(NO_DATA_CODE);
+            return;
+        }
+        send.finish();
+        self.share_package().await;
+    }
+
+    /// Open CE 134 to the co-guarantors, as a guarantor does once it has
+    /// taken a package (`simple.md:406-458`).
+    ///
+    /// The mappings are empty, which is the truthful answer for a package
+    /// that imports no segments: they map the *import* list to the roots it
+    /// comes from. The harness's lane grades the mapping row only where a
+    /// node sent mappings at all, for the same reason.
+    async fn share_package(&self) {
+        let mut peers: Vec<u16> = self
+            .sharing_peers
+            .lock()
+            .expect("sim sharing peers")
+            .clone();
+        if self.fault == SimFault::SharesWithOneCoGuarantor {
+            peers.truncate(1);
+        }
+        let context = ce131_136::SharingContext {
+            core_index: 0,
+            shard_count: jam_types::max_val_count(),
+            mappings: Vec::new(),
+        };
+        let first = frame(CE134, &context.encode());
+        let second = frame_message(
+            &ce131_136::SharingBundle {
+                bundle: vec![0xab; 32],
+            }
+            .encode(),
+        );
+        let connections: Vec<Conn> = {
+            let held = self.peers.lock().expect("sim peers");
+            peers
+                .iter()
+                .filter_map(|want| {
+                    held.iter()
+                        .find(|(index, _)| index == want)
+                        .map(|(_, conn)| conn.clone())
+                })
+                .collect()
+        };
+        for conn in connections {
+            let Ok((mut send, _recv)) = conn.open_bi().await else {
+                continue;
+            };
+            if send.write_all(&first).await.is_ok() && send.write_all(&second).await.is_ok() {
+                send.finish();
+            }
+        }
+    }
+
+    /// Receive a CE 141 assurance: check it, and pool it if it holds up.
+    ///
+    /// The whole of what `n4_ce141_inclusion` grades happens here and in the
+    /// block the node goes on to author. A node carries the valid assurances
+    /// its peers sent it and leaves the rest out, so the two rows are one
+    /// decision seen from the block: whether these bytes reached the pool.
+    ///
+    /// The check is the harness's own [`m2_reference::assurance`], which is
+    /// what a stand-in is for -- the independence that matters is between
+    /// the node and the *grading*, and the grading reads the block. What
+    /// makes the rows provable is that the two faults move this decision
+    /// without touching anything else.
+    async fn receive_assurance(&self, content: &[u8], peer: Option<u16>) {
+        // Nobody to attribute it to. A real node reads the index off the
+        // connection's certificate; this one knows only the peers it dialled.
+        let Some(peer) = peer else { return };
+        let Ok(assurance) = Assurance::decode(&mut &content[..]) else {
+            return;
+        };
+        if self.fault == SimFault::AssuranceOmitsValid {
+            return;
+        }
+        let received = m2_reference::assurance::as_received(&assurance, peer);
+        if self.assurance_holds(&assurance, peer) {
+            let _ = self.chain.submit_assurances(&[received]);
+            return;
+        }
+        // Refused, and remembered only by the node that carries what it
+        // refused. The pool is not where that fault can be posed: an
+        // assurance it should have turned away is one the block would be
+        // invalid for carrying, and the engine will not author such a block.
+        if self.fault == SimFault::AssuranceIncludesInvalid {
+            self.refused_assurances
+                .lock()
+                .expect("sim refused assurances")
+                .push(received);
+        }
+    }
+
+    /// Everything a node checks before pooling an assurance.
+    ///
+    /// Three questions, and the lane grades the answers separately because a
+    /// node that gets one wrong is not the same node as one that gets
+    /// another wrong (`simple.md:675-695`): is it shaped right and signed by
+    /// the validator it came from, does it name a block this node has, and
+    /// does every core it claims carry a report.
+    fn assurance_holds(&self, assurance: &Assurance, peer: u16) -> bool {
+        // Asked of the chain rather than remembered: the anchor must be a
+        // block this node has, and the chain is the only thing that knows
+        // which those are.
+        let anchor = assurance.anchor.0;
+        if !matches!(self.chain.storage_root(&anchor), Ok(Some(_))) {
+            return false;
+        }
+        if m2_reference::assurance::check_assurance(assurance, peer, &[anchor]).is_err() {
+            return false;
+        }
+        let reported = self.reported_cores.lock().expect("sim reported cores");
+        m2_reference::assurance::assured_cores(assurance)
+            .iter()
+            .all(|core| reported.contains(core))
+    }
+
+    /// Serve CE 148: the whole segments asked for, then one import proof
+    /// each (`simple.md:650-673`).
+    ///
+    /// Two messages, and neither says how long it is -- the frame does. The
+    /// segments go out concatenated because every one is `SEGMENT_LEN`
+    /// bytes, and the proofs run back to back because each carries its own
+    /// count.
+    ///
+    /// Matched by root, not merely answered: a guarantor serves the
+    /// segments of bundles it holds, and one asked for a root it never
+    /// exported says so by resetting, the same as for an unknown erasure
+    /// root.
+    async fn serve_segments(&self, send: &mut SendHalf, content: &[u8]) {
+        if self.fault == SimFault::SegmentsRefused {
+            send.reset(NO_DATA_CODE);
+            return;
+        }
+        let Ok(request) = ce137_148::SegmentRequest::decode(&mut &content[..]) else {
+            return;
+        };
+        // Everything out of the lock before the first await: a guard held
+        // across one makes the task unsendable.
+        let reply = {
+            let held = self.available.lock().expect("sim available");
+            let Some(held) = held.as_ref() else {
+                send.reset(NO_DATA_CODE);
+                return;
+            };
+            if held.tree.segments_root != request.segments_root {
+                send.reset(NO_DATA_CODE);
+                return;
+            }
+            let mut indices = request.segment_indices.clone();
+            if self.fault == SimFault::SegmentsShort {
+                indices.pop();
+            }
+            let mut segments = Vec::with_capacity(indices.len());
+            let mut proofs = Vec::with_capacity(indices.len());
+            for index in &indices {
+                let Some(segment) = held.segments.get(*index as usize) else {
+                    send.reset(NO_DATA_CODE);
+                    return;
+                };
+                segments.push(segment.clone());
+                proofs.push(held.tree.proofs[*index as usize].clone());
+            }
+            if self.fault == SimFault::SegmentProofBad {
+                // One hash of one proof, so the message still reads as a
+                // run of proofs and only the walk fails. Altering the count
+                // instead would make this a structure defect, which is a
+                // different row.
+                if let Some(first) = proofs.first_mut().and_then(|p| p.first_mut()) {
+                    first[0] ^= 0xff;
+                }
+            }
+            ce137_148::SegmentResponse {
+                segments,
+                import_proofs: proofs,
+            }
+        };
+
+        let mut data = reply.encode_segments();
+        if self.fault == SimFault::SegmentsRagged {
+            data.pop();
+        }
+        if send.write_all(&frame_message(&data)).await.is_err() {
+            return;
+        }
+        if self.fault == SimFault::SegmentsReplyShort {
+            // The segments and nothing else. Nothing in the first message
+            // says a second is coming, so this looks exactly like a reply
+            // that finished -- which is why the lane counts messages.
+            send.finish();
+            return;
+        }
+        let proofs = reply.encode_import_proofs();
+        if send.write_all(&frame_message(&proofs)).await.is_ok() {
+            send.finish();
         }
     }
 

@@ -594,14 +594,22 @@ those the assertion is "not included" alone.
 | Check | Assertions | Faults |
 |---|---|---|
 | CE 133 `:351-376` (builder → NUT in NUT's rotation) | NUT FINs, opens CE 134 to both co-guarantors within ~3 s | first message > 2+200·1024 bytes → reset `:362-364`; NUT not guarantor of the core → ignore; unauthorized package → no sharing; extrinsic size mismatch → reset |
-| CE 146 `:378-404` | as 133; no CE 139/140/148 for supplied segments | bad import proof → refuse; package > 200·1024 → reset |
+| CE 146 `:378-404` | as 133, under row names of its own; the cap is on the **work-package message alone**, not on it plus the core index as CE 133's is | package > 200·1024 → reset. *(The bad-import-proof fault is not posed: this run's package imports no segments, so it carries no proof to spoil.)* |
 | CE 134 send `:406-458` | message 1 `Core ++ ShardCount(6) ++ len++[WPHash ++ SegRoot]`; message 2 bundle byte-identical to reference `:421-425`; shard count valid `:433-437` | co-guarantor replies wrong hash → its signature excluded; reset → proceed with the other |
 | CE 134 receive | NUT replies `WRHash ++ sig($jam_guarantee ++ blake(E(report)))`; hash equals reference (NUT refines) | shard count 5 or 7 → reject; bad mappings → refuse or trust `:443-445`; invalid authorization → reset |
 | CE 135 send `:460-485` | `Report ++ Slot ++ len++[(Idx,Sig)]`, 2–3 signatures sorted and valid; report equals reference; to all current validators, in the last rotation also to the next set `:469-471`; ~2 s wait for the third `:465-467` | — |
 | CE 135 receive → inclusion | NUT includes reference-signed reports in its next block | one signature; unassigned signer; stale slot; duplicate core → excluded |
-| CE 148 `:650-673` | serves `[Segment] ++ [Import-Proof]` for own bundles; prefers 148 over 139/140 *(soft)*; ≤3072 per stream | corrupt segment → fallback to 139/140 `:660` |
+| CE 148 `:650-673` | **graded in N4, not here** — see below |
 
-### N4 — availability, CE 137/138/139/140/141 (2 epochs)
+CE 148 moved to N4. The grouping above is by *purpose* — CE 148 completes a
+bundle — but what decides which lane can ask the question is the plan. The
+request names a segments root, and the only root the node is obliged to
+serve is one it exported itself, which exists only once it has guaranteed a
+package and published a report. That is the same report and the same mid-run
+plan N4 already waits for (`findings.md` §12), so asking from N3 would mean
+building it twice.
+
+### N4 — availability, CE 137/138/139/140/141/148 (2 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
@@ -612,6 +620,7 @@ those the assertion is "not included" alone.
 | CE 138 serve `:558-580` | bundle shard + justification with segment-shard root `:566-568` | unknown → reset |
 | CE 139/140 serve `:597-648` | 139 `[SegShard]`; 140 adds justification discriminator 0/1/2 `:637`; ≤2·3072 | over limit → reset |
 | CE 139/140 fetch | NUT reconstructs imports from **3** shards; 139 first, 140 on inconsistency `:625-630` | one corrupt shard → retries via 140 and completes |
+| CE 148 serve `:650-673` | two messages: `[Segment]` then `[Import-Proof]`, one segment per index asked for and one proof each, every proof walking to the segments root | refuse *(soft: `:660` lets a requester fall back to 139/140)*; ragged segments; short reply; a proof that does not verify |
 
 ### N5 — auditing and disputes, CE 136/144/145/147 (2–3 epochs)
 

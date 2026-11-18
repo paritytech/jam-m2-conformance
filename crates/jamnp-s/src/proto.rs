@@ -78,7 +78,16 @@ pub enum Message {
     Ce147Request(ce137_148::BundleRequest),
     Ce147Response(ce137_148::BundleResponse),
     Ce148Request(ce137_148::SegmentRequest),
-    Ce148Response(ce137_148::SegmentResponse),
+    /// CE 148 response, message 1 (`simple.md:670`): the segments, as they
+    /// came.
+    ///
+    /// Opaque, because this message carries no boundaries of its own. How
+    /// long a segment is comes from the protocol parameters, not from these
+    /// bytes, and a decoder that guessed would be inventing the one thing
+    /// the wire does not say.
+    Ce148Segments(Vec<u8>),
+    /// CE 148 response, message 2 (`simple.md:671`): one proof per segment.
+    Ce148ImportProofs(Vec<ce137_148::ImportProof>),
 }
 
 impl Message {
@@ -113,7 +122,9 @@ impl Message {
             Message::Ce145Judgment(_) => CE145,
             Message::Ce146Submission(_) => CE146,
             Message::Ce147Request(_) | Message::Ce147Response(_) => CE147,
-            Message::Ce148Request(_) | Message::Ce148Response(_) => CE148,
+            Message::Ce148Request(_)
+            | Message::Ce148Segments(_)
+            | Message::Ce148ImportProofs(_) => CE148,
         }
     }
 }
@@ -149,11 +160,20 @@ pub fn encode_message(msg: &Message) -> Result<(u8, Vec<u8>), ProtoError> {
         Message::Ce143Reply(m) => m.encode(),
         Message::Ce144Announce(m) => m.encode(),
         Message::Ce145Judgment(m) => m.encode(),
-        Message::Ce146Submission(m) => m.encode(),
+        // Message 1 only, as CE 133's arm does: the rest of a CE 146
+        // bundle is four further messages, and this layer carries one.
+        Message::Ce146Submission(m) => m.encode_initial(),
         Message::Ce147Request(m) => m.encode(),
         Message::Ce147Response(m) => m.encode(),
         Message::Ce148Request(m) => m.encode(),
-        Message::Ce148Response(m) => m.encode(),
+        Message::Ce148Segments(bytes) => bytes.clone(),
+        Message::Ce148ImportProofs(proofs) => {
+            let response = ce137_148::SegmentResponse {
+                segments: Vec::new(),
+                import_proofs: proofs.clone(),
+            };
+            response.encode_import_proofs()
+        }
     };
     Ok((msg.kind(), payload))
 }
@@ -202,9 +222,34 @@ pub fn from_kind_and_payload(kind: u8, payload: &[u8]) -> Result<Message, ProtoE
             decode_full::<ce141_145::AuditAnnouncementMsg>(payload).map(Ce144Announce)
         }
         framing::CE145 => decode_full::<ce141_145::Judgment>(payload).map(Ce145Judgment),
-        framing::CE146 => decode_full::<ce137_148::BundleSubmission>(payload).map(Ce146Submission),
+        framing::CE146 => {
+            let mut input: &[u8] = payload;
+            ce137_148::BundleSubmission::decode_initial(&mut input)
+                .map(|(core_index, mappings)| {
+                    Ce146Submission(ce137_148::BundleSubmission {
+                        core_index,
+                        mappings,
+                        work_package: Vec::new(),
+                        extrinsics: Vec::new(),
+                        segments: Vec::new(),
+                        import_proofs: Vec::new(),
+                    })
+                })
+                .map_err(|e| ProtoError::Decode(e.to_string()))
+        }
         framing::CE147 => decode_pair(payload, Ce147Request, Ce147Response),
-        framing::CE148 => decode_pair(payload, Ce148Request, Ce148Response),
+        framing::CE148 => match decode_full::<ce137_148::SegmentRequest>(payload) {
+            Ok(request) => Ok(Ce148Request(request)),
+            // The two response messages are both size-implied, so which one
+            // a payload is depends on its position on the stream. The proofs
+            // are self-delimiting and the segments are not, so a payload
+            // that reads cleanly as a run of proofs is taken for one -- and
+            // an empty payload, which is both, is read as the first message.
+            Err(_) => match ce137_148::SegmentResponse::decode_import_proofs(payload) {
+                Ok(proofs) if !payload.is_empty() => Ok(Ce148ImportProofs(proofs)),
+                _ => Ok(Ce148Segments(payload.to_vec())),
+            },
+        },
         // CE 130 (reserved) and GRANDPA 149..=152 are spec-known but refused.
         130 | 149..=152 => Err(ProtoError::RefusedKind(kind)),
         _ => Err(ProtoError::UnknownKind(kind)),
@@ -285,8 +330,8 @@ mod tests {
         },
         ce137_148::{
             AuditShardResponse, BundleRequest, BundleResponse, BundleSubmission, Justification,
-            ProvenSegmentShardsResponse, SegmentJustification, SegmentRequest, SegmentResponse,
-            SegmentShardRequest, SegmentShardsResponse, ShardRequest, ShardResponse,
+            ProvenSegmentShardsResponse, SegmentJustification, SegmentRequest, SegmentShardRequest,
+            SegmentShardsResponse, ShardRequest, ShardResponse,
         },
         ce141_145::{
             Announcement as AuditAnnouncement, Assurance, AuditAnnouncementMsg, Judgment,
@@ -493,7 +538,7 @@ mod tests {
                 work_package: vec![],
                 extrinsics: vec![],
                 segments: vec![],
-                import_proof: vec![],
+                import_proofs: vec![],
             }),
             Ce147Request(BundleRequest {
                 erasure_root: [0x13; 32],
@@ -505,10 +550,7 @@ mod tests {
                 segments_root: [0x21; 32],
                 segment_indices: vec![0x0001],
             }),
-            Ce148Response(SegmentResponse {
-                segments: vec![vec![0xaa]],
-                import_proof: vec![[0x11; 32]],
-            }),
+            Ce148ImportProofs(vec![vec![[0x11; 32]]]),
         ]
     }
 
@@ -713,7 +755,7 @@ mod tests {
                     work_package: vec![],
                     extrinsics: vec![],
                     segments: vec![],
-                    import_proof: vec![],
+                    import_proofs: vec![],
                 }),
                 146,
             ),
@@ -721,13 +763,7 @@ mod tests {
                 Message::Ce147Response(BundleResponse { bundle: vec![] }),
                 147,
             ),
-            (
-                Message::Ce148Response(SegmentResponse {
-                    segments: vec![],
-                    import_proof: vec![],
-                }),
-                148,
-            ),
+            (Message::Ce148Segments(vec![]), 148),
         ];
         for (msg, expected) in cases {
             assert_eq!(msg.kind(), expected, "kind mismatch");

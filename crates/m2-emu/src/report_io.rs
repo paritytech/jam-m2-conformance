@@ -14,7 +14,8 @@ use jamnp_s::{
     codec::ce131_136::{
         GuaranteedWorkReport, SharingBundle, SharingContext, SharingReply, WorkPackageSubmission,
     },
-    framing::{frame, frame_message, CE133, CE134, CE135},
+    codec::ce137_148::BundleSubmission,
+    framing::{frame, frame_message, CE133, CE134, CE135, CE146},
     trace::{wall_ts, Direction as TraceDir, Trace},
     transport::{Conn, ReadError, SendHalf},
 };
@@ -24,7 +25,7 @@ use m2_scenario::scenarios::n3::{
     DistributedReport, ReportSeen, SharedToNut, SharingSeen, SubmittedPackage,
 };
 use m2_scenario::scenarios::obs::{
-    EMU_ANSWERED_134, EMU_SENT_133, EMU_SENT_134, EMU_SENT_135, NUT_ANSWERED_134,
+    EMU_ANSWERED_134, EMU_SENT_133, EMU_SENT_134, EMU_SENT_135, EMU_SENT_146, NUT_ANSWERED_134,
     NUT_SENT_BAD_REPORT, NUT_SENT_BAD_SHARING, PACKAGE_REFUSED,
 };
 
@@ -147,14 +148,21 @@ pub fn handle_inbound_report(
     });
 }
 
-/// Submit `plan`'s work package to the NUT over CE 133, as a builder
-/// (`simple.md:351-376`).
+/// Submit `plan`'s work package to the NUT over CE 133 or CE 146, as a
+/// builder (`simple.md:351-376`, `simple.md:378-404`).
 ///
-/// Two messages on one stream, then FIN: `Core Index ++ Work-Package`, then
-/// the extrinsic bodies concatenated. The node answers with its own FIN to
-/// accept, or resets the stream to refuse, and the refusal is recorded
-/// against this submission rather than into the log alone -- a reset carries
-/// no reason, so only the sender knows which package was refused.
+/// CE 133 is two messages on one stream, then FIN: `Core Index ++
+/// Work-Package`, then the extrinsic bodies concatenated. CE 146 is the
+/// whole-bundle form and takes five: `Core Index ++ Segments-Root
+/// Mappings`, the work-package on its own, then the extrinsics, the
+/// imported segments and their import proofs. The split exists so a
+/// guarantor can authorize the package before downloading the rest, which
+/// is also why only the package message carries the size cap.
+///
+/// Either way the node answers with its own FIN to accept, or resets the
+/// stream to refuse, and the refusal is recorded against this submission
+/// rather than into the log alone -- a reset carries no reason, so only the
+/// sender knows which package was refused.
 ///
 /// The submission goes out at the start of its slot rather than ahead of it,
 /// which is the opposite of a ticket. A ticket has to be in the node's hands
@@ -174,33 +182,80 @@ pub async fn spawn_package_sender(
     let Ok((mut send, mut recv)) = connection.open_bi().await else {
         return;
     };
-    let submission = WorkPackageSubmission {
-        core_index: plan.core,
-        work_package: plan.package.clone(),
-        extrinsics: plan.extrinsics.clone(),
+    let kind = if plan.protocol == u16::from(CE146) {
+        CE146
+    } else {
+        CE133
     };
-
-    let first = frame(CE133, &submission.encode_initial());
     // The extrinsic-mismatch fault lives here and nowhere else: the package
     // is well-formed and only the bytes that follow it are wrong. One byte
     // too many makes the message size differ from the sum of the lengths the
-    // package declares, which is the rule `simple.md:373` states.
-    let mut bodies = submission.encode_extrinsics();
+    // package declares, which is the rule `simple.md:373` states, and which
+    // CE 146 states again at `simple.md:399`.
+    let mut bodies = plan.extrinsics.concat();
     if plan.fault == Some(SubmissionFault::ExtrinsicSizeMismatch) {
         bodies.push(0xff);
     }
-    let second = frame_message(&bodies);
-    crate::emu::trace_record(peer, CE133, send.id(), &first, &trace, TraceDir::Rx);
-    crate::emu::trace_record(peer, CE133, send.id(), &second, &trace, TraceDir::Rx);
-    record(&obs, peer, ObsKind::Other(EMU_SENT_133));
-    if send.write_all(&first).await.is_err() || send.write_all(&second).await.is_err() {
-        return;
+    let messages: Vec<Vec<u8>> = if kind == CE146 {
+        let bundle = BundleSubmission {
+            core_index: plan.core,
+            mappings: plan.mappings.clone(),
+            work_package: plan.package.clone(),
+            extrinsics: plan.extrinsics.clone(),
+            segments: plan.segments.clone(),
+            import_proofs: plan.import_proofs.clone(),
+        };
+        vec![
+            bundle.encode_initial(),
+            // The package alone, with no length of its own: the frame is
+            // what says how long it is.
+            bundle.work_package.clone(),
+            bodies,
+            bundle.encode_segments(),
+            bundle.encode_import_proofs(),
+        ]
+    } else {
+        let submission = WorkPackageSubmission {
+            core_index: plan.core,
+            work_package: plan.package.clone(),
+            extrinsics: plan.extrinsics.clone(),
+        };
+        vec![submission.encode_initial(), bodies]
+    };
+
+    // The first message carries the stream kind; the rest are bare framed
+    // messages on the stream it opened.
+    let mut wire: Vec<Vec<u8>> = Vec::with_capacity(messages.len());
+    for (i, body) in messages.iter().enumerate() {
+        wire.push(if i == 0 {
+            frame(kind, body)
+        } else {
+            frame_message(body)
+        });
+    }
+    for bytes in &wire {
+        crate::emu::trace_record(peer, kind, send.id(), bytes, &trace, TraceDir::Rx);
+    }
+    record(
+        &obs,
+        peer,
+        ObsKind::Other(if kind == CE146 {
+            EMU_SENT_146
+        } else {
+            EMU_SENT_133
+        }),
+    );
+    for bytes in &wire {
+        if send.write_all(bytes).await.is_err() {
+            return;
+        }
     }
 
     let index = {
         let mut recorded = crate::emu::lock(&submissions);
         recorded.push(SubmittedPackage {
             peer,
+            protocol: plan.protocol,
             core: plan.core,
             slot: plan.slot,
             package_hash: plan.package_hash,
@@ -271,7 +326,17 @@ pub async fn spawn_report_sender(
         slot,
     ) {
         Ok(Some(plan)) => plan,
-        Ok(None) => return,
+        // Said rather than returned silently, the same as the arm below. A
+        // report that could not be composed leaves the CE 135 rows with
+        // nothing to grade, and a reader has no way to tell that from a node
+        // that ignored a report it was sent.
+        Ok(None) => {
+            eprintln!(
+                "[distributor] no report to distribute in slot {slot}: the NUT holds no core \
+                 there in the epoch view, or there is only one core"
+            );
+            return;
+        }
         Err(e) => {
             eprintln!("[distributor] could not compose the report: {e}");
             return;

@@ -30,7 +30,7 @@ use codec::{Decode, Encode};
 /// Bumped whenever a message changes shape. The client refuses a mismatch
 /// rather than guessing, because a silently misread response is a wrong
 /// conformance verdict rather than an error.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Largest frame either side will read, matching the fuzz protocol's.
 pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
@@ -475,6 +475,63 @@ pub enum Message {
         segment_justifications: Vec<Vec<Vec<u8>>>,
     } = 55,
 
+    /// Put assurances into the session's pool, as a validator does with
+    /// the ones its peers send it over CE 141.
+    ///
+    /// The counterpart of [`Message::SubmitTickets`], and the half of the
+    /// assurance story that was unreachable until `submit_assurance` was
+    /// exported: the engine could always sign its own assurance, and a
+    /// harness could never hand it one. A node's assurances extrinsic
+    /// carries what its *peers* sent it, so without this no simulated node
+    /// can be shown to include a valid assurance or leave an invalid one
+    /// out (findings.md §14).
+    ///
+    /// Taken as already verified, which is what the engine's entry point
+    /// expects: the validator index is read off the connection and the
+    /// signature checked before this point. Sending an assurance the caller
+    /// has not checked is how a simulated node poses the fault of including
+    /// one it should have refused.
+    SubmitAssurances {
+        session: SessionId,
+        /// Encoded `AvailabilityAssurance`s.
+        assurances: Vec<Vec<u8>>,
+    } = 56,
+
+    /// Build the segments root and per-segment import proofs a guarantor
+    /// serves over CE 148.
+    ///
+    /// Session-free, like the coding messages: a root is a function of the
+    /// bytes. Here rather than in the harness because the tree is the
+    /// engine's -- the leaves are hashed one way, the nodes another, and a
+    /// harness carrying its own copy of that would be grading a node against
+    /// a second Merkle implementation. The builders happen to be public in
+    /// `jam-std-common`; the checker is not, which is the asymmetry that
+    /// made CE 148 ungradeable until `cd_proof_root_ph` was exported.
+    MakeSegments {
+        /// Exported segments, `SEGMENT_LEN` bytes each.
+        segments: Vec<Vec<u8>>,
+    } = 57,
+    /// The root those segments sit under, and one proof per segment.
+    SegmentProofs {
+        segments_root: [u8; 32],
+        /// Per segment, in segment order: the co-path from its leaf to the
+        /// root, which is what `Import-Proof = len++[Hash]` carries.
+        proofs: Vec<Vec<[u8; 32]>>,
+    } = 58,
+
+    /// Check a CE 148 import proof the way a requester checks one it was
+    /// served, answered with `ShardChecked`.
+    ///
+    /// The segment travels whole rather than hashed: the leaf hashing is
+    /// part of the rule, and a caller that did it here could get it wrong in
+    /// a way nothing downstream would catch.
+    CheckImportProof {
+        segments_root: [u8; 32],
+        segment_index: u16,
+        segment: Vec<u8>,
+        proof: Vec<[u8; 32]>,
+    } = 59,
+
     /// Build a package, optionally against an authorizer no core accepts.
     BuildPackage {
         session: SessionId,
@@ -714,6 +771,23 @@ mod tests {
             Message::SubmitTickets {
                 session: 1,
                 envelopes: vec![vec![0x08; 16]],
+            },
+            Message::SubmitAssurances {
+                session: 1,
+                assurances: vec![vec![0x5b; 100], vec![0x5c; 100]],
+            },
+            Message::MakeSegments {
+                segments: vec![vec![0x60; 8], vec![0x61; 8]],
+            },
+            Message::SegmentProofs {
+                segments_root: [0x62; 32],
+                proofs: vec![vec![[0x63; 32]], vec![[0x64; 32], [0x65; 32]]],
+            },
+            Message::CheckImportProof {
+                segments_root: [0x66; 32],
+                segment_index: 1,
+                segment: vec![0x67; 16],
+                proof: vec![[0x68; 32]],
             },
             Message::Done,
             Message::ImportInto {

@@ -375,7 +375,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     // The harness also shares a bundle *to* the node, so
                     // the node does the refining for once. A rotation after
                     // the last submission, so the two never contend.
-                    let share_base = honest_slot + SUBMISSION_SPACING_SLOTS * 6;
+                    let share_base =
+                        honest_slot + SUBMISSION_SPACING_SLOTS * (plan.len() as u32 + 1);
                     let mut shares = Vec::new();
                     for (i, fault) in [
                         None,
@@ -387,7 +388,17 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         let slot = share_base + SUBMISSION_SPACING_SLOTS * i as u32;
                         match ref_chain.share_to_nut(nut_index as u16, slot, fault) {
                             Ok(Some(share)) => shares.push(share),
-                            Ok(None) => {}
+                            // Said rather than dropped, the same as the
+                            // sibling above. A run where no share could be
+                            // planned grades the CE 134 receive rules as
+                            // unexercised, and a reader looking at a report
+                            // with nothing in those rows needs to know the
+                            // harness never asked -- not be left to guess
+                            // whether the node stayed silent.
+                            Ok(None) => eprintln!(
+                                "[assignment] no bundle to share at slot {slot}: the NUT holds \
+                                 no core there in the epoch view"
+                            ),
                             Err(e) => conn_findings.push(no_package_plan_finding(&e)),
                         }
                     }
@@ -423,6 +434,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         let ce129_probes = emu.ce129_probes();
         let shards_served = emu.shards_served();
         let segment_shards_served = emu.segment_shards_served();
+        let segments_served = emu.segments_served();
         let assurances_seen = emu.assurances_seen();
         let assurances_offered = emu.assurances_offered();
         let avail_shard_count = Arc::new(Mutex::new(None));
@@ -458,6 +470,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             shared_to_nut,
             shards_served,
             segment_shards_served,
+            segments_served,
             assurances_seen,
             assurances_offered,
             avail_shard_count,
@@ -933,14 +946,26 @@ fn plan_package_for_this_run(
     let mut plans = vec![m2_reference::reports::SubmissionSchedule {
         slot: plan.slot,
         core: plan.core,
+        protocol: u16::from(jamnp_s::framing::CE133),
         co_guarantors: plan.co_guarantors.clone(),
         fault: None,
     }];
-    for (i, fault) in [
-        Oversized,
-        Unauthorized,
-        ExtrinsicSizeMismatch,
-        NotAGuarantor,
+    // The CE 133 faults, then CE 146: the same package over the whole-bundle
+    // protocol, honest and then over its own size cap.
+    //
+    // CE 146 gets the honest submission that CE 133 already has because
+    // DESIGN §11 N3 grades it "as 133" -- the node should accept it and
+    // share it with both co-guarantors just the same. What is not the same
+    // is the framing: five messages instead of two, and a cap on the
+    // work-package message alone rather than on it plus the core index. A
+    // node that reads the bundle as one value gets neither right.
+    for (i, (protocol, fault)) in [
+        (jamnp_s::framing::CE133, Some(Oversized)),
+        (jamnp_s::framing::CE133, Some(Unauthorized)),
+        (jamnp_s::framing::CE133, Some(ExtrinsicSizeMismatch)),
+        (jamnp_s::framing::CE133, Some(NotAGuarantor)),
+        (jamnp_s::framing::CE146, None),
+        (jamnp_s::framing::CE146, Some(Oversized)),
     ]
     .into_iter()
     .enumerate()
@@ -955,12 +980,12 @@ fn plan_package_for_this_run(
             // themselves unexercised with no way to tell that from a node
             // that was never asked.
             eprintln!(
-                "[assignment] dropping the {fault:?} submission: slot {slot} is past the \
-                 epoch the view resolves"
+                "[assignment] dropping the CE {protocol} {fault:?} submission: slot {slot} \
+                 is past the epoch the view resolves"
             );
             continue;
         };
-        let addressed = if fault == NotAGuarantor {
+        let addressed = if fault == Some(NotAGuarantor) {
             // Deliberately the core it does *not* hold.
             (core + 1) % jam_types::core_count()
         } else {
@@ -969,13 +994,14 @@ fn plan_package_for_this_run(
         plans.push(m2_reference::reports::SubmissionSchedule {
             slot,
             core: addressed,
+            protocol: u16::from(protocol),
             co_guarantors: ref_chain
                 .guarantors_for_in_epoch(addressed, slot)?
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|v| *v != nut_index as u16)
                 .collect(),
-            fault: Some(fault),
+            fault,
         });
     }
     Ok(plans)
@@ -1192,13 +1218,17 @@ async fn plan_availability(
     let now = m2_reference::chain::wall_clock_slot();
     let plan = m2_emu::avail_io::AvailPlan {
         erasure_root: spec.erasure_root,
+        segments_root: spec.exports_root,
         shard_count: spec.erasure_shards,
         segment_indices,
         cores: spec.cores,
         // A slot ahead, so the fetches have somewhere to finish before the
         // assurance that follows them.
         honest_slot: now + 1,
-        spoiled_slot: now + 1 + SPOILED_ASSURANCE_GAP_SLOTS,
+        assurance_slots: ASSURANCE_SLOTS,
+        // Half honest, half spoiled. Either half has to contain a slot the
+        // node authors the child of, or its row goes ungraded.
+        spoiled_from: now + 1 + ASSURANCE_SLOTS / 2,
     };
     eprintln!(
         "[availability] planning against root {} coded into {} shards, {} segment(s)",
@@ -1210,14 +1240,14 @@ async fn plan_availability(
     planner.set(plan);
 }
 
-/// Slots between the honest assurances and the deliberately spoiled ones.
+/// Slots a run assures for, starting at the first.
 ///
-/// They must land on different blocks. A validator that sent an honest
-/// assurance and a spoiled one for the *same* anchor would have the second
-/// dropped as a duplicate, and the row asking whether the node excludes
-/// invalid assurances would pass for a reason that has nothing to do with
-/// their being invalid.
-const SPOILED_ASSURANCE_GAP_SLOTS: u32 = 3;
+/// A validator assures the head every slot, and an assurance is carried in
+/// exactly one block: the child of the block it anchors. The node authors
+/// about two slots in six, so a single offer would leave the inclusion rows
+/// unexercised most runs -- not failing, but saying nothing. A full epoch's
+/// worth of slots puts several of the node's own among them.
+const ASSURANCE_SLOTS: u32 = 12;
 
 /// Most segment indices a run asks for over CE 139/140.
 ///
@@ -1229,6 +1259,10 @@ const MAX_SEGMENTS_ASKED: u16 = 4;
 struct AvailSpec {
     erasure_root: [u8; 32],
     erasure_shards: u16,
+    /// The root the package's exported segments sit under, which is what a
+    /// CE 148 request names. A different root from `erasure_root`, and a
+    /// different question.
+    exports_root: [u8; 32],
     exports_count: u16,
     cores: Vec<u16>,
 }
@@ -1248,6 +1282,7 @@ fn first_package_spec(
     Some(AvailSpec {
         erasure_root: decoded.package_spec.erasure_root.0,
         erasure_shards: decoded.package_spec.erasure_shards,
+        exports_root: decoded.package_spec.exports_root.0,
         exports_count: decoded.package_spec.exports_count,
         cores: vec![decoded.core_index],
     })

@@ -10,11 +10,13 @@ artefact the NUT produces against the polkajam `hazmat` reference engine.
 
 ## Status
 
-**Implemented and green (2026-09):** P0 infrastructure complete plus conformance lanes **N0**
-(connectivity/sync), **N1** (block authoring), and **N2** (Safrole tickets). See [DESIGN.md](DESIGN.md)
-for the design; this README documents the current implementation state.
+**Implemented and green:** P0 infrastructure complete plus conformance lanes **N0**
+(connectivity/sync), **N1** (block authoring) and **N2** (Safrole tickets), which run by default,
+plus **N3** (guaranteeing) and **N4** (availability), which are graded by name — see the roadmap
+below for why. See [DESIGN.md](DESIGN.md) for the design; this README documents the current
+implementation state.
 
-- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **432 passed / 0 failed** ✓,
+- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **537 passed / 0 failed** ✓,
   `cargo fmt --all --check` ✓, no `unwrap`/`panic`/`expect`/`todo!` in non-test code.
 - Dry-run baseline: `cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/x`
   exits 0 with **all N0+N1+N2 checks HARD PASS** — the harness's own expectations are satisfiable.
@@ -211,21 +213,34 @@ and pins `PvmBackend::Interpreter`.
 | P4 | N7 adversarial, index rotation, IPv6, web UI | ⏳ |
 
 **Why N3 and N4 are not in the default lane set.** A check nobody has seen
-fail is a check nobody knows is a check. N4's serve and assurance rows are
-held to that bar by `m2-sim/tests/n4_sim_it.rs`, which drives eleven faults
-through a simulated guarantor; `n4_ce141_inclusion` is not, because a
-stand-in that authors through the reference chain cannot carry a received
-assurance in a block. N3 has the same gap in places. Until they close, a
-green N3 or N4 means "nothing contradicted the node" rather than "the node
-was checked", and the lanes are asked for by name so that distinction is
-never made silently.
+fail is a check nobody knows is a check. Every N4 check is now held to that
+bar: `m2-sim/tests/n4_sim_it.rs` drives eleven faults through a simulated
+guarantor for the serve and assurance rows, and
+`m2-sim/tests/n4_inclusion_sim_it.rs` drives two more through a node that
+mishandles the assurances it is sent. Writing the second found both of
+`n4_ce141_inclusion`'s rows asking for the wrong block (`findings.md` §14).
+N3's submission rows are now held to it too, by
+`m2-sim/tests/n3_sim_it.rs`: a guarantor that refuses every package, one
+that takes a package over its protocol's size cap, and one that shares with
+a single co-guarantor each fail their own row, over CE 133 and CE 146 alike.
+CE 148 is written and proven too, in N4 rather than N3: it asks by a
+segments root the node exported, so it rides the same mid-run plan the rest
+of availability does. What is still unproven is N3's CE 135 distribution and
+inclusion rows. Until those close, a green N3 means
+"nothing contradicted the node" rather than "the node was checked", and the
+lanes are asked for by name so that distinction is never made silently.
 
 **The pin is on an unmerged branch.** `Cargo.toml` and `oracle/Cargo.toml`
-point at polkajam `43689c3de` (branch `jv-export-n4`, open as
-polkajam#1401), which exports `hazmat::merkle`. Checking a CE 137 justification needs `merkle_root`, and
-building one at all — which is what lets a simulated node serve shards —
-needs `merkle_proofs` and `pack_erasure_tree_entry`. The pin goes back to a
-merge commit once that PR lands; see `findings.md` §9.
+point at polkajam `b1ea8aca4` (branch `jv-export-n4`, open as
+polkajam#1401), which exports three things the harness cannot do without.
+`hazmat::merkle` is what checks and builds a CE 137 justification —
+`merkle_root` to check one, `merkle_proofs` and `pack_erasure_tree_entry` to
+build one, which is what lets a simulated node serve shards at all — and
+`cd_proof_root_ph`, without which a CE 148 import proof cannot be checked by
+anything outside the node crate. `AuthoringHarness::submit_assurance` is
+what lets a simulated node carry an assurance it *received*, without which
+the CE 141 inclusion rows cannot be shown to fail. The pin goes back to a
+merge commit once that PR lands; see `findings.md` §9, §14 and §16.
 
 Iterate-later items: full 2-epoch observation + epoch-boundary alignment of the ticket window;
 independent (non-`import_block`) seal/entropy VRF re-verification; full M1-style keyvals diff on

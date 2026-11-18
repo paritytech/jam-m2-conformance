@@ -21,19 +21,21 @@ use std::sync::{Arc, Mutex};
 use jam_types::{Decode, Encode};
 use jamnp_s::{
     codec::{
-        ce137_148::{SegmentShardRequest, ShardRequest},
+        ce137_148::{SegmentRequest, SegmentResponse, SegmentShardRequest, ShardRequest},
         ce141_145::Assurance,
     },
-    framing::{frame, CE137, CE138, CE139, CE140, CE141},
+    framing::{frame, CE137, CE138, CE139, CE140, CE141, CE148},
     trace::{wall_ts, Direction as TraceDir, Trace},
     transport::Conn,
 };
 use m2_scenario::dsl::{ObsKind, ObsLog};
 use m2_scenario::scenarios::n4::{
-    AssuranceFaultKind, AssuranceOffered, AssuranceSeen, SegmentShardsServed, ShardServed,
+    AssuranceFaultKind, AssuranceOffered, AssuranceSeen, SegmentShardsServed, SegmentsServed,
+    ShardServed,
 };
 use m2_scenario::scenarios::obs::{
-    NUT_SENT_BAD_ASSURANCE, SENT_ASSURANCE, SERVED_BUNDLE_SHARD, SERVED_SEGMENT_SHARDS,
+    NUT_SENT_BAD_ASSURANCE, SENT_ASSURANCE, SERVED_BUNDLE_SHARD, SERVED_SEGMENTS,
+    SERVED_SEGMENT_SHARDS,
 };
 
 use crate::emu::{lock, record, trace_record, StreamReader};
@@ -243,6 +245,68 @@ pub async fn request_segment_shards(
     Some(served)
 }
 
+/// Ask the NUT for whole imported segments over CE 148
+/// (`simple.md:650-673`).
+///
+/// One request message, then two reply messages: the segments concatenated,
+/// then one import proof per segment. Nothing in either says how long it
+/// is, so what arrived is counted rather than trusted -- and the proofs are
+/// kept as they came, because whether one proves anything is the engine's
+/// answer and this module does not have it.
+pub async fn request_segments(
+    connection: &Conn,
+    segments_root: [u8; 32],
+    segment_indices: Vec<u16>,
+    peer: u16,
+    trace: &Arc<Mutex<Trace>>,
+    obs: &Arc<Mutex<ObsLog>>,
+) -> Option<SegmentsServed> {
+    let request = SegmentRequest {
+        segments_root,
+        segment_indices: segment_indices.clone(),
+    };
+    let reply = exchange(connection, CE148, &request.encode(), peer, trace).await?;
+
+    let mut served = SegmentsServed {
+        segments_root,
+        requested: segment_indices,
+        segments: Vec::new(),
+        proofs: Vec::new(),
+        proofs_verified: Vec::new(),
+        proof_details: Vec::new(),
+        ragged: false,
+        proofs_unreadable: false,
+        messages: 0,
+        refused: false,
+    };
+    let Exchange::Answered(messages) = reply else {
+        served.refused = true;
+        return Some(served);
+    };
+    record(obs, peer, ObsKind::Other(SERVED_SEGMENTS));
+    served.messages = messages.len();
+
+    let mut messages = messages.into_iter();
+    let data = messages.next().unwrap_or_default();
+    match SegmentResponse::decode_segments(&data, jam_types::SEGMENT_LEN) {
+        Ok(segments) => served.segments = segments,
+        Err(_) => {
+            served.ragged = true;
+            return Some(served);
+        }
+    }
+    // The proof message, if it came at all. A reply that stopped after the
+    // segments is short rather than unreadable, and the row that counts
+    // messages is the one that says so.
+    if let Some(proofs) = messages.next() {
+        match SegmentResponse::decode_import_proofs(&proofs) {
+            Ok(proofs) => served.proofs = proofs,
+            Err(_) => served.proofs_unreadable = true,
+        }
+    }
+    Some(served)
+}
+
 /// What came of a request: the messages that came back, or a refusal.
 enum Exchange {
     /// Every message the node sent before the stream ended, in order.
@@ -302,6 +366,13 @@ pub struct AvailPlan {
     /// The erasure root the NUT guaranteed. Its own: a root the harness
     /// guaranteed would be one the node is right to answer `NoData` for.
     pub erasure_root: [u8; 32],
+    /// The segments root the NUT exported (`exports_root`), which is what a
+    /// CE 148 request names.
+    ///
+    /// A different root from `erasure_root` and a different question: one
+    /// asks for a coded shard of the bundle, the other for the whole
+    /// segments the package exported. Both come off the same report.
+    pub segments_root: [u8; 32],
     /// Shards the report declared it was coded into (`erasure_shards`).
     pub shard_count: u16,
     /// Segment indices to ask for over CE 139 and CE 140.
@@ -313,16 +384,30 @@ pub struct AvailPlan {
     /// Cores the harness believes carried a report, which is what an honest
     /// assurance claims.
     pub cores: Vec<u16>,
-    /// Slot the honest assurances go out in.
+    /// First slot an assurance goes out for.
     pub honest_slot: u32,
-    /// Slot the deliberately spoiled ones go out in.
+    /// How many slots in a row to assure for, starting at `honest_slot`.
     ///
-    /// A different slot, and so a different anchor, on purpose. A validator
-    /// that sent an honest assurance and a spoiled one for the *same* block
-    /// would have its second dropped as a duplicate, and the row asking
-    /// whether the node excludes invalid assurances would pass for the wrong
-    /// reason.
-    pub spoiled_slot: u32,
+    /// A validator assures the head every slot, and an assurance can be
+    /// carried in exactly one block -- the child of the block it anchors.
+    /// Offering in a single slot would leave the inclusion rows exercised
+    /// only if the node happened to author that one slot's child, which is
+    /// about one slot in three.
+    pub assurance_slots: u32,
+    /// First slot whose offer is spoiled instead of honest.
+    ///
+    /// A boundary rather than one named slot. An assurance is carried in
+    /// exactly one block -- the child of the block it anchors -- so a single
+    /// spoiled offer is graded only if the node happens to author that one
+    /// block, and the row asking whether invalid assurances are excluded
+    /// would spend most runs unexercised.
+    ///
+    /// The two halves are kept apart because they must land on different
+    /// blocks. A validator that sent an honest assurance and a spoiled one
+    /// for the *same* anchor would have its second dropped as a duplicate,
+    /// and the exclusion row would pass for a reason that has nothing to do
+    /// with the assurance being invalid.
+    pub spoiled_from: u32,
 }
 
 /// Run one emulated validator's availability exchange against the NUT.
@@ -339,6 +424,7 @@ pub async fn drive_availability(
     obs: &Arc<Mutex<ObsLog>>,
     shards_served: &Arc<Mutex<Vec<ShardServed>>>,
     segment_shards_served: &Arc<Mutex<Vec<SegmentShardsServed>>>,
+    segments_served: &Arc<Mutex<Vec<SegmentsServed>>>,
     assurances_offered: &Arc<Mutex<Vec<AssuranceOffered>>>,
     anchor_of: impl Fn() -> Option<[u8; 32]>,
 ) {
@@ -368,6 +454,22 @@ pub async fn drive_availability(
     }
 
     if !plan.segment_indices.is_empty() {
+        // The whole-segment shortcut first. A requester is meant to try CE
+        // 148 and fall back to CE 139/140 (`simple.md:660`), and asking in
+        // that order is also what lets the lane see a node that serves one
+        // and not the other.
+        if let Some(served) = request_segments(
+            connection,
+            plan.segments_root,
+            plan.segment_indices.clone(),
+            peer,
+            trace,
+            obs,
+        )
+        .await
+        {
+            lock(segments_served).push(served);
+        }
         for protocol in [CE139, CE140] {
             if let Some(served) = request_segment_shards(
                 connection,
@@ -387,47 +489,52 @@ pub async fn drive_availability(
         }
     }
 
-    // The honest one first. Its anchor is read now rather than planned: the
-    // block to assure is whichever one the chain is on, and a hash chosen
-    // when the plan was written would name a block several slots old.
-    sleep_until_slot(plan.honest_slot).await;
-    if let Some(anchor) = anchor_of() {
-        let assurance = m2_reference::assurance::sign_assurance(peer, anchor, &plan.cores);
+    // One assurance per slot, which is what a validator does: it assures the
+    // head, and the head moves every slot. The anchor is read at send time
+    // rather than planned, because an assurance names the block it is about
+    // and a hash chosen when the plan was written names a block several
+    // slots old by then.
+    let kind = spoil_for(peer);
+    let mut previous: Option<[u8; 32]> = None;
+    for slot in plan.honest_slot..plan.honest_slot.saturating_add(plan.assurance_slots) {
+        sleep_until_lead(slot).await;
+        let Some(anchor) = anchor_of() else { continue };
+        // The head has not moved, so there is nothing new to assure. Sending
+        // anyway would put two assurances from this validator under one
+        // anchor -- and if one of them were the spoiled one, the two rows
+        // would be judging the same block against opposite expectations.
+        if previous == Some(anchor) {
+            continue;
+        }
+        previous = Some(anchor);
+
+        let (assurance, cores, fault) = if slot >= plan.spoiled_from {
+            // `None` where this validator cannot pose its fault -- there is
+            // no empty core to claim when every core carried a report.
+            // Sending some other fault instead would mean the run graded a
+            // different rule from the one it recorded.
+            match spoil(peer, anchor, &plan.cores, kind) {
+                Some((assurance, claimed)) => (assurance, claimed, Some(kind)),
+                None => continue,
+            }
+        } else {
+            (
+                m2_reference::assurance::sign_assurance(peer, anchor, &plan.cores),
+                plan.cores.clone(),
+                None,
+            )
+        };
         if send_assurance(connection, &assurance, peer, trace, obs).await {
             lock(assurances_offered).push(AssuranceOffered {
                 validator: peer,
-                anchor,
-                cores: plan.cores.clone(),
-                sent_in_slot: plan.honest_slot,
+                anchor: assurance.anchor.0,
+                cores,
+                sent_in_slot: slot,
                 included: false,
                 had_opportunity: false,
-                fault: None,
+                fault,
             });
         }
-    }
-
-    // Then one that is wrong on purpose, so the row asking whether the node
-    // leaves invalid assurances out is exercised rather than merely absent.
-    sleep_until_slot(plan.spoiled_slot).await;
-    let Some(anchor) = anchor_of() else { return };
-    let kind = spoil_for(peer);
-    // `None` where this validator cannot pose its fault -- there is no
-    // empty core to claim when every core carried a report. Sending some
-    // other fault instead would mean the run graded a different rule from
-    // the one it recorded.
-    let Some((assurance, claimed_cores)) = spoil(peer, anchor, &plan.cores, kind) else {
-        return;
-    };
-    if send_assurance(connection, &assurance, peer, trace, obs).await {
-        lock(assurances_offered).push(AssuranceOffered {
-            validator: peer,
-            anchor: assurance.anchor.0,
-            cores: claimed_cores,
-            sent_in_slot: plan.spoiled_slot,
-            included: false,
-            had_opportunity: false,
-            fault: Some(kind),
-        });
     }
 }
 
@@ -496,9 +603,16 @@ fn spoil(
     }
 }
 
-/// Wait until `slot` begins.
-async fn sleep_until_slot(slot: u32) {
-    let target_ms = crate::emu::slot_start_ms(slot);
+/// Wait until an assurance for `slot` is due: the lead `simple.md:679-680`
+/// asks for, before the slot begins.
+///
+/// Sent then rather than at the slot's start because that is when the anchor
+/// is right. The block to assure is the head at that instant, which is the
+/// parent of the block about to be authored -- and an assurance anchored at
+/// anything but that block's parent cannot be carried in it at all.
+async fn sleep_until_lead(slot: u32) {
+    let target_ms = crate::emu::slot_start_ms(slot)
+        .saturating_sub(m2_scenario::scenarios::n4::ASSURANCE_LEAD_MS as u64);
     loop {
         let now = wall_ts();
         if now >= target_ms {

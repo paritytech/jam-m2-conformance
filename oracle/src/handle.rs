@@ -447,6 +447,77 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             }
         }
 
+        Message::MakeSegments { segments } => {
+            let mut leaves = Vec::with_capacity(segments.len());
+            for (i, segment) in segments.iter().enumerate() {
+                if segment.len() != jam_types::SEGMENT_LEN {
+                    return Message::Error(format!(
+                        "segment {i} is {} bytes, not {}",
+                        segment.len(),
+                        jam_types::SEGMENT_LEN
+                    ));
+                }
+                // The leaf hashing is part of the rule: `cd_proof_root_ph`
+                // recomputes exactly this from the segment it is handed, so
+                // a tree built over anything else would verify against
+                // nothing.
+                leaves.push(jam_std_common::hash_raw_concat([
+                    &b"leaf"[..],
+                    segment.as_slice(),
+                ]));
+            }
+            let padded = leaves.len().next_power_of_two();
+            let mut proofs = Vec::with_capacity(leaves.len());
+            let mut segments_root = [0u8; 32];
+            for index in 0..leaves.len() {
+                let (proof, root) = jam_std_common::cd_merkle_proof(&leaves, padded, index);
+                segments_root = root;
+                proofs.push(proof);
+            }
+            if leaves.is_empty() {
+                segments_root = jam_std_common::cd_merkle_root(&leaves, padded);
+            }
+            Message::SegmentProofs {
+                segments_root,
+                proofs,
+            }
+        }
+
+        Message::CheckImportProof {
+            segments_root,
+            segment_index,
+            segment,
+            proof,
+        } => {
+            match jam_node::hazmat::merkle::cd_proof_root_ph(
+                proof.iter(),
+                &segment,
+                segment_index as usize,
+            ) {
+                Ok(root) => Message::ShardChecked {
+                    verified: Some(root == segments_root),
+                    detail: (root != segments_root).then(|| {
+                        format!(
+                            "the proof puts segment {segment_index} under {} and the root is {}",
+                            hex8(&root),
+                            hex8(&segments_root)
+                        )
+                    }),
+                },
+                // A proof the engine cannot walk at all is a different
+                // answer from one that walks to the wrong root, and the two
+                // belong in different findings.
+                Err(()) => Message::ShardChecked {
+                    verified: None,
+                    detail: Some(format!(
+                        "the engine could not walk a {}-element proof for segment \
+                         {segment_index}",
+                        proof.len()
+                    )),
+                },
+            }
+        }
+
         Message::MakeAvailable {
             bundle,
             segments,
@@ -708,6 +779,32 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
                 }
             }
             s.harness.submit_tickets(&decoded);
+            Message::Done
+        }),
+
+        Message::SubmitAssurances {
+            session,
+            assurances,
+        } => with(sessions, session, |s| {
+            let mut decoded = Vec::with_capacity(assurances.len());
+            for bytes in &assurances {
+                let mut cursor = &bytes[..];
+                match jam_std_common::AvailabilityAssurance::decode(&mut cursor) {
+                    // Trailing bytes mean the caller and the engine disagree
+                    // about the shape, which is the disagreement worth
+                    // finding rather than ignoring.
+                    Ok(_) if !cursor.is_empty() => {
+                        return Message::Error(
+                            "an assurance decoded and left bytes over".to_string(),
+                        )
+                    }
+                    Ok(assurance) => decoded.push(assurance),
+                    Err(e) => return Message::Error(format!("an assurance did not decode: {e}")),
+                }
+            }
+            for assurance in &decoded {
+                s.harness.submit_assurance(assurance);
+            }
             Message::Done
         }),
 
