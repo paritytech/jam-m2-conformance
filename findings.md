@@ -855,6 +855,20 @@ than a guess. Until then:
 - the simulated node is the only thing those rows have been measured
   against, which is better than nothing and is not the same as a node.
 
+**A fourth row has the same cause**, found 2026-11-18 while proving the CE
+134 receive rows. `n3_ce134_shares_the_submitted_package` grades the
+mappings on a share the node *sends* and is gated on those mappings being
+non-empty — deliberately, because a package with no imported segments
+correctly has none and a row written as "names it, or there were none"
+could not fail. Mappings map the **import** list to the roots it comes
+from, so the gate opens only for a package that imports segments, and no
+package this harness builds does. The row has therefore never run against
+anything, live or simulated, and is not counted among N3's proven rows.
+
+That makes four rows waiting on the same thing: CE 139, CE 140, CE 148 and
+this one. A work item that exports segments would let an later package
+import them and open all four at once.
+
 Related: §12, which is why the plan is mid-run at all.
 
 ---

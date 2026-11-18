@@ -230,13 +230,24 @@ of availability does. CE 135 is proven at both ends:
 that distributes wrongly, and `m2-sim/tests/n3_ce135_inclusion_sim_it.rs`
 drives one through a node that drops a report distributed to it.
 
-What is still unproven is N3's **CE 134 receive** rows — `n3_ce134_answered`,
-`n3_ce134_hash_equals_the_reference`, `n3_ce134_shares_the_submitted_package`
-and `n3_ce134_wrong_shard_count_refused`. The simulated node opens CE 134
-and has never been asked to answer one, so those four have never been seen
-to fail. Until they close, a green N3 means "nothing contradicted the node"
-rather than "the node was checked", and the lanes are asked for by name so
-that distinction is never made silently.
+CE 134 receive is proven too, by `m2-sim/tests/n3_ce134_sim_it.rs`: the
+simulated node now refines a bundle it is sent and answers with the
+report's hash, and three faults -- refusing a well-formed share, naming the
+wrong hash, and taking a share coded for the wrong validator count -- each
+cost their own row.
+
+**Every row a node can cause in N3 and N4 has now been seen to fail**, with
+one exception that cannot be reached at all:
+`n3_ce134_shares_the_submitted_package` is gated on a share carrying
+mappings, mappings map *imported* segments, and no package this harness
+builds imports any (`findings.md` §17, which now lists four rows waiting on
+the same thing).
+
+So the coverage reason for keeping N3 and N4 out of the default set is
+gone, and what is left is a judgement rather than a gap: `n3_ce133_oversized_reset`
+and `n3_ce146_oversized_reset` are Hard against a reading of `simple.md`
+that §4 records as unsettled, and making these lanes default would fail a
+third-party node on a **should**. They stay opt-in until that is settled.
 
 **N4's assurance rows have now been answered by a real node.** As of
 2026-11-18 a live run grades `n4_ce141_well_formed`,
