@@ -1259,6 +1259,20 @@ composition re-checks every guarantee it holds and **skips** the ones that
 no longer apply. Assurances are fatal instead. Whether that asymmetry is
 deliberate is the first question to put to the conformance group.
 
+**Why receive-time checking cannot be the answer**, traced through the node
+2026-11-19. `AssuranceTracker::on_assurance_received`
+(`availability/assurance_tracker.rs:140`) accepts an assurance when the
+leaf is known, the signer is known, it is not a duplicate and the signature
+verifies. It does not read the bitfield — and at that moment it has no
+reason to, because the assurance *is* valid. The staleness appears
+afterwards, between pooling and authoring. `assurances_at` (`:58`) then
+returns the pool unfiltered and the author puts all of it in the block. So
+the filter has to sit at composition, which is exactly where the guarantee
+equivalent already sits.
+
+Written up for the node's authors as `ask_polkajam.md`, with the code path,
+the three runs, and what is deliberately not being claimed.
+
 ---
 
 ## 23. The row grading a node's assurance bits compared them against a slot — CLOSED 2026-11-18
