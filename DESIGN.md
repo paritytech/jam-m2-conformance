@@ -42,7 +42,7 @@ measurement (M3/M4); testing more than one NUT per run.
 | JAMNP-S spec | `jam-np/simple.md` (HEAD 2026-09-02, untagged) | Only file in the repo. ALPN protocol version `1`. Line numbers below refer to it. |
 | Graypaper | `graypaper/` v0.8.0 | Off-chain duties: `text/work_packages_and_reports.tex:15` (Honest Behavior), `guaranteeing.tex`, `assurance.tex`, `auditing.tex`, `best_chain.tex`, `safrole.tex`. |
 | Reference engine | `polkajam/crates/node` (`hazmat` feature), reached over a socket from `oracle/` | Authoring engine, STF import, state diff. `polkajam-fuzz` is read for its trace framing and mutation vocabulary (§8), not depended on. |
-| Tiny parameters | `w3f/jamtestvectors` README | V=6, C=2, E=12, Y=10, N=3, rotation R=4, EC recovery 2 shards. |
+| Tiny parameters | `w3f/jamtestvectors` README | V=6, C=2, E=12, Y=10, N=3, rotation R=4, **EC recovery 3 shards**. |
 
 Tiny derived numbers used throughout: grid width W=⌊√6⌋=2 (rows {0,1},{2,3},{4,5}; columns
 {0,2,4},{1,3,5}); three guarantor rotations per epoch (slots 0–3, 4–7, 8–11); `max(⌊E/30⌋,1)` =
@@ -611,7 +611,7 @@ those the assertion is "not included" alone.
 | CE 141 receive → inclusion | all valid assurances included; report available at ≥5 of 6 | wrong anchor, bad signature, bit set for an empty core → excluded |
 | CE 138 serve `:558-580` | bundle shard + justification with segment-shard root `:566-568` | unknown → reset |
 | CE 139/140 serve `:597-648` | 139 `[SegShard]`; 140 adds justification discriminator 0/1/2 `:637`; ≤2·3072 | over limit → reset |
-| CE 139/140 fetch | NUT reconstructs imports from 2 shards; 139 first, 140 on inconsistency `:625-630` | one corrupt shard → retries via 140 and completes |
+| CE 139/140 fetch | NUT reconstructs imports from **3** shards; 139 first, 140 on inconsistency `:625-630` | one corrupt shard → retries via 140 and completes |
 
 ### N5 — auditing and disputes, CE 136/144/145/147 (2–3 epochs)
 

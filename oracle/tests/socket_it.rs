@@ -310,7 +310,17 @@ fn tickets_are_proved_over_the_context_the_oracle_gave() {
     };
 
     let (pks, entropy) = match ask(&mut stream, Message::TicketCtx(session)) {
-        Message::TicketContext { pks, entropy } => (pks, entropy),
+        Message::TicketContext {
+            pks,
+            entropy,
+            epoch,
+        } => {
+            // The context names the epoch its entropy seals, read from the
+            // same storage as the entropy. A session opened on the dev spec
+            // has its head at genesis, in epoch 0, so this is epoch 1.
+            assert_eq!(epoch, 1, "the epoch follows the head, not a clock");
+            (pks, entropy)
+        }
         other => panic!("expected TicketContext, got {other:?}"),
     };
     assert_eq!(pks.len(), 6, "the tiny validator set");
@@ -868,4 +878,288 @@ fn an_import_reports_its_roots_and_its_refusals() {
     assert!(!ok, "a corrupt body is refused");
     assert!(error.is_some(), "a refusal says why");
     assert_eq!(root, None);
+}
+
+/// Erasure coding, and what a justification check says.
+///
+/// The coding is the engine's: a harness that coded bundles itself would be
+/// grading a node against a second implementation of Reed-Solomon, which is
+/// the mistake `proxy_index` already made once in this protocol.
+#[test]
+fn a_bundle_codes_into_shards_and_a_bad_justification_is_refused() {
+    let oracle = start("availability");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    // Coding needs no session: it is a function of the bytes and the count.
+    let bundle: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+    let (shards, recovery_threshold, shard_len) = match ask(
+        &mut stream,
+        Message::CodeBundle {
+            bundle: bundle.clone(),
+            shard_count: 6,
+        },
+    ) {
+        Message::CodedBundle {
+            shards,
+            recovery_threshold,
+            shard_len,
+        } => (shards, recovery_threshold, shard_len),
+        other => panic!("expected CodedBundle, got {other:?}"),
+    };
+
+    assert_eq!(shards.len(), 6, "one shard per validator");
+    for shard in &shards {
+        assert_eq!(shard.len() as u32, shard_len, "every shard is one length");
+    }
+    assert!(
+        shards
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1,
+        "coding produced distinct shards"
+    );
+    // Three of six, not two: `val_count / VALS_PER_CORE + 1`. DESIGN's tiny
+    // table and its N4 row both said two, and a lane written from them would
+    // have asked the node to reconstruct from one shard too few.
+    assert_eq!(recovery_threshold, 3, "D(6) is three");
+
+    // Coding is deterministic, or two sides of a run would disagree about
+    // what a node should have served.
+    match ask(
+        &mut stream,
+        Message::CodeBundle {
+            bundle,
+            shard_count: 6,
+        },
+    ) {
+        Message::CodedBundle { shards: again, .. } => {
+            assert_eq!(again, shards, "the same bundle codes the same way")
+        }
+        other => panic!("expected CodedBundle, got {other:?}"),
+    }
+
+    // A justification of the wrong shape is reported as undecodable rather
+    // than as a proof that failed: they are different findings.
+    let served = |protocol: u16, segment_shards: Vec<u8>, justification: Vec<u8>| {
+        Message::CheckServedShard {
+            protocol,
+            erasure_root: [0x11; 32],
+            shard_index: 0,
+            shard_count: 6,
+            bundle_shard: shards[0].clone(),
+            segment_shards,
+            justification,
+        }
+    };
+    // One element: `0 ++ Hash`, which is what the wire carries and not a
+    // length-prefixed sequence.
+    let hash_element = |fill: u8| {
+        let mut element = vec![0u8];
+        element.extend_from_slice(&[fill; 32]);
+        element
+    };
+
+    match ask(&mut stream, served(138, Vec::new(), vec![0xff; 3])) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(verified, None, "undecodable is not `did not verify`");
+            assert!(detail.is_some(), "and it says why");
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // Empty is refused before any proof is checked, the way polkajam's own
+    // reader refuses it.
+    match ask(&mut stream, served(138, Vec::new(), Vec::new())) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(verified, None);
+            assert!(
+                detail.as_deref().is_some_and(|d| d.contains("empty")),
+                "and it says so: {detail:?}"
+            );
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // CE 138 carries the segment root as its last element, so a
+    // justification of one element has a root and no proof left.
+    match ask(&mut stream, served(138, Vec::new(), hash_element(0x33))) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(verified, None);
+            assert!(
+                detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("once the segment root is off")),
+                "the root is taken off before the proof is judged: {detail:?}"
+            );
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // The same bytes under CE 137, which carries no root in the
+    // justification, are a one-element proof that decodes and does not
+    // verify. The two protocols reading one message differently is the
+    // reason the protocol travels with the request.
+    match ask(&mut stream, served(137, Vec::new(), hash_element(0x33))) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(
+                verified,
+                Some(false),
+                "a proof against the wrong root proves nothing ({detail:?})"
+            );
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // A well-formed CE 138 justification -- a proof element and a root --
+    // decodes and fails to verify against a root nothing was coded under.
+    let mut two = hash_element(0x44);
+    two.extend_from_slice(&hash_element(0x33));
+    match ask(&mut stream, served(138, Vec::new(), two)) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(
+                verified,
+                Some(false),
+                "decoded, and did not verify ({detail:?})"
+            );
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // A protocol that does not serve bundle shards is the caller's mistake,
+    // not the node's, so it comes back as `Error` rather than as a shard
+    // that failed to check.
+    match ask(&mut stream, served(139, Vec::new(), hash_element(0x33))) {
+        Message::Error(message) => assert!(
+            message.contains("139"),
+            "the error names the protocol: {message}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+/// Segment shards, and what the engine's segment-justification decoder says.
+///
+/// The matrix shape is the thing to get right: coding `n` segments for `v`
+/// validators gives a `v x n` grid of slices, and one shard is a *row* --
+/// one validator's slice of every segment, concatenated in segment order.
+/// A lane that read a shard as "the segments for this validator" would
+/// compare the wrong bytes against the node's reply.
+#[test]
+fn segments_code_into_one_row_per_validator() {
+    let oracle = start("segments");
+    let mut stream = UnixStream::connect(&oracle.path).expect("connect");
+
+    // `SEGMENT_LEN` exactly: anything else is an error rather than a
+    // truncation, because a short segment codes into shards that are wrong
+    // in a way no later check would pin on this.
+    let segment = |fill: u8| vec![fill; jam_types::SEGMENT_LEN];
+    let segments = vec![segment(0xa1), segment(0xb2), segment(0xc3)];
+
+    let (shards, slice_len) = match ask(
+        &mut stream,
+        Message::CodeSegments {
+            segments: segments.clone(),
+            shard_count: 6,
+        },
+    ) {
+        Message::CodedSegments { shards, slice_len } => (shards, slice_len),
+        other => panic!("expected CodedSegments, got {other:?}"),
+    };
+
+    assert_eq!(shards.len(), 6, "one row per validator");
+    for shard in &shards {
+        assert_eq!(
+            shard.len() as u32,
+            slice_len * segments.len() as u32,
+            "a row is one slice per segment, concatenated"
+        );
+    }
+    // `SEGMENT_LEN / D(v)` = 4104 / 3.
+    assert_eq!(
+        slice_len,
+        (jam_types::SEGMENT_LEN / 3) as u32,
+        "the slice length follows the recovery threshold"
+    );
+
+    // A segment of the wrong length is refused by name.
+    match ask(
+        &mut stream,
+        Message::CodeSegments {
+            segments: vec![vec![0u8; 16]],
+            shard_count: 6,
+        },
+    ) {
+        Message::Error(why) => assert!(
+            why.contains("segment 0") && why.contains("16 bytes"),
+            "the refusal names the segment and its length: {why}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    // No segments is a legitimate package, and still yields a row each.
+    match ask(
+        &mut stream,
+        Message::CodeSegments {
+            segments: Vec::new(),
+            shard_count: 6,
+        },
+    ) {
+        Message::CodedSegments { shards, .. } => {
+            assert_eq!(
+                shards.len(),
+                6,
+                "a package exporting nothing still has rows"
+            );
+            assert!(
+                shards.iter().all(|s| s.is_empty()),
+                "and the rows are empty"
+            );
+        }
+        other => panic!("expected CodedSegments, got {other:?}"),
+    }
+
+    // A justification the engine's decoder cannot read is `None`, which is
+    // not the same answer as a proof that failed.
+    match ask(
+        &mut stream,
+        Message::CheckSegmentShard {
+            erasure_root: [0x11; 32],
+            shard_index: 0,
+            shard_count: 6,
+            segment_index: 0,
+            segment_count: segments.len() as u32,
+            segment_slice: shards[0][..slice_len as usize].to_vec(),
+            justification: vec![0x07],
+        },
+    ) {
+        Message::ShardChecked { verified, detail } => {
+            assert_eq!(verified, None, "undecodable is not `did not verify`");
+            assert!(
+                detail.is_some_and(|d| d.contains("did not decode")),
+                "and says so"
+            );
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
+
+    // An empty justification decodes and proves nothing against a root that
+    // was never built from these shards.
+    match ask(
+        &mut stream,
+        Message::CheckSegmentShard {
+            erasure_root: [0x11; 32],
+            shard_index: 0,
+            shard_count: 6,
+            segment_index: 0,
+            segment_count: segments.len() as u32,
+            segment_slice: shards[0][..slice_len as usize].to_vec(),
+            justification: Vec::new(),
+        },
+    ) {
+        Message::ShardChecked { verified, .. } => {
+            assert_eq!(verified, Some(false), "nothing proves nothing")
+        }
+        other => panic!("expected ShardChecked, got {other:?}"),
+    }
 }

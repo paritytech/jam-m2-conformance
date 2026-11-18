@@ -15,10 +15,11 @@ use m2_scenario::ctx::{
 use m2_scenario::dsl::{Check, Obs, ObsKind, ObsLog, Outcome, Scheduler, Severity};
 use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
 use m2_scenario::scenarios::n3::N3Ctx;
+use m2_scenario::scenarios::n4::N4Ctx;
 use m2_scenario::scenarios::obs::{
     EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, TICKET_REFUSED,
 };
-use m2_scenario::scenarios::{n0, n1, n2, n3};
+use m2_scenario::scenarios::{n0, n1, n2, n3, n4};
 
 use crate::cli::LaneSet;
 use crate::report::{CheckOutcome, Finding};
@@ -29,6 +30,7 @@ pub(crate) struct RunCtx {
     pub n1: Option<N1Ctx>,
     pub n2: Option<N2Ctx>,
     pub n3: Option<N3Ctx>,
+    pub n4: Option<N4Ctx>,
 }
 
 /// The outcome of a run's scenario evaluation.
@@ -79,6 +81,9 @@ pub(crate) fn evaluate(obs: &ObsLog, run_ctx: &RunCtx, selected: LaneSet) -> Eva
     }
     if let (true, Some(ctx)) = (selected.n3, &run_ctx.n3) {
         lanes.push(("N3", n3::all(ctx)));
+    }
+    if let (true, Some(ctx)) = (selected.n4, &run_ctx.n4) {
+        lanes.push(("N4", n4::all(ctx)));
     }
     for (lane, checks) in lanes {
         let (out, finds, hard) = run_lane(lane, &checks, obs);
@@ -567,6 +572,89 @@ pub(crate) fn fabricated_run_ctx(
         authored_slots: vec![fab_block_slot],
     };
 
+    // A conforming node's availability, as the deterministic baseline: both
+    // bundle protocols answered in full with justifications that verify,
+    // both segment protocols answered one slice per index asked for, an
+    // assurance sent in time for a core that carried a report, and the
+    // offered assurances included or excluded exactly as their soundness
+    // says they should be.
+    const FAB_ERASURE_ROOT: [u8; 32] = [0x5c; 32];
+    const FAB_ANCHOR: [u8; 32] = [0x4d; 32];
+    let served = |protocol: u16| n4::ShardServed {
+        protocol,
+        erasure_root: FAB_ERASURE_ROOT,
+        shard_index: FAB_NUT_INDEX,
+        bundle_shard: vec![0x11; 64],
+        // The harness did not build this bundle, so it has nothing to
+        // compare against; the lane leaves the comparison unmade.
+        expected_bundle_shard: None,
+        segment_shards: if protocol == 137 {
+            vec![0x22; 8]
+        } else {
+            Vec::new()
+        },
+        messages: n4::ShardServed::messages_owed(protocol),
+        justification: vec![0x33; 33],
+        justification_verified: Some(true),
+        justification_detail: None,
+        refused: false,
+    };
+    let segments_served = |protocol: u16| n4::SegmentShardsServed {
+        protocol,
+        erasure_root: FAB_ERASURE_ROOT,
+        shard_index: FAB_NUT_INDEX,
+        requested: vec![0, 1],
+        shards: vec![vec![0x44; 4], vec![0x55; 4]],
+        justifications: if protocol == 140 {
+            vec![vec![0x66; 33], vec![0x66; 33]]
+        } else {
+            Vec::new()
+        },
+        justifications_verified: if protocol == 140 {
+            vec![Some(true), Some(true)]
+        } else {
+            Vec::new()
+        },
+        justification_details: Vec::new(),
+        ragged: false,
+        refused: false,
+    };
+    let n4 = n4::N4Ctx {
+        nut_index: FAB_NUT_INDEX,
+        shards_served: vec![served(137), served(138)],
+        segment_shards_served: vec![segments_served(139), segments_served(140)],
+        assurances_seen: vec![n4::AssuranceSeen {
+            from: FAB_NUT_INDEX,
+            anchor: FAB_ANCHOR,
+            cores: vec![0],
+            fault: None,
+            lead_ms: 2_000,
+            reported_cores: vec![0],
+        }],
+        assurances_offered: vec![
+            n4::AssuranceOffered {
+                validator: n0::PEER_1,
+                anchor: FAB_ANCHOR,
+                cores: vec![0],
+                sent_in_slot: fab_block_slot - 1,
+                included: true,
+                had_opportunity: true,
+                fault: None,
+            },
+            n4::AssuranceOffered {
+                validator: n0::PEER_1,
+                anchor: FAB_ANCHOR,
+                cores: vec![0],
+                sent_in_slot: fab_block_slot - 1,
+                included: false,
+                had_opportunity: true,
+                fault: Some(n4::AssuranceFaultKind::BadSignature),
+            },
+        ],
+        availability_threshold: jam_types::supermajority_threshold(jam_types::max_val_count()),
+        assured_by_core: vec![(0, (0..jam_types::max_val_count()).collect())],
+    };
+
     Ok(RunCtx {
         // The fabricated log is written for a NUT at index 0, which initiates
         // to every emulated peer and so never needs a fallback dial.
@@ -611,6 +699,7 @@ pub(crate) fn fabricated_run_ctx(
         n1: Some(n1),
         n2: Some(n2),
         n3: Some(n3),
+        n4: Some(n4),
     })
 }
 
@@ -626,6 +715,7 @@ mod tests {
         n1: true,
         n2: true,
         n3: true,
+        n4: true,
     };
 
     #[test]
@@ -645,7 +735,7 @@ mod tests {
             eval.all_hard_passed,
             "fabricated log must pass all lanes; failed: {hard_failures:?}"
         );
-        for lane in ["N0", "N1", "N2", "N3"] {
+        for lane in ["N0", "N1", "N2", "N3", "N4"] {
             let outcomes: Vec<&CheckOutcome> =
                 eval.outcomes.iter().filter(|o| o.lane == lane).collect();
             assert!(!outcomes.is_empty(), "lane {lane} must produce outcomes");
@@ -659,6 +749,39 @@ mod tests {
                 "lane {lane} must all pass; failed: {failed:?}"
             );
         }
+
+        // N4's baseline is not vacuous: the rows have to be *present*, not
+        // merely not failing. A lane whose every check reported "not
+        // exercised" would pass this loop while grading nothing.
+        let n4_rows: Vec<&str> = eval
+            .outcomes
+            .iter()
+            .filter(|o| o.lane == "N4")
+            .map(|o| o.id.as_str())
+            .collect();
+        for row in [
+            "n4_ce137_reply_complete",
+            "n4_ce137_justification_verifies",
+            "n4_ce138_justification_verifies",
+            "n4_ce139_140_one_shard_per_request",
+            "n4_ce140_justifications_verify",
+            "n4_ce141_well_formed",
+            "n4_ce141_bits_have_reports",
+            // Both halves of the inclusion rule: a baseline that only ever
+            // offered sound assurances would never reach the second.
+            "n4_ce141_valid_assurance_included",
+            "n4_ce141_invalid_assurance_excluded",
+            "n4_availability_threshold_reached",
+        ] {
+            assert!(
+                n4_rows.iter().any(|id| id.ends_with(row)),
+                "N4 must grade {row} on the baseline, not report it unexercised: {n4_rows:?}"
+            );
+        }
+        assert!(
+            !n4_rows.iter().any(|id| id.contains("not_exercised")),
+            "nothing in the baseline is left ungraded: {n4_rows:?}"
+        );
 
         // The N1 and N2 verdicts come from the ctx facts, not from markers in
         // the log, so the negative case has to change what the node did: drop

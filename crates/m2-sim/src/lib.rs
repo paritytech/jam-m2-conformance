@@ -33,7 +33,10 @@ use jamnp_s::codec::ce128_129::{
 use jamnp_s::codec::ce131_136::{Ticket, TicketDistribution};
 use jamnp_s::codec::up0::{Announcement, Final, Handshake};
 use jamnp_s::endpoint::{EndpointConfig, EndpointError};
-use jamnp_s::framing::{frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, UP};
+use jamnp_s::framing::{
+    frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE137, CE138, CE139, CE140,
+    CE141, UP,
+};
 use jamnp_s::transport::{Conn, RecvHalf, SendHalf, Transport};
 use m2_reference::chain::RefChain;
 use m2_reference::tickets::{proxy_index, ticket_id, verify_ticket};
@@ -148,10 +151,56 @@ pub enum SimFault {
     /// Take delivery of a ticket and never offer it to its own pool, so the
     /// block it authors leaves it out. Seals just as validly.
     OmitsDeliveredTickets,
+
+    // --- N4: availability ------------------------------------------------
+    /// Reset a CE 137/138 bundle-shard request instead of serving it.
+    ShardRefused,
+    /// Serve the *next* validator's bundle shard with this one's
+    /// justification.
+    ///
+    /// Both halves are genuine and neither is the pair the root commits to,
+    /// so the justification is the only thing that can catch it. A random
+    /// shard would also fail a length check and leave it unclear which rule
+    /// did the work.
+    ShardWrongBytes,
+    /// Serve the right shard with a justification whose co-path has been
+    /// altered.
+    ///
+    /// A byte inside an element rather than its discriminator: the message
+    /// still decodes as a sequence of elements, so the proof is what fails
+    /// and not the structure.
+    ShardBadJustification,
+    /// Stop a CE 137 reply after two messages, which is what CE 138 owes and
+    /// one short of CE 137's.
+    ///
+    /// The segment shards are the message left out. Nothing in a reply says
+    /// how long it is, so a node that stops early looks exactly like one
+    /// that finished -- which is the row's whole reason for counting.
+    ShardReplyShort,
+    /// Serve CE 139/140 slices one byte short of a whole number of them.
+    SegmentShardsRagged,
+    /// Serve fewer slices than the request asked for.
+    SegmentShardsShort,
+    /// Serve CE 140 slices with justifications that do not prove them.
+    SegmentJustificationBad,
+    /// Assure a block that was never authored.
+    ///
+    /// Signed genuinely, so only the anchor is wrong.
+    AssuranceWrongAnchor,
+    /// Sign an assurance with another validator's key.
+    AssuranceBadSignature,
+    /// Set a bit for a core that carried no report.
+    AssuranceEmptyCore,
+    /// Send the assurance after its slot has begun rather than before it.
+    AssuranceLate,
 }
 
 /// Application error code the node resets a refused ticket stream with.
 const TICKET_REFUSED_CODE: u32 = 1;
+
+/// Application error code for an availability request naming a root this
+/// node does not hold.
+const NO_DATA_CODE: u32 = 2;
 
 /// Byte to flip to break a proof without moving the ticket.
 ///
@@ -169,6 +218,13 @@ pub enum SimError {
 
 /// How many slots late [`SimFault::AnnouncesLate`] is.
 const LATE_BY_SLOTS: u64 = 2;
+
+/// Milliseconds of slot left when [`SimFault::AssuranceLate`] sends.
+///
+/// Well under the two seconds `simple.md:679-680` asks for, and well above
+/// zero: the assurance is late, not sent into the following slot, so only
+/// the timing row has anything to say about it.
+const LATE_ASSURANCE_MARGIN_MS: u64 = 500;
 
 /// A node-shaped peer the harness can grade.
 pub struct SimNode {
@@ -189,6 +245,20 @@ pub struct SimNode {
     /// Tickets this node forwarded as proxy, by id, so it can forward one
     /// again once a block of its own carries it.
     forwarded: Mutex<Vec<([u8; 32], TicketDistribution)>>,
+    /// The bundle this node is a guarantor of, coded into servable shards.
+    ///
+    /// `None` until a test hands it one. A node that holds nothing answers
+    /// every availability request the way a real one does when it has no
+    /// such root: by refusing.
+    available: Mutex<Option<Available>>,
+}
+
+/// A bundle this node can serve shards of.
+pub struct Available {
+    shards: m2_reference::availability::AvailableShards,
+    /// How many segments were coded, which is what fixes the slice
+    /// boundaries inside each row.
+    segment_count: usize,
 }
 
 impl SimNode {
@@ -209,7 +279,34 @@ impl SimNode {
             announce: broadcast::Sender::new(16),
             own_blocks: Mutex::new(Vec::new()),
             forwarded: Mutex::new(Vec::new()),
+            available: Mutex::new(None),
         }
+    }
+
+    /// Code `bundle` and `segments` into shards this node will serve.
+    ///
+    /// The coding and the justifications are the engine's, through the
+    /// oracle: a stand-in that built its own would be proving the harness
+    /// agrees with itself rather than that it agrees with a node.
+    pub fn hold_available(
+        &self,
+        bundle: Vec<u8>,
+        segments: Vec<Vec<u8>>,
+        shard_count: u16,
+    ) -> Result<[u8; 32], m2_reference::chain::ChainError> {
+        let segment_count = segments.len();
+        let shards = m2_reference::availability::make_available(
+            self.chain.oracle(),
+            bundle,
+            segments,
+            shard_count,
+        )?;
+        let root = shards.erasure_root;
+        *self.available.lock().expect("sim available") = Some(Available {
+            shards,
+            segment_count,
+        });
+        Ok(root)
     }
 
     /// Announce a block this node authored, and keep it to serve.
@@ -608,9 +705,227 @@ impl SimNode {
             CE128 => self.serve_ce128(&mut send, &content).await,
             CE129 => self.serve_ce129(&mut send, &content).await,
             CE131 | CE132 => self.receive_ticket(&mut send, kind, &content).await,
+            CE137 | CE138 => self.serve_bundle_shard(&mut send, kind, &content).await,
+            CE139 | CE140 => self.serve_segment_shards(&mut send, kind, &content).await,
             // A real node resets an unserved kind; this one is not graded on
             // that, so it drops the stream.
             _ => {}
+        }
+    }
+
+    /// Serve CE 137 or CE 138: the bundle shard, CE 137's segment shards,
+    /// and a justification, each as its own framed message.
+    ///
+    /// Three messages for CE 137 and two for CE 138, because nothing in the
+    /// reply says how long any of it is -- the frame does
+    /// (`simple.md:552-554`, `simple.md:577-578`).
+    async fn serve_bundle_shard(&self, send: &mut SendHalf, kind: u8, content: &[u8]) {
+        if self.fault == SimFault::ShardRefused {
+            // A reset, not a clean close: a node with no such root says so
+            // by killing the stream.
+            send.reset(NO_DATA_CODE);
+            return;
+        }
+        let Ok(request) = jamnp_s::codec::ce137_148::ShardRequest::decode(&mut &content[..]) else {
+            return;
+        };
+        // Everything taken out of the lock before the first await: a guard
+        // held across one makes the whole task unsendable, and the shards
+        // are a handful of kilobytes.
+        let parts = {
+            let held = self.available.lock().expect("sim available");
+            let Some(held) = held.as_ref() else {
+                send.reset(NO_DATA_CODE);
+                return;
+            };
+            if request.erasure_root != held.shards.erasure_root {
+                send.reset(NO_DATA_CODE);
+                return;
+            }
+            let index = request.shard_index as usize;
+            if index >= held.shards.bundle_shards.len() {
+                send.reset(NO_DATA_CODE);
+                return;
+            }
+            let bundle_shard = if self.fault == SimFault::ShardWrongBytes {
+                // The next validator's shard, which is a genuine shard of
+                // the same length under the same root -- so only the proof
+                // can tell them apart.
+                let other = (index + 1) % held.shards.bundle_shards.len();
+                held.shards.bundle_shards[other].clone()
+            } else {
+                held.shards.bundle_shards[index].clone()
+            };
+            let mut justification = if kind == CE137 {
+                held.shards.shard_justifications[index].clone()
+            } else {
+                held.shards.audit_justifications[index].clone()
+            };
+            if self.fault == SimFault::ShardBadJustification && justification.len() > 1 {
+                // A byte inside the first element's hash, not its
+                // discriminator: the message still parses as a sequence of
+                // elements, so the proof is what fails.
+                justification[1] ^= 0xff;
+            }
+            (
+                bundle_shard,
+                held.shards.segment_shards[index].clone(),
+                justification,
+            )
+        };
+        let (bundle_shard, segment_row, justification) = parts;
+
+        if send.write_all(&frame_message(&bundle_shard)).await.is_err() {
+            return;
+        }
+        if kind == CE137 {
+            if self.fault == SimFault::ShardReplyShort {
+                // Stop after one message. CE 138 owes two and CE 137 three,
+                // so a reply that ends here is complete for neither.
+                send.finish();
+                return;
+            }
+            if send.write_all(&frame_message(&segment_row)).await.is_err() {
+                return;
+            }
+        }
+        let _ = send.write_all(&frame_message(&justification)).await;
+        send.finish();
+    }
+
+    /// Serve CE 139 or CE 140: one message of slices, then CE 140's
+    /// justification per requested index (`simple.md:597-648`).
+    async fn serve_segment_shards(&self, send: &mut SendHalf, kind: u8, content: &[u8]) {
+        let Ok(request) = jamnp_s::codec::ce137_148::SegmentShardRequest::decode(&mut &content[..])
+        else {
+            return;
+        };
+        // As above: nothing of the lock survives into an await.
+        let parts = {
+            let held = self.available.lock().expect("sim available");
+            let Some(held) = held.as_ref() else {
+                send.reset(NO_DATA_CODE);
+                return;
+            };
+            if request.erasure_root != held.shards.erasure_root {
+                send.reset(NO_DATA_CODE);
+                return;
+            }
+            let index = request.shard_index as usize;
+            let Some(row) = held.shards.segment_shards.get(index) else {
+                send.reset(NO_DATA_CODE);
+                return;
+            };
+            let slice_len = row.len() / held.segment_count.max(1);
+
+            let mut asked: Vec<u16> = request.segment_indices.clone();
+            if self.fault == SimFault::SegmentShardsShort && asked.len() > 1 {
+                asked.pop();
+            }
+            let mut slices = Vec::new();
+            for segment in &asked {
+                let at = *segment as usize * slice_len;
+                let Some(slice) = row.get(at..at + slice_len) else {
+                    send.reset(NO_DATA_CODE);
+                    return;
+                };
+                slices.extend_from_slice(slice);
+            }
+            if self.fault == SimFault::SegmentShardsRagged {
+                // One byte past a whole number of slices, so the two sides
+                // disagree about the width rather than about the count.
+                slices.push(0);
+            }
+            let justifications: Vec<Vec<u8>> = if kind == CE140 {
+                asked
+                    .iter()
+                    .map(|segment| {
+                        let mut justification = held.shards.segment_justifications[index]
+                            .get(*segment as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        if self.fault == SimFault::SegmentJustificationBad
+                            && justification.len() > 1
+                        {
+                            justification[1] ^= 0xff;
+                        }
+                        justification
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (slices, justifications)
+        };
+        let (slices, justifications) = parts;
+
+        if send.write_all(&frame_message(&slices)).await.is_err() {
+            return;
+        }
+        for justification in &justifications {
+            if send.write_all(&frame_message(justification)).await.is_err() {
+                return;
+            }
+        }
+        send.finish();
+    }
+
+    /// Broadcast a CE 141 assurance to every peer this node has dialled.
+    ///
+    /// `cores` is what an honest assurance claims; the faults are posed on
+    /// top of it, each at the level it belongs to.
+    pub async fn send_assurance(&self, anchor: [u8; 32], cores: &[u16]) {
+        if self.fault == SimFault::AssuranceLate {
+            // Held until the slot has nearly run out, so it arrives with a
+            // fraction of a second of lead instead of the two seconds
+            // `simple.md:679-680` asks for. Sleeping a whole slot period
+            // would not do it: that lands at the same phase of the next
+            // slot and reads exactly as punctual.
+            let now = clock::current().wall_ms();
+            let next = m2_reference::chain::slot_start_ms(m2_reference::chain::slot_of_ms(now) + 1);
+            if let Some(wait) = next
+                .saturating_sub(LATE_ASSURANCE_MARGIN_MS)
+                .checked_sub(now)
+            {
+                clock::current().sleep(Duration::from_millis(wait)).await;
+            }
+        }
+        let index = self.index as u16;
+        let assurance = match self.fault {
+            SimFault::AssuranceWrongAnchor => {
+                let mut absent = anchor;
+                absent[0] ^= 0xff;
+                m2_reference::assurance::sign_assurance(index, absent, cores)
+            }
+            // CE 141 carries no validator index -- the reader takes it from
+            // the connection -- so another validator's key is the whole of
+            // the fault.
+            SimFault::AssuranceBadSignature => {
+                m2_reference::assurance::sign_assurance(index.wrapping_add(1), anchor, cores)
+            }
+            SimFault::AssuranceEmptyCore => {
+                let Some(empty) = (0..jam_types::core_count()).find(|c| !cores.contains(c)) else {
+                    return;
+                };
+                m2_reference::assurance::sign_assurance(index, anchor, &[empty])
+            }
+            _ => m2_reference::assurance::sign_assurance(index, anchor, cores),
+        };
+        let wire = frame(CE141, &assurance.encode());
+        let peers: Vec<Conn> = self
+            .peers
+            .lock()
+            .expect("sim peers")
+            .iter()
+            .map(|(_, conn)| conn.clone())
+            .collect();
+        for conn in peers {
+            let Ok((mut send, _recv)) = conn.open_bi().await else {
+                continue;
+            };
+            if send.write_all(&wire).await.is_ok() {
+                send.finish();
+            }
         }
     }
 

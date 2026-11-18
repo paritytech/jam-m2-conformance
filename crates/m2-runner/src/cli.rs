@@ -35,6 +35,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 60)]
     pub observe_secs: u64,
     /// Comma-separated lane set to grade, e.g. `n0` or `n1,n2`.
+    ///
+    /// The default is the lanes a run grades unasked. N3 and N4 are not
+    /// among them yet: neither has a simulated misbehaving node to prove
+    /// its rows can fail, so a pass from either is a pass nobody has
+    /// checked the meaning of. They are asked for by name until then.
     #[arg(long, default_value = "n0,n1,n2", value_parser = LaneSet::parse)]
     pub lanes: LaneSet,
     /// Skip NUT launch and connectivity; fabricate a conforming observation
@@ -58,6 +63,7 @@ pub struct LaneSet {
     pub n1: bool,
     pub n2: bool,
     pub n3: bool,
+    pub n4: bool,
 }
 
 impl LaneSet {
@@ -70,6 +76,7 @@ impl LaneSet {
             n1: false,
             n2: false,
             n3: false,
+            n4: false,
         };
         for name in raw.split(',').map(str::trim).filter(|n| !n.is_empty()) {
             match name.to_ascii_lowercase().as_str() {
@@ -77,14 +84,15 @@ impl LaneSet {
                 "n1" => set.n1 = true,
                 "n2" => set.n2 = true,
                 "n3" => set.n3 = true,
+                "n4" => set.n4 = true,
                 other => {
                     return Err(format!(
-                        "unknown lane {other:?}; implemented lanes are n0, n1, n2, n3"
+                        "unknown lane {other:?}; implemented lanes are n0, n1, n2, n3, n4"
                     ))
                 }
             }
         }
-        if !(set.n0 || set.n1 || set.n2 || set.n3) {
+        if !(set.n0 || set.n1 || set.n2 || set.n3 || set.n4) {
             return Err("no lanes selected".to_string());
         }
         Ok(set)
@@ -97,11 +105,20 @@ impl LaneSet {
         self.n1 || self.n2
     }
 
-    /// Whether the run needs a work package submitted. Only N3 reads it, and
-    /// building and submitting one costs a refinement the other lanes have no
-    /// use for.
+    /// Whether the run needs a work package submitted.
+    ///
+    /// N3 grades what the node does with one, and N4 needs the *result*: the
+    /// shards it asks for belong to a bundle the node guaranteed, so a run
+    /// that submits nothing gives the node nothing to serve. One submission
+    /// feeds both.
     pub fn needs_package(&self) -> bool {
-        self.n3
+        self.n3 || self.n4
+    }
+
+    /// Whether the run drives availability: fetching shards and offering
+    /// assurances once the node has published a report of its own.
+    pub fn needs_availability(&self) -> bool {
+        self.n4
     }
 }
 
@@ -245,7 +262,8 @@ mod tests {
                 n0: true,
                 n1: false,
                 n2: true,
-                n3: false
+                n3: false,
+                n4: false
             }
         );
         assert!(

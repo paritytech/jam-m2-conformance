@@ -12,14 +12,20 @@
 //! Building work packages, refining them into reports and signing guarantees
 //! is [`reports`], which N3 puts on CE 133, CE 134 and CE 135.
 //!
+//! Availability is split in two, and the split is the rule rather than an
+//! accident of where things landed. Erasure coding and justification
+//! checking are the engine's, so they go over the socket ([`availability`]);
+//! signing and checking an assurance is `jam-std-common` code both sides
+//! link, so it does not ([`assurance`]). The test before adding a message is
+//! not "does the engine know how" but "is there a second implementation to
+//! diverge from".
+//!
 //! **Not here yet.** DESIGN §3 also describes this crate as signing
-//! assurances and judgments and erasure-coding bundles. None of that exists
-//! yet -- those are N4's and N5's -- but nothing upstream blocks them any
-//! more: the export for bundle -> shards + justifications + segment proofs
-//! was the last outstanding DESIGN §8 prerequisite and the pin now carries
-//! it (`hazmat::erasure`, `hazmat::availability`).
+//! judgments, which is N5's.
 #![deny(unsafe_code)]
 
+pub mod assurance;
+pub mod availability;
 pub mod chain;
 pub mod import;
 pub mod oracle;

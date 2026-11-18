@@ -22,6 +22,7 @@ use m2_scenario::ctx::{
 use m2_scenario::scenarios::n3::{
     DistributedReport, N3Ctx, ReportSeen, SharingSeen, SubmittedPackage,
 };
+use m2_scenario::scenarios::n4::{AssuranceOffered, N4Ctx, SegmentShardsServed, ShardServed};
 
 use crate::scenario::RunCtx;
 
@@ -50,6 +51,17 @@ pub(crate) struct RealRunData {
     pub(crate) distributed: Arc<Mutex<Vec<DistributedReport>>>,
     /// CE 134 shares the emulator opened to the NUT, with its answers.
     pub(crate) shared_to_nut: Arc<Mutex<Vec<m2_scenario::scenarios::n3::SharedToNut>>>,
+    /// CE 137/138 replies the NUT served.
+    pub(crate) shards_served: Arc<Mutex<Vec<ShardServed>>>,
+    /// CE 139/140 replies the NUT served.
+    pub(crate) segment_shards_served: Arc<Mutex<Vec<SegmentShardsServed>>>,
+    /// CE 141 assurances the NUT broadcast, as they arrived.
+    pub(crate) assurances_seen: Arc<Mutex<Vec<m2_emu::avail_io::RawAssurance>>>,
+    /// CE 141 assurances the emulator offered the NUT.
+    pub(crate) assurances_offered: Arc<Mutex<Vec<AssuranceOffered>>>,
+    /// Shard count the availability plan was built for, or `None` where no
+    /// plan was ever set.
+    pub(crate) avail_shard_count: Arc<Mutex<Option<u16>>>,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
@@ -232,12 +244,228 @@ pub(crate) fn build_real_run_ctx(
         authored_slots: nut_blocks.iter().map(|n| n.block.header.slot).collect(),
     };
     crate::run::phase("ctx.build_n3", t);
+    let t = std::time::Instant::now();
+    let n4 = build_n4_ctx(data, &nut_blocks);
+    crate::run::phase("ctx.build_n4", t);
     Ok(RunCtx {
         n0,
         n1: Some(n1),
         n2: Some(n2),
         n3: Some(n3),
+        n4: Some(n4),
     })
+}
+
+/// Build the N4 context from what the availability driver recorded.
+///
+/// This is where the justifications are actually checked: the emulator
+/// recorded the bytes, and the engine -- through the oracle -- says whether
+/// they prove anything. Doing it here rather than on the wire keeps the
+/// round trips out of the observation window, where a slow oracle would
+/// shift the timing the other lanes are graded on.
+fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
+    // The count the report declared, not the validator count this harness
+    // assumes: a report may only be included if the two agree, but a node
+    // that coded into some other number is exactly what a check should be
+    // able to say, and substituting our own would hide it.
+    let shard_count = lock(&data.avail_shard_count).unwrap_or_else(jam_types::max_val_count);
+
+    let mut shards_served = lock(&data.shards_served).clone();
+    verify_served_shards(data.ref_chain.oracle(), shard_count, &mut shards_served);
+    let mut segment_shards_served = lock(&data.segment_shards_served).clone();
+    verify_segment_shards(
+        data.ref_chain.oracle(),
+        shard_count,
+        &mut segment_shards_served,
+    );
+    // Every block the harness has seen the node on. Which one it assures is
+    // its own choice -- the head two seconds before a slot -- so the rule is
+    // that the anchor names a block that exists, not a block the harness
+    // picked.
+    let known_anchors: Vec<[u8; 32]> = nut_blocks
+        .iter()
+        .map(|nut| nut.block.header.hash().0)
+        .chain(
+            data.ref_chain
+                .chain_blocks()
+                .unwrap_or_default()
+                .iter()
+                .map(|block| block.header.hash().0),
+        )
+        .collect();
+    // Cores that carried a report at those blocks, which is what an
+    // assurance may claim. Read off the node's own blocks: a report it
+    // included is one it put on chain.
+    let reported_cores: Vec<u16> = nut_blocks
+        .iter()
+        .flat_map(|nut| {
+            nut.block
+                .extrinsic
+                .guarantees_prehashed()
+                .into_iter()
+                .map(|(_, core, _)| core as u16)
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let assurances_seen = m2_emu::avail_io::assurances_for_lane(
+        &lock(&data.assurances_seen),
+        data.nut_index as u16,
+        &known_anchors,
+        &reported_cores,
+        |at_wall_ms| {
+            // Milliseconds before the start of the slot it was sent for,
+            // which is the slot after the one it arrived in.
+            let slot = m2_reference::chain::slot_of_ms(at_wall_ms);
+            m2_reference::chain::slot_start_ms(slot + 1) as i64 - at_wall_ms as i64
+        },
+    );
+
+    // Whether an offered assurance was carried, and whether the node ever
+    // had the chance. A block authored before the offer owed nothing.
+    let mut assurances_offered = lock(&data.assurances_offered).clone();
+    for offered in &mut assurances_offered {
+        let later: Vec<&NutBlock> = nut_blocks
+            .iter()
+            .filter(|nut| nut.block.header.slot > offered.sent_in_slot)
+            .collect();
+        offered.had_opportunity = !later.is_empty();
+        offered.included = later.iter().any(|nut| {
+            nut.block
+                .extrinsic
+                .assurances
+                .iter()
+                .any(|a| a.signature.val_index == offered.validator)
+        });
+    }
+
+    N4Ctx {
+        nut_index: data.nut_index as u16,
+        shards_served,
+        segment_shards_served,
+        assurances_seen,
+        assurances_offered,
+        availability_threshold: jam_types::supermajority_threshold(jam_types::max_val_count()),
+        assured_by_core: assured_by_core(nut_blocks),
+    }
+}
+
+/// Ask the engine whether each served bundle shard's justification proves it.
+///
+/// Done after the observation window rather than on the wire: the emulator
+/// records bytes, the engine decides, and holding the round trips out of the
+/// window keeps a slow oracle from shifting the timing the other lanes are
+/// graded on.
+///
+/// Public because `m2-sim`'s N4 test grades the same facts the runner does.
+/// A test that re-implemented this would be checking its own copy of the
+/// rule rather than the one a run uses.
+pub fn verify_served_shards(
+    oracle: &Arc<m2_reference::oracle::Oracle>,
+    shard_count: u16,
+    served: &mut [ShardServed],
+) {
+    for shard in served {
+        if shard.refused {
+            continue;
+        }
+        match m2_reference::availability::check_served_shard(
+            oracle,
+            m2_reference::availability::ServedShard {
+                protocol: shard.protocol,
+                erasure_root: shard.erasure_root,
+                shard_index: shard.shard_index,
+                shard_count,
+                bundle_shard: shard.bundle_shard.clone(),
+                segment_shards: shard.segment_shards.clone(),
+                justification: shard.justification.clone(),
+            },
+        ) {
+            Ok(check) => {
+                shard.justification_verified = check.verified;
+                shard.justification_detail = check.detail;
+            }
+            // The oracle refusing to answer is the harness's problem, not
+            // the node's. Left unverified with the reason on it, which the
+            // lane reports as a justification it could not read rather than
+            // as a proof that failed.
+            Err(e) => shard.justification_detail = Some(format!("the oracle could not say: {e}")),
+        }
+    }
+}
+
+/// The same for CE 140's per-slice justifications.
+pub fn verify_segment_shards(
+    oracle: &Arc<m2_reference::oracle::Oracle>,
+    shard_count: u16,
+    served: &mut [SegmentShardsServed],
+) {
+    for shards in served {
+        if shards.refused || shards.ragged || shards.protocol != 140 {
+            continue;
+        }
+        // One justification per slice, paired by position: the reply carries
+        // no indices, so position is the only thing tying the two together.
+        for (i, slice) in shards.shards.iter().enumerate() {
+            let Some(justification) = shards.justifications.get(i) else {
+                shards.justifications_verified.push(None);
+                shards
+                    .justification_details
+                    .push(Some("no justification was sent for this slice".into()));
+                continue;
+            };
+            let segment_index = shards.requested.get(i).copied().unwrap_or(i as u16);
+            match m2_reference::availability::check_segment_shard(
+                oracle,
+                shards.erasure_root,
+                shards.shard_index,
+                shard_count,
+                segment_index,
+                shards.requested.len() as u32,
+                slice.clone(),
+                justification.clone(),
+            ) {
+                Ok(check) => {
+                    shards.justifications_verified.push(check.verified);
+                    shards.justification_details.push(check.detail);
+                }
+                Err(e) => {
+                    shards.justifications_verified.push(None);
+                    shards
+                        .justification_details
+                        .push(Some(format!("the oracle could not say: {e}")));
+                }
+            }
+        }
+    }
+}
+
+/// Which validators assured each core, as the NUT's own blocks recorded it.
+fn assured_by_core(nut_blocks: &[NutBlock]) -> Vec<(u16, Vec<u16>)> {
+    let cores = jam_types::core_count();
+    let mut by_core: Vec<(u16, Vec<u16>)> = (0..cores).map(|core| (core, Vec::new())).collect();
+    for nut in nut_blocks {
+        for assurance in nut.block.extrinsic.assurances.iter() {
+            let bitfield = jam_types::Encode::encode(&assurance.statement.bitfield);
+            for core in 0..cores {
+                let Some(byte) = bitfield.get(core as usize / 8) else {
+                    continue;
+                };
+                if byte & (1 << (core % 8)) != 0 {
+                    let who = assurance.signature.val_index;
+                    let holders = &mut by_core[core as usize].1;
+                    if !holders.contains(&who) {
+                        holders.push(who);
+                    }
+                }
+            }
+        }
+    }
+    // Cores nobody assured are left out: a core with no report is not a
+    // core that failed to reach the threshold.
+    by_core.retain(|(_, holders)| !holders.is_empty());
+    by_core
 }
 
 /// Every ticket context the harness can verify a proof against, by the epoch

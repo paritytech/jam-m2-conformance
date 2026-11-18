@@ -201,6 +201,11 @@ pub enum ShareFault {
     WrongShardCount,
 }
 
+/// What [`RefChain::epoch_probe`] reads: the cached epoch index, the head's
+/// epoch, the entropy the cached view shuffles with, and entries 1 and 2 of
+/// the head's buffer.
+type EpochProbe = (u32, u32, [u8; 32], [u8; 32], [u8; 32]);
+
 impl RefChain {
     /// Build a share to send the NUT at `slot`, on a core it holds.
     ///
@@ -758,7 +763,7 @@ impl RefChain {
     }
 
     /// `(cached epoch, head epoch, cached entropy, entry 1, entry 2)`.
-    fn epoch_probe(&self) -> Result<(u32, u32, [u8; 32], [u8; 32], [u8; 32]), ChainError> {
+    fn epoch_probe(&self) -> Result<EpochProbe, ChainError> {
         match self.ask(Message::EpochProbe(self.session()))? {
             Message::EpochProbed {
                 cached_index,

@@ -167,10 +167,7 @@ impl RefChain {
     /// The pool also rejects duplicates and keeps only the lowest ids, which
     /// is why an unsorted or repeated extrinsic cannot be produced this way.
     pub fn submit_tickets(&self, candidates: &[TicketEnvelope]) -> Result<(), ChainError> {
-        let envelopes = candidates
-            .iter()
-            .map(|t| jam_types::Encode::encode(t))
-            .collect();
+        let envelopes = candidates.iter().map(jam_types::Encode::encode).collect();
         match self.ask(Message::SubmitTickets {
             session: self.session(),
             envelopes,
@@ -981,6 +978,53 @@ mod tests {
     /// A `tiny` chain makes the two unmistakable: its genesis is at slot 0,
     /// so the head is in epoch 0 and the context seals epoch 1, while the
     /// wall clock is hundreds of thousands of epochs along.
+    /// The cached epoch view follows the chain, rather than freezing at
+    /// genesis.
+    ///
+    /// `current_and_next_epochs` is only ever written in polkajam's
+    /// finalization path, and an `AuthoringHarness` builds a chain without
+    /// the worker that drives finality -- that worker belongs to the node.
+    /// So a session used to finalize once, at genesis, and never again: the
+    /// cached view stayed on genesis entropy for the whole run while the head
+    /// walked away from it. The epoch view answers for the cached epoch and
+    /// the one after it, so every lane asking who holds a core got an answer
+    /// built from genesis entropy, or no answer at all once the head was more
+    /// than an epoch out. That is what left N3 reporting every row
+    /// unexercised. See findings.md §1.
+    #[test]
+    fn the_cached_epoch_view_follows_the_chain() -> Result<(), ChainError> {
+        let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;
+        let period = jam_types::epoch_period();
+        let genesis = chain.genesis_slot();
+
+        // Two epochs past genesis is far enough that a frozen cache cannot
+        // pass: it would still be reporting the genesis epoch.
+        for slot in genesis + 1..genesis + 2 * period + 2 {
+            let _ = chain.author_block(slot)?;
+        }
+
+        let (cached, state) = chain.epoch_views()?;
+        assert!(
+            state >= genesis / period + 2,
+            "the head crossed two boundaries, so there is something to lag behind"
+        );
+        let genesis_epoch = genesis / period;
+        assert!(
+            cached > genesis_epoch,
+            "the cached view moved off genesis: read {cached}, genesis is {genesis_epoch}"
+        );
+        // Within an epoch of the head rather than equal to it. Finality
+        // trails the head by a slot, so just after a boundary the cached
+        // epoch is still the previous one -- a node's view does the same.
+        // What matters downstream is that `cached + 1` reaches the head's
+        // epoch, which is where the N3 lane aims.
+        assert!(
+            state - cached <= 1,
+            "cached {cached} is more than an epoch behind state {state}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn the_context_names_the_epoch_its_entropy_seals() -> Result<(), ChainError> {
         let chain = RefChain::tiny(&Oracle::for_tests(), 0)?;

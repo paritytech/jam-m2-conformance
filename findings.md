@@ -5,85 +5,96 @@ observed, what it is not, and what would close it.
 
 ---
 
-## 1. Two core assignments, reading different entropy entries
+## 1. The reference chain never finalized, so its epoch view froze — CLOSED 2026-11-17
 
-**Status:** worked around, root cause not established. Opened 2026-11-11.
+**Status:** root cause found and fixed. Opened 2026-11-11 as "two core
+assignments, reading different entropy entries", which was wrong; what it
+recorded was a symptom. The correction is below.
 
-polkajam computes the core assignment two ways, and for a slot in the chain
-head's own epoch they disagree.
-
-| source | entropy used |
-|---|---|
-| `storage.core_assignments_for(slot)` | the entry `epoch_relation` selects: **2** for a slot in the head's epoch, **1** for the next |
-| `EpochInfo::core_assignments(slot)` (cached, via `current_and_next_epochs`) | **entry 1**, whatever the slot |
-
-Measured against a live node:
+**What this was recorded as.** That polkajam computes the core assignment two
+ways and they disagree — `storage.core_assignments_for(slot)` shuffling with
+entropy entry 2 while the cached `EpochInfo::core_assignments(slot)` uses
+entry 1 — measured against a live node as:
 
 ```
 cached ee155ace9c402920  best-block[1] ee155ace9c402920
                          best-block[2] bb30a42c1e62f0af
 ```
 
-So the two agree for a slot in the *next* epoch and disagree for one in the
-head's own. A guarantor choosing who to share a work-package with uses the
-cached view (`chain/guarantors/guarantor.rs`, `epoch.core_assignments(slot)`),
-while the on-chain rule for a guarantee shuffles with entry 2
-(`chain/exec/reports.rs`).
+**What it actually was.** `current_and_next_epochs` reads a cache that
+polkajam writes in exactly one place: the finalization path
+(`chain/mod.rs:1175`, "Publish the new finalized head"). Finality in dummy
+mode is driven by `finality::dummy_run`, an async worker the **node** spawns
+(`node/mod.rs:377`). `AuthoringHarness::new` builds a `JamChain` and spawns
+nothing, so a harness session finalized once — at genesis — and never again.
 
-**Observed effect.** N3's CE 133 sharing row passed in one run and failed in
-the next with no code change between them: the submission slot landed in the
-head's epoch or the next one depending only on where in the epoch the run
-started. Where they disagreed the node shared with one co-guarantor instead
-of two and its guaranteed report carried two signatures rather than three.
+The cached view was not lagging. It was **frozen at genesis for the whole
+run**, while the head walked away from it. Authoring a `tiny` chain across
+two boundaries, with no node involved at all:
 
-**What it is not.** Not a stale cache. The cached epoch index matched the
-best-block state epoch exactly (815264 against 815264) in the run that
-produced the numbers above; the difference is which entry is read, not which
-block. An earlier hypothesis that the cache lags finalization was tested and
-refuted.
+```
+period 12, genesis slot 0
+slot  1 (epoch 0) cached_idx 0 state_idx 0 | cached ee155ace9c402920 entry1 ee155ace9c402920 entry2 bb30a42c1e62f0af
+slot 12 (epoch 1) cached_idx 0 state_idx 1 | cached ee155ace9c402920 entry1 c782837d5e696d6c entry2 ee155ace9c402920
+slot 24 (epoch 2) cached_idx 0 state_idx 2 | cached ee155ace9c402920 entry1 0c4e24ca0c0d8e0f entry2 c782837d5e696d6c
+```
 
-**Current workaround.** `plan_package_for_this_run` aims the submission into
-the next epoch, where both sides provably read the same entropy, and aims it
-from the *cached* epoch index rather than from the head. The epoch view
-resolves the cached epoch and the one after it, so `cached + 1` is
-resolvable by construction.
+The first line reproduces the original measurement byte for byte. `cached`
+never changes; the entries rotate past it. It equals entry 1 at slot 1, entry
+**2** at slot 12 and neither at slot 24 — so "the cached view reads entry 1"
+was a coincidence of *when* the measurement was taken, not a rule.
 
-Waiting for the cache to catch up and then reading the head again is not
-enough, and was the first attempt: a head that crosses an epoch in the gap
-between the wait and the read puts the target two epochs past the cache,
-which resolves to nothing and leaves the lane unexercised. Three runs in
-five did exactly that, all near a boundary. Aiming from the cached index
-closes the race -- five consecutive runs after it, all planning and all
-clean. The second half matters because the view resolves only the cached
-epoch and the next, so a cache more than one epoch behind cannot answer for
-a slot an epoch ahead and no plan is made at all.
+**Why the stale-cache hypothesis was wrongly refuted.** The finding said the
+cache was not stale because "the cached epoch index matched the best-block
+state epoch exactly (815264 against 815264)". Those indices agree for as long
+as the run is still inside the genesis epoch, which is where that measurement
+was taken — a frozen cache and a healthy one are indistinguishable there. The
+test could not have told the two apart.
 
-Measured over four consecutive runs after that wait was added: **every run
-exercised the lane**, where before roughly one in three had planned nothing.
-Three scored 30 of 30; the fourth failed only the inclusion row, with both
-views agreeing, which is a separate residual and not this one.
+**Why the lane went quiet.** The epoch view answers only for the cached epoch
+and the one after it. With the cache stuck at genesis, every slot more than
+one epoch out resolved to nothing, so `submission_slot_for` found no slot and
+N3 reported all four rows unexercised. `wait_for_the_epoch_view_to_catch_up`
+made it worse: it waited up to half the observation window for a cache that
+could never move, and the head drifted further away while it waited.
 
-This is a workaround, not a resolution. It removes the lane's dependence on
-a lagging cache without settling which view is authoritative.
+**The fix.** `advance_finality` in the oracle, called after authoring and
+after a successful import. Not `dummy_run`'s rule of one slot behind the head:
+the harness is asked to import blocks a node announced late, a block older
+than the finalized head cannot be imported at all, and at a one-slot lag a
+block two slots late is refused — which turned a late announcement into a
+harness-side failure on `n1_header_seal_import_ok`, a row about whether the
+block is well formed. It finalizes the *earliest block still in the head's
+epoch*, the least that moves the epoch index, leaving the rest of the epoch
+open to import; and it skips the head, so a fresh boundary does not leave
+zero headroom.
 
-**To close it, a follow-up session should establish:**
+**Measured after the fix**, on a live run:
 
-1. Which view is authoritative for a slot in the head's own epoch. The STF
-   also computes `old_assignments` (`chain/exec/reports.rs`), so it may accept
-   more than one rotation — in which case both views are valid inputs and
-   nothing is wrong. That has not been checked.
-2. If the STF accepts only entry 2, whether a guarantee formed over the
-   cached entry-1 cohort can actually be included. If it cannot, a node
-   sharing by the cached view is building guarantees the chain will reject,
-   which is a polkajam defect and belongs upstream.
-3. Whether the harness should then grade the sharing row against the on-chain
-   rule and report the divergence as a finding, rather than working around it
-   by choice of slot.
+```
+[assignment] entropy: cached ee155ace9c402920  best-block[1] 4f739a0703289dcc
+             best-block[2] ee155ace9c402920  -> cached matches entry 2 (the on-chain rule)
+[assignment] cached epoch view 822125, best-block state epoch 822125
+[assignment] slot 9865512 core 0: storage Ok(Some([2, 3, 4])) epoch Ok(Some([2, 3, 4]))
+[assignment] slot 9865512 core 1: storage Ok(Some([0, 1, 5])) epoch Ok(Some([0, 1, 5]))
+```
 
-The diagnostics that produced this are `RefChain::epoch_views` and
-`RefChain::assignment_entropy`, printed by the runner on every N3 plan.
+**The two views agree, on both cores.** There is no divergence to choose
+between, so the three questions this finding left open — which view is
+authoritative, whether a guarantee over the cached cohort can be included,
+whether the harness should grade against the on-chain rule — do not arise.
+Nor was there anything to raise upstream: the defect was ours.
 
----
+N3 went from four unexercised rows to eleven running, nine of them passing.
+
+**Pinned by** `the_cached_epoch_view_follows_the_chain` in `m2-reference`,
+which authors across two boundaries and asserts the cached view has moved off
+genesis and sits within one epoch of the head.
+
+**One caution.** In the run above the cached entropy also equals entry 2, but
+the chain was only a few epochs old and entry 2 may still hold genesis
+entropy at that age. The cohorts agreeing is the direct evidence; the entropy
+line is consistent with it rather than independent proof.
 
 ## 2. A distributed report is never included — CLOSED 2026-11-12
 
@@ -389,3 +400,260 @@ version out of its own `Cargo.lock` -- the oracle's already reads its manifest
 for the polkajam revision -- and the handshake compares them, the way it
 already compares the protocol version. About fifteen lines, and it turns a
 silent divergence into a refusal to start.
+
+## 8. The node accepts a CE 133 extrinsic message of the wrong size
+
+**Status:** open, observed once, and it may be a change in the node rather
+than a standing defect. Seen 2026-11-17.
+
+CE 133's second message carries the extrinsic data, and `simple.md:373` gives
+its size as the sum of the lengths the work-package declares. polkajam itself
+reads it with `read_exact(saturated_extrinsic_size())`, so that equality is
+the rule, and DESIGN §11 N3 lists "extrinsic size mismatch" as a fault the
+node must reset the stream for.
+
+The fault row sends a message whose size does not match the declared sum. The
+node accepted it and did not reset.
+
+**What makes this worth a second look rather than a filing.** The same row
+passed at the previous pin (`e3d216c2`) in earlier sessions, and failed on
+the first run after re-pinning to `5ef954fb1`. Twenty-seven commits separate
+them, several touching block import and work-package handling. It is equally
+possible that the row only now ran to completion: the N3 lane was reporting
+every row unexercised before §1 was fixed, so "passed before" may mean
+"passed in an older session under different conditions" rather than "passed
+on this code path yesterday".
+
+**Before filing anything upstream**, establish:
+
+1. Whether it reproduces. One run is not a pattern, and the N3 lane has only
+   just started exercising again.
+2. Whether it reproduces at the *old* pin with the current harness, which
+   separates a node change from a harness change.
+3. Which of polkajam's read paths handles this message now, and whether the
+   `saturated_extrinsic_size` read survived the re-pin range.
+
+Related: §4, the oversized first message, which is the same shape — a size
+rule the node does not enforce — and which also failed in this run.
+
+## 9. The hazmat availability export cannot build a justification
+
+**Status:** open upstream; the harness is pinned to the proposed branch,
+and with it the whole of N4 is now reachable. Found 2026-11-17, starting N4.
+
+polkajam #1378 exported erasure coding and the justification builders so the
+harness could produce availability artifacts outside the node, and that is
+what let the N4 lane start. It is not sufficient for half of it.
+
+`bundle_justification` and `segment_justification` both take a `ShardProof`,
+and nothing outside `jam-node` can build one. Every top-level module in that
+crate is private except `hazmat`, so only its explicit re-exports are
+reachable, and the Merkle layer is not among them. Tracing what the node
+itself does to turn a bundle into a servable shard
+(`availability/mod.rs:190-215`):
+
+| step | exported |
+|---|---|
+| `erasure_shards(bundle, n)` | yes |
+| `segments_shards(segments, n)` | yes |
+| `merkle_root(s, len)` | **no** — `util::merkle` |
+| `pack_erasure_tree_entry(hash, root)` | **no** — `util::merkle` |
+| `merkle_proofs(entries, len)` | **no** — `util::merkle` |
+| `bundle_justification(&ShardProof)` | yes, and uncallable without the above |
+
+`check_bundle_proof` and `check_segment_proof` take wire types and are fully
+usable. So the harness can **verify** a node's justification and cannot
+**construct** its own.
+
+**What that cost.** Five of DESIGN's seven N4 rows are the node producing
+and the harness checking -- CE 137/138/139/140 serve, CE 141 send, CE 141
+receive to inclusion -- and those were reachable with the verify half alone.
+The two where the *harness* must serve shards to the node, CE 137 fetch and
+CE 139/140 fetch, were not.
+
+**And what it cost that was not obvious.** Without the construct half there
+is also no way to *simulate* a node that serves shards, so none of the five
+reachable rows could be shown to fail. Checks nobody has seen fail are
+checks nobody knows are checks, and this harness has already paid for that
+twice. With the pin moved, `m2-sim` holds a real coded bundle and
+`n4_sim_it` drives eleven faults through it.
+
+**Open upstream** as polkajam#1401, from branch `jv-export-n4`:
+`util::merkle` becomes `pub(crate)` and `hazmat::merkle` re-exports
+`merkle_proofs`, `merkle_root`, `pack_erasure_tree_entry` and the proof
+types. The same shape as #1378 -- a re-export and a visibility bump, no
+behaviour change.
+
+The pin moved to that branch (`43689c3de`) on 2026-11-17, ahead of the PR
+being opened, for two reasons. `merkle_root` is needed to *check* a CE 137
+justification at all, since that protocol takes its segment root from the
+shards rather than from the justification (§11b). And `merkle_proofs` with
+`pack_erasure_tree_entry` are needed to *build* one, without which no
+simulated node can serve shards and none of N4's serve rows could be shown
+to fail. The pin goes back to a merge commit once #1401 lands.
+
+## 10. DESIGN had the erasure recovery threshold wrong
+
+**Status:** fixed in DESIGN 2026-11-17.
+
+DESIGN §2's tiny-parameter table said "EC recovery 2 shards" and the §11 N4
+row said the node "reconstructs imports from 2 shards". It is **three**:
+
+```rust
+pub const fn erasure_recovery_count(val_count: usize) -> usize {
+    let mut recovery_count = val_count / VALS_PER_CORE + 1;   // 6/3 + 1 = 3
+    while !SEGMENT_LEN.is_multiple_of(POINT_LEN * recovery_count) { recovery_count -= 1; }
+    recovery_count
+}
+```
+
+polkajam pins it with `erasure_recovery_count_matches_gp`: 6 to 3, 78 to 27,
+1023 to 342. A CE 139/140 fetch row written from DESIGN would have asked a
+conforming node to reconstruct from one shard too few and failed it.
+
+Found by asserting the wrong value in a reachability test and reading the
+failure, rather than by reading the table -- which is the only reason it was
+caught before the row was written. `CodedBundle` now carries the threshold
+from the engine so no lane has to hold a copy of this number.
+
+## 11. The harness's availability codecs were shape models, not the wire — CLOSED 2026-11-17
+
+**Status:** closed. Found 2026-11-17, wiring the N4 emulator against the real
+serving path; all three defects were the harness's own.
+
+`crates/jamnp-s/src/codec/ce137_148.rs` opens by saying so:
+
+> Shapes only: the harness does not produce real erasure data at this layer,
+> so all shards/segments/bundles are opaque `Vec<u8>`.
+
+That was a fair trade while nothing spoke those protocols. The moment N4
+started it stopped being one, and three separate things were wrong — each of
+which would have failed an honest node rather than erroring.
+
+**a. CE 137/138/139/140 replies are framed messages, not one structure.**
+`ShardResponse` and friends derive `Encode`/`Decode`, so a bundle shard
+decoded as a compact-length-prefixed `Vec<u8>` and the segment shards as a
+prefixed `Vec<Vec<u8>>`. The node writes neither. It writes a *sequence of
+whole messages* — bundle shard, then CE 137's segment shards concatenated
+with no boundary, then the justification — each with the stream's own
+`[len: u32 LE]` framing (`availability/net/mod.rs:358-368`, read back by
+`read_exact` / `read_decoded_bounded_seq`). Nothing in the reply says how
+long a shard is, because the reader already knows: the frame does.
+
+The justification is the sharpest case. Its elements are written back to
+back with **no count in front of them**, while the engine's own
+`BundleJustification` is a `BoundedVec` whose `Decode` expects a compact
+count. Handing the wire bytes to that decoder reads the first element's
+discriminator as a length.
+
+**b. The two bundle protocols take their segment root from different
+places.** CE 138 appends it as a final `0 ++ Hash` element and the reader
+pops it off before checking the proof; CE 137 omits it and the reader takes
+the Merkle root of the segment shards instead (`net/mod.rs:946-963` against
+`:1030-1046`). Reading one the other's way turns a sound proof into a failed
+one. This is now `CheckServedShard`'s `protocol` field, decided in the
+oracle: it is a rule both sides must apply identically, so it is applied in
+one place.
+
+**c. CE 141's bitfield had a length prefix.** `Assurance.bitfield` was a
+`Vec<u8>` with a derived codec, which puts a compact length in front of it.
+The wire is `AvailabilityStatement ++ Signature` and the bitfield is
+`[u8; ceil(C / 8)]` — fixed width, no prefix. Under tiny that is one extra
+byte, which shifts the 64-byte signature out of place: every assurance the
+harness sent would have been refused, and every one it received would have
+been read as a bad signature from a node that signed correctly.
+
+Two tests had the wrong vector written into them, which is why this survived
+a full suite. They now assert the raw layout, and
+`assurance::the_wire_and_the_engine_agree_about_the_width` holds the two
+independent readings of the width together — `jamnp-s` derives it from the
+core count, `m2-reference` asks the engine's type, and neither can drift
+alone because the wire carries nothing to contradict either.
+
+**The general shape.** All three are the same mistake in different places: a
+self-describing codec standing in for a wire whose lengths are carried out of
+band. A shape model is only safe while nothing sends it, and the comment
+saying so is not a guard.
+
+## 12. N4's plan cannot be written before the run, and that is the protocol's doing
+
+**Status:** not a defect — a design note, recorded because the first attempt
+got it wrong. 2026-11-17, wiring N4 into a real run.
+
+Every other plan this harness makes is laid out before the observation
+window: the ticket schedule, the CE 133 submission, the report to distribute,
+the bundles to share. N4's cannot be, and the reason is worth writing down
+because the obvious alternative is wrong in a way that reads as a node
+defect.
+
+CE 137/138/139/140 are *fetches against an erasure root*. A node serves
+shards for the bundles it holds, and it holds the ones it guaranteed. The
+harness knows several erasure roots before a run starts — every bundle it
+built itself — and the node is entitled to answer `NoData` for every one of
+them, because it never saw those bundles. A lane that asked for one of those
+would record a refusal and fail `n4_ce137_answered` against a node doing
+exactly the right thing.
+
+The only root a node owes shards for is one **it** published. That root
+exists only once the node has guaranteed a package and distributed the
+report, which is mid-run. So:
+
+- the harness submits a package over CE 133 (N3's machinery, which N4 now
+  also depends on — `LaneSet::needs_package` covers both),
+- a watcher waits for the node's own CE 135 distribution and reads
+  `package_spec.erasure_root`, `erasure_shards` and `exports_count` straight
+  off the report's bytes,
+- the plan goes out on a watch of its own, because `plans_set` has long
+  since flipped by then and a driver waiting on that would read an empty
+  plan and do nothing.
+
+A run where the node guarantees nothing therefore exercises no N4 fetch. The
+lane says so, which is the truth, rather than failing the node for the
+harness having nothing to ask about.
+
+**The assurance rounds are split for a related reason.** The three
+deliberate faults (`WrongAnchor`, `BadSignature`, `EmptyCore`) must come from
+validators that did *not* already send an honest assurance for the same
+anchor — otherwise the node drops the second as a duplicate, and
+`n4_ce141_invalid_assurance_excluded` passes for a reason that has nothing to
+do with the assurance being invalid. So the honest round and the spoiled
+round sit three slots apart, against different blocks. With a supermajority
+threshold of 5 of 6, that also keeps the honest round complete enough for
+`n4_availability_threshold_reached` to mean something.
+
+## 13. A timing row that could never fail — CLOSED 2026-11-17
+
+**Status:** closed. Found by writing the simulated node that should have
+broken it, which is the only reason it was found at all.
+
+`n4_ce141_sent_before_the_slot` read:
+
+```rust
+seen.lead_ms > 0
+```
+
+against a `lead_ms` computed as the time remaining in the slot the assurance
+arrived in. That quantity is positive by construction — it is bounded by
+`(0, slot_period]` — so the row passed on every node, conforming or not,
+and would have gone on passing forever.
+
+`simple.md:679-680` asks for roughly two seconds' lead. The row now asks for
+that, as a **floor** rather than a window: assuring *early* is not a defect,
+since a node with nothing left to wait for may send as soon as it has
+verified its shard, so only too little lead is reported. It stays Soft,
+because "roughly" is not a number a node can be hard-failed on.
+
+Two things worth keeping from this.
+
+**The row looked fine in review and in its unit test.** The test fed
+`lead_ms: -500` and watched the row fail — a value the real measurement
+cannot produce. A unit test that fabricates its input can only prove the
+comparison does what it says, never that the input can reach the values it
+compares against. The simulated node is what closes that gap, because it
+produces the measurement the way a run does.
+
+**The first attempt at the fault did not work either.** `AssuranceLate`
+slept one whole slot period before sending, which lands at exactly the same
+phase of the next slot and reads as punctual. It now holds until the slot has
+nearly run out. A fault that fails to break the thing it is aimed at looks
+identical to a check that works.

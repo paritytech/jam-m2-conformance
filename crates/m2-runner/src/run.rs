@@ -421,6 +421,25 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         let reports_seen = emu.reports_seen();
         let ce128_probes = emu.ce128_probes();
         let ce129_probes = emu.ce129_probes();
+        let shards_served = emu.shards_served();
+        let segment_shards_served = emu.segment_shards_served();
+        let assurances_seen = emu.assurances_seen();
+        let assurances_offered = emu.assurances_offered();
+        let avail_shard_count = Arc::new(Mutex::new(None));
+        if cli.lanes.needs_availability() {
+            // The one plan that cannot be written before the run. Its
+            // erasure root is the one the NUT published in a report it
+            // guaranteed, so it exists only once the node has guaranteed
+            // something -- and a root the harness guaranteed instead would
+            // be one the node is right to answer `NoData` for.
+            let reports = Arc::clone(&reports_seen);
+            let shard_count = Arc::clone(&avail_shard_count);
+            let planner = emu.avail_planner();
+            let budget = cli.observe_secs;
+            dial_tasks.push(tokio::spawn(async move {
+                plan_availability(reports, shard_count, planner, budget).await;
+            }));
+        }
         let real_run = RealRunData {
             ref_chain,
             nut_blocks,
@@ -437,6 +456,11 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             sharing_answer,
             distributed,
             shared_to_nut,
+            shards_served,
+            segment_shards_served,
+            assurances_seen,
+            assurances_offered,
+            avail_shard_count,
         };
         (
             ObsSource::Emulator {
@@ -1125,6 +1149,112 @@ async fn submit_one(
     )
     .await;
     drop(connection);
+}
+
+/// Watch for a report the NUT guaranteed, and plan this run's availability
+/// around it.
+///
+/// Every other plan is written before the observation window. This one
+/// cannot be: it is built around an erasure root, and the only root the node
+/// is obliged to serve shards for is one it published itself. A root the
+/// harness guaranteed would be a root the node never held, and `NoData` on
+/// it would read as a node that refuses to serve.
+///
+/// Gives up when the window runs out, in which case the N4 lane reports its
+/// rules as unexercised -- which is the truth, and not a node that failed.
+async fn plan_availability(
+    reports: Arc<Mutex<Vec<m2_scenario::scenarios::n3::ReportSeen>>>,
+    shard_count: Arc<Mutex<Option<u16>>>,
+    planner: m2_emu::emu::AvailPlanner,
+    budget_secs: u64,
+) {
+    let deadline = jamnp_s::clock::current().wall_ms() + budget_secs * 1000;
+    let spec = loop {
+        if let Some(spec) = first_package_spec(&reports) {
+            break spec;
+        }
+        if jamnp_s::clock::current().wall_ms() >= deadline {
+            eprintln!(
+                "[availability] the NUT published no report of its own inside the window; \
+                 N4 has nothing to ask it for"
+            );
+            return;
+        }
+        jamnp_s::clock::current()
+            .sleep(Duration::from_millis(m2_scenario::ctx::SLOT_PERIOD_MS))
+            .await;
+    };
+
+    // Segment indices only where the package exported something. Asking for
+    // segment 0 of a package that exports none is asking for a slice that
+    // does not exist, and a node is right to refuse it.
+    let segment_indices: Vec<u16> = (0..spec.exports_count.min(MAX_SEGMENTS_ASKED)).collect();
+    let now = m2_reference::chain::wall_clock_slot();
+    let plan = m2_emu::avail_io::AvailPlan {
+        erasure_root: spec.erasure_root,
+        shard_count: spec.erasure_shards,
+        segment_indices,
+        cores: spec.cores,
+        // A slot ahead, so the fetches have somewhere to finish before the
+        // assurance that follows them.
+        honest_slot: now + 1,
+        spoiled_slot: now + 1 + SPOILED_ASSURANCE_GAP_SLOTS,
+    };
+    eprintln!(
+        "[availability] planning against root {} coded into {} shards, {} segment(s)",
+        hex8(&plan.erasure_root),
+        plan.shard_count,
+        plan.segment_indices.len()
+    );
+    *lock(&shard_count) = Some(plan.shard_count);
+    planner.set(plan);
+}
+
+/// Slots between the honest assurances and the deliberately spoiled ones.
+///
+/// They must land on different blocks. A validator that sent an honest
+/// assurance and a spoiled one for the *same* anchor would have the second
+/// dropped as a duplicate, and the row asking whether the node excludes
+/// invalid assurances would pass for a reason that has nothing to do with
+/// their being invalid.
+const SPOILED_ASSURANCE_GAP_SLOTS: u32 = 3;
+
+/// Most segment indices a run asks for over CE 139/140.
+///
+/// A handful is enough to exercise the protocol; the point of the rows is
+/// that the slices verify, not that every one of them is fetched.
+const MAX_SEGMENTS_ASKED: u16 = 4;
+
+/// What a report the NUT distributed says about its package's availability.
+struct AvailSpec {
+    erasure_root: [u8; 32],
+    erasure_shards: u16,
+    exports_count: u16,
+    cores: Vec<u16>,
+}
+
+/// Read the package spec out of the first report the NUT distributed.
+///
+/// Decoded from the bytes that came off the wire rather than from anything
+/// the harness computed: the erasure root the node must serve shards for is
+/// the one it published, whatever this harness would have derived.
+fn first_package_spec(
+    reports: &Arc<Mutex<Vec<m2_scenario::scenarios::n3::ReportSeen>>>,
+) -> Option<AvailSpec> {
+    let seen = lock(reports);
+    let report = seen.first()?;
+    let mut input: &[u8] = &report.encoded_report;
+    let decoded = <jam_std_common::WorkReport as jam_types::Decode>::decode(&mut input).ok()?;
+    Some(AvailSpec {
+        erasure_root: decoded.package_spec.erasure_root.0,
+        erasure_shards: decoded.package_spec.erasure_shards,
+        exports_count: decoded.package_spec.exports_count,
+        cores: vec![decoded.core_index],
+    })
+}
+
+fn hex8(bytes: &[u8; 32]) -> String {
+    bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Wait until `slot` begins.

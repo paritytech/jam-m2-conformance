@@ -30,7 +30,7 @@ use codec::{Decode, Encode};
 /// Bumped whenever a message changes shape. The client refuses a mismatch
 /// rather than guessing, because a silently misread response is a wrong
 /// conformance verdict rather than an error.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Largest frame either side will read, matching the fuzz protocol's.
 pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
@@ -331,6 +331,150 @@ pub enum Message {
         protocol_parameters: Vec<u8>,
     } = 46,
 
+    /// Erasure-code a work-package bundle, as a guarantor does before
+    /// serving CE 137/138.
+    ///
+    /// Session-free: coding is a pure function of the bytes and the shard
+    /// count. What makes it the oracle's job is that the harness must get
+    /// the *engine's* answer, not a second implementation of Reed-Solomon.
+    CodeBundle {
+        bundle: Vec<u8>,
+        shard_count: u16,
+    } = 47,
+    /// The coded shards, with the two numbers a lane needs beside them.
+    CodedBundle {
+        shards: Vec<Vec<u8>>,
+        /// How many shards reconstruct the bundle (`D(v)`), which for six
+        /// validators is three and not two. DESIGN said two in both its
+        /// parameter table and its N4 row.
+        recovery_threshold: u16,
+        /// The length every shard has, for a row that checks sizes without
+        /// holding the shards.
+        shard_len: u32,
+    } = 48,
+
+    /// Check a CE 137 or CE 138 reply the way a node checks one it was
+    /// served.
+    ///
+    /// The whole reply travels, as the bytes that came off the wire, and the
+    /// oracle does every step. Re-encoding the justification through this
+    /// harness's own type would hide exactly the disagreement worth finding:
+    /// if `jamnp-s` and the engine read that structure differently, the round
+    /// trip would paper over it and the check would pass on bytes the node
+    /// never sent.
+    ///
+    /// `protocol` rides along because the two differ in *where the segment
+    /// root comes from*: CE 138 carries it as the last justification element,
+    /// while CE 137 omits it and the reader must take the Merkle root of the
+    /// segment shards instead. That is a rule both sides must apply
+    /// identically, so it is applied in one place rather than by whoever
+    /// happens to be calling.
+    CheckServedShard {
+        /// 137 or 138. Anything else is an error rather than a default.
+        protocol: u16,
+        erasure_root: [u8; 32],
+        shard_index: u16,
+        shard_count: u16,
+        /// Hashed here, so the hash is the engine's own.
+        bundle_shard: Vec<u8>,
+        /// CE 137's segment shards, as the raw concatenation the wire
+        /// carries. Empty for CE 138, which sends none.
+        ///
+        /// No slice length travels with them: the wire marks no boundary,
+        /// but `jam_types::segment_slice_len` derives one from the shard
+        /// count and both sides link it, so sending it would only create a
+        /// way for the caller to disagree with the engine.
+        segment_shards: Vec<u8>,
+        justification: Vec<u8>,
+    } = 49,
+    /// Whether the justification proves that shard sits under that root.
+    ///
+    /// `None` where it could not be decoded at all, which is a different
+    /// answer from "decoded and did not verify" and belongs in a different
+    /// finding.
+    ShardChecked {
+        verified: Option<bool>,
+        detail: Option<String>,
+    } = 50,
+
+    /// Erasure-code a work package's exported segments into per-validator
+    /// segment shards, for CE 139/140.
+    ///
+    /// Each segment is `SEGMENT_LEN` (4104) bytes; anything else is an
+    /// error rather than a truncation, because a segment of the wrong
+    /// length codes into shards that are wrong in a way no later check
+    /// would attribute to this.
+    CodeSegments {
+        segments: Vec<Vec<u8>>,
+        shard_count: u16,
+    } = 51,
+    /// One shard per validator, each the concatenation of that validator's
+    /// slice of every segment, in segment order.
+    CodedSegments {
+        shards: Vec<Vec<u8>>,
+        /// The slice boundary within each shard: `SEGMENT_LEN / D(v)`, a
+        /// property of the coding rather than a protocol constant, so it
+        /// travels with the shards instead of being recomputed.
+        slice_len: u32,
+    } = 52,
+
+    /// Check a CE 139/140 segment-shard justification, answered with
+    /// `ShardChecked`.
+    ///
+    /// The justification is decoded by the engine's own
+    /// `decode_segment_justification`, which needs the slice length to know
+    /// where its elements end.
+    CheckSegmentShard {
+        erasure_root: [u8; 32],
+        shard_index: u16,
+        shard_count: u16,
+        segment_index: u16,
+        segment_count: u32,
+        segment_slice: Vec<u8>,
+        justification: Vec<u8>,
+    } = 53,
+
+    /// Build everything needed to *serve* a bundle's shards, the way a
+    /// guarantor does once it has refined a package.
+    ///
+    /// The counterpart of [`Message::CheckServedShard`], and the half that
+    /// was unreachable until `hazmat::merkle` was exported: `merkle_proofs`
+    /// and `pack_erasure_tree_entry` are what turn coded shards into a root
+    /// and per-shard proofs, and nothing outside `jam-node` could call them
+    /// (findings.md §9). Without this a simulated node cannot serve CE
+    /// 137/138/139/140 at all, and the rows that grade those protocols have
+    /// never been shown to fail.
+    MakeAvailable {
+        bundle: Vec<u8>,
+        /// Exported segments, `SEGMENT_LEN` bytes each.
+        segments: Vec<Vec<u8>>,
+        shard_count: u16,
+    } = 54,
+    /// One servable shard per validator, with the justifications each
+    /// protocol carries.
+    ///
+    /// The justifications travel as the bytes the wire carries, not as a
+    /// structure: their elements run back to back with no count, and a
+    /// caller handed a decoded form would have to re-derive that layout to
+    /// put them on a stream. Producing them here keeps the layout in the
+    /// one place that already reads it.
+    AvailableShards {
+        erasure_root: [u8; 32],
+        /// Per validator, in validator order.
+        bundle_shards: Vec<Vec<u8>>,
+        /// Per validator: that validator's slice of every segment,
+        /// concatenated in segment order.
+        segment_shards: Vec<Vec<u8>>,
+        /// CE 137's justification per validator: the co-path alone, because
+        /// the segment shards travel beside it and their root is theirs.
+        shard_justifications: Vec<Vec<u8>>,
+        /// CE 138's per validator: the same co-path with the segment root
+        /// appended, which is where that protocol's reader takes it from.
+        audit_justifications: Vec<Vec<u8>>,
+        /// CE 140's, per validator and then per segment index.
+        segment_justifications: Vec<Vec<Vec<u8>>>,
+    } = 55,
+
     /// Build a package, optionally against an authorizer no core accepts.
     BuildPackage {
         session: SessionId,
@@ -593,6 +737,71 @@ mod tests {
             })),
             Message::StateIs(None),
             Message::DevSpec { base_port: 40_000 },
+            Message::CodeBundle {
+                bundle: vec![0x17; 64],
+                shard_count: 6,
+            },
+            Message::CodedBundle {
+                shards: vec![vec![0x18; 8], vec![0x19; 8]],
+                recovery_threshold: 3,
+                shard_len: 8,
+            },
+            Message::CheckServedShard {
+                protocol: 137,
+                erasure_root: [0x1b; 32],
+                shard_index: 2,
+                shard_count: 6,
+                bundle_shard: vec![0x1c; 8],
+                segment_shards: vec![0x1d; 16],
+                justification: vec![0x1e; 33],
+            },
+            Message::CheckServedShard {
+                protocol: 138,
+                erasure_root: [0x1b; 32],
+                shard_index: 2,
+                shard_count: 6,
+                bundle_shard: vec![0x1c; 8],
+                segment_shards: Vec::new(),
+                justification: vec![0x1e; 66],
+            },
+            Message::ShardChecked {
+                verified: Some(true),
+                detail: None,
+            },
+            Message::CodeSegments {
+                segments: vec![vec![0x1f; 4104]],
+                shard_count: 6,
+            },
+            Message::CodedSegments {
+                shards: vec![vec![0x20; 1368], vec![0x21; 1368]],
+                slice_len: 1368,
+            },
+            Message::MakeAvailable {
+                bundle: vec![0x26; 128],
+                segments: vec![vec![0x27; 4104]],
+                shard_count: 6,
+            },
+            Message::AvailableShards {
+                erasure_root: [0x28; 32],
+                bundle_shards: vec![vec![0x29; 8], vec![0x2a; 8]],
+                segment_shards: vec![vec![0x2b; 16], vec![0x2c; 16]],
+                shard_justifications: vec![vec![0x2d; 33], vec![0x2e; 33]],
+                audit_justifications: vec![vec![0x2f; 66], vec![0x30; 66]],
+                segment_justifications: vec![vec![vec![0x31; 34]], vec![vec![0x32; 34]]],
+            },
+            Message::CheckSegmentShard {
+                erasure_root: [0x23; 32],
+                shard_index: 1,
+                shard_count: 6,
+                segment_index: 0,
+                segment_count: 1,
+                segment_slice: vec![0x24; 1368],
+                justification: vec![0x25; 34],
+            },
+            Message::ShardChecked {
+                verified: None,
+                detail: Some("the justification did not decode".into()),
+            },
             Message::DevSpecIs {
                 genesis_header: vec![0x12; 8],
                 keyvals: vec![(vec![0x13; 31], vec![0x14, 0x15])],
