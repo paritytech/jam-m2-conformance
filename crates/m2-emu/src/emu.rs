@@ -112,6 +112,7 @@ pub struct Emulator {
     avail_set: Arc<watch::Sender<bool>>,
     shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::ShardServed>>>,
     segment_shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentShardsServed>>>,
+    segments_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentsServed>>>,
     assurances_offered: Arc<Mutex<Vec<m2_scenario::scenarios::n4::AssuranceOffered>>>,
     shared_to_nut: Arc<Mutex<Vec<SharedToNut>>>,
     deliveries: Arc<Mutex<Vec<DeliveredTicket>>>,
@@ -215,6 +216,8 @@ pub struct EmuShared {
     pub shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::ShardServed>>>,
     /// CE 139/140 replies the NUT served.
     pub segment_shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentShardsServed>>>,
+    /// CE 148 replies the NUT served.
+    pub segments_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentsServed>>>,
     /// CE 141 assurances the emulator offered the NUT.
     pub assurances_offered: Arc<Mutex<Vec<m2_scenario::scenarios::n4::AssuranceOffered>>>,
     /// Tickets actually put on the wire, with the wall-clock time they were
@@ -399,6 +402,7 @@ impl Emulator {
             avail_set: Arc::new(watch::channel(false).0),
             shards_served: Arc::new(Mutex::new(Vec::new())),
             segment_shards_served: Arc::new(Mutex::new(Vec::new())),
+            segments_served: Arc::new(Mutex::new(Vec::new())),
             assurances_offered: Arc::new(Mutex::new(Vec::new())),
             deliveries: Arc::new(Mutex::new(Vec::new())),
             ce128_probes: Arc::new(Mutex::new(Vec::new())),
@@ -498,6 +502,11 @@ impl Emulator {
         Arc::clone(&self.segment_shards_served)
     }
 
+    /// CE 148 replies the NUT served.
+    pub fn segments_served(&self) -> Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentsServed>>> {
+        Arc::clone(&self.segments_served)
+    }
+
     /// CE 141 assurances the emulator offered the NUT.
     pub fn assurances_offered(
         &self,
@@ -555,6 +564,7 @@ impl Emulator {
             avail_set: self.avail_set.subscribe(),
             shards_served: Arc::clone(&self.shards_served),
             segment_shards_served: Arc::clone(&self.segment_shards_served),
+            segments_served: Arc::clone(&self.segments_served),
             assurances_offered: Arc::clone(&self.assurances_offered),
             shared_to_nut: Arc::clone(&self.shared_to_nut),
             deliveries: Arc::clone(&self.deliveries),
@@ -899,6 +909,7 @@ fn start_availability(connection: &Conn, peer: u16, shared: &EmuShared) {
             &shared.obs,
             &shared.shards_served,
             &shared.segment_shards_served,
+            &shared.segments_served,
             &shared.assurances_offered,
             // The chain's head, read at send time: the block to assure is
             // whichever one the chain is on, and a hash chosen when the plan

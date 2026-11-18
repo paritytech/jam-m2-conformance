@@ -434,6 +434,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         let ce129_probes = emu.ce129_probes();
         let shards_served = emu.shards_served();
         let segment_shards_served = emu.segment_shards_served();
+        let segments_served = emu.segments_served();
         let assurances_seen = emu.assurances_seen();
         let assurances_offered = emu.assurances_offered();
         let avail_shard_count = Arc::new(Mutex::new(None));
@@ -469,6 +470,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             shared_to_nut,
             shards_served,
             segment_shards_served,
+            segments_served,
             assurances_seen,
             assurances_offered,
             avail_shard_count,
@@ -1216,6 +1218,7 @@ async fn plan_availability(
     let now = m2_reference::chain::wall_clock_slot();
     let plan = m2_emu::avail_io::AvailPlan {
         erasure_root: spec.erasure_root,
+        segments_root: spec.exports_root,
         shard_count: spec.erasure_shards,
         segment_indices,
         cores: spec.cores,
@@ -1256,6 +1259,10 @@ const MAX_SEGMENTS_ASKED: u16 = 4;
 struct AvailSpec {
     erasure_root: [u8; 32],
     erasure_shards: u16,
+    /// The root the package's exported segments sit under, which is what a
+    /// CE 148 request names. A different root from `erasure_root`, and a
+    /// different question.
+    exports_root: [u8; 32],
     exports_count: u16,
     cores: Vec<u16>,
 }
@@ -1275,6 +1282,7 @@ fn first_package_spec(
     Some(AvailSpec {
         erasure_root: decoded.package_spec.erasure_root.0,
         erasure_shards: decoded.package_spec.erasure_shards,
+        exports_root: decoded.package_spec.exports_root.0,
         exports_count: decoded.package_spec.exports_count,
         cores: vec![decoded.core_index],
     })

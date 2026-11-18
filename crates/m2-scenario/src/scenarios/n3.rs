@@ -1481,4 +1481,95 @@ mod tests {
             names(&results)
         );
     }
+
+    /// Neither protocol can answer for the other.
+    ///
+    /// The two are graded by one function, so the thing worth holding is
+    /// that the rows stay apart: a run that submitted only over CE 133 must
+    /// leave CE 146 unexercised rather than reporting it green. That is the
+    /// mistake obs code 44 was retired for, in a new place.
+    #[test]
+    fn one_protocol_does_not_answer_for_the_other() {
+        let only_133 = ctx(
+            vec![submission(false)],
+            vec![
+                share(CO[0], SENT_AT + 10, Vec::new()),
+                share(CO[1], SENT_AT + 20, Vec::new()),
+            ],
+        );
+        let results = run(&n3_ce133_submission(&only_133));
+        let ce133 = names(&results);
+        assert!(
+            ce133.contains(&"n3_ce133_accepted"),
+            "CE 133 was exercised: {ce133:?}"
+        );
+        let results = run(&n3_ce146_submission(&only_133));
+        let ce146 = names(&results);
+        assert_eq!(
+            ce146,
+            vec!["n3_ce146_not_exercised"],
+            "and CE 146 was not: {ce146:?}"
+        );
+
+        // And the same the other way, under CE 146's own names.
+        let only_146 = ctx(
+            vec![SubmittedPackage {
+                protocol: 146,
+                ..submission(false)
+            }],
+            vec![
+                share(CO[0], SENT_AT + 10, Vec::new()),
+                share(CO[1], SENT_AT + 20, Vec::new()),
+            ],
+        );
+        let results = run(&n3_ce146_submission(&only_146));
+        let ce146 = names(&results);
+        assert!(
+            ce146.contains(&"n3_ce146_accepted")
+                && ce146.contains(&"n3_ce146_shares_with_both_co_guarantors"),
+            "CE 146 is graded by the same rules under its own names: {ce146:?}"
+        );
+        let results = run(&n3_ce133_submission(&only_146));
+        assert_eq!(names(&results), vec!["n3_ce133_not_exercised"]);
+    }
+
+    /// The oversize row names the cap its own protocol sets.
+    ///
+    /// CE 133 counts the core index with the package and CE 146 does not, so
+    /// a report that quoted one figure for both would send a reader looking
+    /// for a defect at the wrong size.
+    #[test]
+    fn each_protocol_reports_its_own_cap() {
+        for (protocol, cap) in [
+            (
+                133u16,
+                jamnp_s::codec::ce131_136::WORK_PACKAGE_INITIAL_MAX as usize,
+            ),
+            (146, jamnp_s::codec::ce137_148::WORK_PACKAGE_MAX),
+        ] {
+            let over = ctx(
+                vec![SubmittedPackage {
+                    protocol,
+                    fault: Some(SubmissionFault::Oversized),
+                    ..submission(false)
+                }],
+                Vec::new(),
+            );
+            let check = if protocol == 133 {
+                n3_ce133_submission(&over)
+            } else {
+                n3_ce146_submission(&over)
+            };
+            let results = run(&check);
+            let row = results
+                .iter()
+                .find(|r| r.name == format!("n3_ce{protocol}_oversized_reset"))
+                .unwrap_or_else(|| panic!("CE {protocol} grades its own oversize row"));
+            let detail = format!("{:?}", row.detail);
+            assert!(
+                detail.contains(&cap.to_string()),
+                "CE {protocol} must quote its own {cap} byte cap: {detail}"
+            );
+        }
+    }
 }

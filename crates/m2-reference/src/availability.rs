@@ -195,6 +195,65 @@ impl RefChain {
     }
 }
 
+/// A work package's exported segments, with the root they sit under.
+#[derive(Clone, Debug)]
+pub struct SegmentTree {
+    /// The segments root: what a report calls `exports_root`, and what a CE
+    /// 148 request names.
+    pub segments_root: [u8; 32],
+    /// One import proof per segment, in segment order.
+    pub proofs: Vec<Vec<[u8; 32]>>,
+}
+
+/// Build the segments root and per-segment import proofs a guarantor serves
+/// over CE 148.
+///
+/// The builders are public in `jam-std-common` and the checker is not, which
+/// is why this goes over the socket rather than being done here: the two
+/// halves have to be the same tree, and only the engine can say whether a
+/// proof walks to the root.
+pub fn make_segments(
+    oracle: &Arc<Oracle>,
+    segments: Vec<Vec<u8>>,
+) -> Result<SegmentTree, ChainError> {
+    match oracle.expect(Message::MakeSegments { segments })? {
+        Message::SegmentProofs {
+            segments_root,
+            proofs,
+        } => Ok(SegmentTree {
+            segments_root,
+            proofs,
+        }),
+        other => Err(ChainError::Oracle(format!(
+            "MakeSegments answered {other:?}"
+        ))),
+    }
+}
+
+/// Check a CE 148 import proof the way a requester checks one it was served.
+///
+/// The segment travels whole: hashing it into a leaf is part of the rule,
+/// and a caller that did it would be the second implementation.
+pub fn check_import_proof(
+    oracle: &Arc<Oracle>,
+    segments_root: [u8; 32],
+    segment_index: u16,
+    segment: Vec<u8>,
+    proof: Vec<[u8; 32]>,
+) -> Result<ShardCheck, ChainError> {
+    match oracle.expect(Message::CheckImportProof {
+        segments_root,
+        segment_index,
+        segment,
+        proof,
+    })? {
+        Message::ShardChecked { verified, detail } => Ok(ShardCheck { verified, detail }),
+        other => Err(ChainError::Oracle(format!(
+            "CheckImportProof answered {other:?}"
+        ))),
+    }
+}
+
 /// A CE 137 or CE 138 reply, as it came off the wire.
 ///
 /// Carried whole rather than picked apart here, because the two protocols
@@ -517,5 +576,68 @@ mod tests {
         )
         .expect_err("CE 140 does not serve bundle shards");
         assert!(format!("{error}").contains("140"), "{error}");
+    }
+
+    /// The CE 148 halves have to meet too: a proof `make_segments` builds
+    /// must verify through `check_import_proof`, for every segment.
+    ///
+    /// The same keystone as the shard round trip above, and needed for the
+    /// same reason. The builders come from `jam-std-common` and the checker
+    /// from `jam-node`, so "is the tree the engine's" is a real question
+    /// rather than a formality -- the leaf hashing alone would silently
+    /// disagree if either side did it differently.
+    #[test]
+    fn a_proof_this_builds_is_a_proof_this_accepts() {
+        let oracle = Oracle::for_tests();
+        let segments: Vec<Vec<u8>> = (0..3)
+            .map(|i| vec![0xc0 + i as u8; jam_types::SEGMENT_LEN])
+            .collect();
+        let tree = make_segments(&oracle, segments.clone()).expect("the segments build");
+        assert_eq!(tree.proofs.len(), segments.len(), "one proof per segment");
+
+        for (index, segment) in segments.iter().enumerate() {
+            let check = check_import_proof(
+                &oracle,
+                tree.segments_root,
+                index as u16,
+                segment.clone(),
+                tree.proofs[index].clone(),
+            )
+            .expect("the oracle answers");
+            assert_eq!(
+                check.verified,
+                Some(true),
+                "segment {index} must verify under its own root: {:?}",
+                check.detail
+            );
+        }
+
+        // And the proof is of *that* segment, not of any segment: swapping
+        // two is the smallest thing a node could get wrong while still
+        // sending a well-formed proof.
+        let crossed = check_import_proof(
+            &oracle,
+            tree.segments_root,
+            0,
+            segments[1].clone(),
+            tree.proofs[0].clone(),
+        )
+        .expect("the oracle answers");
+        assert_eq!(
+            crossed.verified,
+            Some(false),
+            "another segment under this proof must not verify"
+        );
+        assert!(crossed.detail.is_some(), "and it says what root it reached");
+    }
+
+    /// A segment of the wrong length is the caller's mistake, and comes back
+    /// as an error rather than as a tree built over something else.
+    #[test]
+    fn a_short_segment_is_the_callers_error() {
+        let oracle = Oracle::for_tests();
+        let error = make_segments(&oracle, vec![vec![0u8; 16]])
+            .expect_err("a 16-byte segment is not a segment");
+        assert!(format!("{error}").contains("16 bytes"), "{error}");
     }
 }

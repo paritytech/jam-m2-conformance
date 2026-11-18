@@ -132,6 +132,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         // No bundle is held, so every shard fetch is refused. Those rows are
         // not graded here; `n4_sim_it` is the test that serves shards.
         erasure_root: [0u8; 32],
+        segments_root: [0u8; 32],
         shard_count: jam_types::max_val_count(),
         segment_indices: Vec::new(),
         // An honest assurance claims the cores that carried a report, and
@@ -187,6 +188,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         nut_index: NUT_INDEX as u16,
         shards_served: Vec::new(),
         segment_shards_served: Vec::new(),
+        segments_served: Vec::new(),
         assurances_seen: Vec::new(),
         assurances_offered,
         availability_threshold: jam_types::supermajority_threshold(jam_types::max_val_count()),

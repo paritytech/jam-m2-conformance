@@ -122,3 +122,11 @@ pub const SERVED_BUNDLE_SHARD: u8 = 61;
 /// would let a run that exercised only one report both as exercised -- which
 /// is the mistake code 44 was retired for.
 pub const EMU_SENT_146: u8 = 62;
+
+/// The NUT answered a CE 148 segment request.
+///
+/// Its own code rather than [`SERVED_SEGMENT_SHARDS`]: CE 139/140 serve
+/// erasure-coded slices and CE 148 serves whole segments, and a lane that
+/// could not tell them apart would read a node that serves only one as
+/// serving both.
+pub const SERVED_SEGMENTS: u8 = 63;

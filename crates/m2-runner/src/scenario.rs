@@ -588,6 +588,9 @@ pub(crate) fn fabricated_run_ctx(
     // says they should be.
     const FAB_ERASURE_ROOT: [u8; 32] = [0x5c; 32];
     const FAB_ANCHOR: [u8; 32] = [0x4d; 32];
+    /// The exports root of the same fabricated package: what a CE 148
+    /// request names, and not the erasure root.
+    const FAB_SEGMENTS_ROOT: [u8; 32] = [0x6e; 32];
     let served = |protocol: u16| n4::ShardServed {
         protocol,
         erasure_root: FAB_ERASURE_ROOT,
@@ -627,10 +630,28 @@ pub(crate) fn fabricated_run_ctx(
         ragged: false,
         refused: false,
     };
+    // A conforming CE 148 reply: both segments asked for came back whole,
+    // each with a proof the engine would walk to the root.
+    let whole_segments = n4::SegmentsServed {
+        segments_root: FAB_SEGMENTS_ROOT,
+        requested: vec![0, 1],
+        segments: vec![
+            vec![0x77; jam_types::SEGMENT_LEN],
+            vec![0x88; jam_types::SEGMENT_LEN],
+        ],
+        proofs: vec![vec![[0x99; 32]], vec![[0xaa; 32]]],
+        proofs_verified: vec![Some(true), Some(true)],
+        proof_details: Vec::new(),
+        ragged: false,
+        proofs_unreadable: false,
+        messages: 2,
+        refused: false,
+    };
     let n4 = n4::N4Ctx {
         nut_index: FAB_NUT_INDEX,
         shards_served: vec![served(137), served(138)],
         segment_shards_served: vec![segments_served(139), segments_served(140)],
+        segments_served: vec![whole_segments],
         assurances_seen: vec![n4::AssuranceSeen {
             from: FAB_NUT_INDEX,
             anchor: FAB_ANCHOR,
@@ -773,6 +794,9 @@ mod tests {
             "n4_ce138_justification_verifies",
             "n4_ce139_140_one_shard_per_request",
             "n4_ce140_justifications_verify",
+            "n4_ce148_one_segment_per_request",
+            "n4_ce148_one_proof_per_segment",
+            "n4_ce148_proofs_verify",
             "n4_ce141_well_formed",
             "n4_ce141_bits_have_reports",
             // Both halves of the inclusion rule: a baseline that only ever

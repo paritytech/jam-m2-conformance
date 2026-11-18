@@ -37,7 +37,7 @@ use jamnp_s::codec::up0::{Announcement, Final, Handshake};
 use jamnp_s::endpoint::{EndpointConfig, EndpointError};
 use jamnp_s::framing::{
     frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE133, CE134, CE137, CE138,
-    CE139, CE140, CE141, CE146, UP,
+    CE139, CE140, CE141, CE146, CE148, UP,
 };
 use jamnp_s::transport::{Conn, RecvHalf, SendHalf, Transport};
 use m2_reference::chain::RefChain;
@@ -183,6 +183,20 @@ pub enum SimFault {
     SegmentShardsRagged,
     /// Serve fewer slices than the request asked for.
     SegmentShardsShort,
+    /// Reset every CE 148 segment request.
+    ///
+    /// Not a breach on its own: a requester is meant to fall back to CE
+    /// 139/140 (`simple.md:660`), which is why the row that catches this is
+    /// Soft. It is here so that the row has been seen to move at all.
+    SegmentsRefused,
+    /// Serve CE 148 segments one byte short of a whole number of them.
+    SegmentsRagged,
+    /// Serve fewer whole segments than the request asked for.
+    SegmentsShort,
+    /// Stop a CE 148 reply after the segments, with no proof message.
+    SegmentsReplyShort,
+    /// Serve CE 148 segments with an import proof that does not prove them.
+    SegmentProofBad,
     /// Serve CE 140 slices with justifications that do not prove them.
     SegmentJustificationBad,
     /// Assure a block that was never authored.
@@ -305,6 +319,14 @@ pub struct Available {
     /// How many segments were coded, which is what fixes the slice
     /// boundaries inside each row.
     segment_count: usize,
+    /// The segments themselves, kept whole for CE 148.
+    ///
+    /// CE 139/140 serve erasure-coded *slices* of these and CE 148 serves
+    /// the segments outright, so a node that holds only the coded form can
+    /// answer the first two and not the third.
+    segments: Vec<Vec<u8>>,
+    /// The root those segments sit under, with one import proof each.
+    tree: m2_reference::availability::SegmentTree,
 }
 
 impl SimNode {
@@ -358,20 +380,28 @@ impl SimNode {
         bundle: Vec<u8>,
         segments: Vec<Vec<u8>>,
         shard_count: u16,
-    ) -> Result<[u8; 32], m2_reference::chain::ChainError> {
+    ) -> Result<([u8; 32], [u8; 32]), m2_reference::chain::ChainError> {
         let segment_count = segments.len();
         let shards = m2_reference::availability::make_available(
             self.chain.oracle(),
             bundle,
-            segments,
+            segments.clone(),
             shard_count,
         )?;
-        let root = shards.erasure_root;
+        // The segments root is a second tree over the same segments, and a
+        // different question from the erasure root: one commits to the
+        // coded shards, the other to the segments themselves. A guarantor
+        // publishes both on its report, and CE 148 asks by the second.
+        let tree =
+            m2_reference::availability::make_segments(self.chain.oracle(), segments.clone())?;
+        let roots = (shards.erasure_root, tree.segments_root);
         *self.available.lock().expect("sim available") = Some(Available {
             shards,
             segment_count,
+            segments,
+            tree,
         });
-        Ok(root)
+        Ok(roots)
     }
 
     /// Announce a block this node authored, and keep it to serve.
@@ -822,6 +852,7 @@ impl SimNode {
             CE131 | CE132 => self.receive_ticket(&mut send, kind, &content).await,
             CE137 | CE138 => self.serve_bundle_shard(&mut send, kind, &content).await,
             CE139 | CE140 => self.serve_segment_shards(&mut send, kind, &content).await,
+            CE148 => self.serve_segments(&mut send, &content).await,
             CE133 | CE146 => {
                 self.receive_package(&mut send, kind, &mut reader, &content)
                     .await
@@ -992,6 +1023,87 @@ impl SimNode {
         m2_reference::assurance::assured_cores(assurance)
             .iter()
             .all(|core| reported.contains(core))
+    }
+
+    /// Serve CE 148: the whole segments asked for, then one import proof
+    /// each (`simple.md:650-673`).
+    ///
+    /// Two messages, and neither says how long it is -- the frame does. The
+    /// segments go out concatenated because every one is `SEGMENT_LEN`
+    /// bytes, and the proofs run back to back because each carries its own
+    /// count.
+    ///
+    /// Matched by root, not merely answered: a guarantor serves the
+    /// segments of bundles it holds, and one asked for a root it never
+    /// exported says so by resetting, the same as for an unknown erasure
+    /// root.
+    async fn serve_segments(&self, send: &mut SendHalf, content: &[u8]) {
+        if self.fault == SimFault::SegmentsRefused {
+            send.reset(NO_DATA_CODE);
+            return;
+        }
+        let Ok(request) = ce137_148::SegmentRequest::decode(&mut &content[..]) else {
+            return;
+        };
+        // Everything out of the lock before the first await: a guard held
+        // across one makes the task unsendable.
+        let reply = {
+            let held = self.available.lock().expect("sim available");
+            let Some(held) = held.as_ref() else {
+                send.reset(NO_DATA_CODE);
+                return;
+            };
+            if held.tree.segments_root != request.segments_root {
+                send.reset(NO_DATA_CODE);
+                return;
+            }
+            let mut indices = request.segment_indices.clone();
+            if self.fault == SimFault::SegmentsShort {
+                indices.pop();
+            }
+            let mut segments = Vec::with_capacity(indices.len());
+            let mut proofs = Vec::with_capacity(indices.len());
+            for index in &indices {
+                let Some(segment) = held.segments.get(*index as usize) else {
+                    send.reset(NO_DATA_CODE);
+                    return;
+                };
+                segments.push(segment.clone());
+                proofs.push(held.tree.proofs[*index as usize].clone());
+            }
+            if self.fault == SimFault::SegmentProofBad {
+                // One hash of one proof, so the message still reads as a
+                // run of proofs and only the walk fails. Altering the count
+                // instead would make this a structure defect, which is a
+                // different row.
+                if let Some(first) = proofs.first_mut().and_then(|p| p.first_mut()) {
+                    first[0] ^= 0xff;
+                }
+            }
+            ce137_148::SegmentResponse {
+                segments,
+                import_proofs: proofs,
+            }
+        };
+
+        let mut data = reply.encode_segments();
+        if self.fault == SimFault::SegmentsRagged {
+            data.pop();
+        }
+        if send.write_all(&frame_message(&data)).await.is_err() {
+            return;
+        }
+        if self.fault == SimFault::SegmentsReplyShort {
+            // The segments and nothing else. Nothing in the first message
+            // says a second is coming, so this looks exactly like a reply
+            // that finished -- which is why the lane counts messages.
+            send.finish();
+            return;
+        }
+        let proofs = reply.encode_import_proofs();
+        if send.write_all(&frame_message(&proofs)).await.is_ok() {
+            send.finish();
+        }
     }
 
     /// Serve CE 137 or CE 138: the bundle shard, CE 137's segment shards,

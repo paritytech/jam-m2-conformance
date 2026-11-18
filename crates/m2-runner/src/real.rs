@@ -22,7 +22,9 @@ use m2_scenario::ctx::{
 use m2_scenario::scenarios::n3::{
     DistributedReport, N3Ctx, ReportSeen, SharingSeen, SubmittedPackage,
 };
-use m2_scenario::scenarios::n4::{AssuranceOffered, N4Ctx, SegmentShardsServed, ShardServed};
+use m2_scenario::scenarios::n4::{
+    AssuranceOffered, N4Ctx, SegmentShardsServed, SegmentsServed, ShardServed,
+};
 
 use crate::scenario::RunCtx;
 
@@ -55,6 +57,7 @@ pub(crate) struct RealRunData {
     pub(crate) shards_served: Arc<Mutex<Vec<ShardServed>>>,
     /// CE 139/140 replies the NUT served.
     pub(crate) segment_shards_served: Arc<Mutex<Vec<SegmentShardsServed>>>,
+    pub(crate) segments_served: Arc<Mutex<Vec<SegmentsServed>>>,
     /// CE 141 assurances the NUT broadcast, as they arrived.
     pub(crate) assurances_seen: Arc<Mutex<Vec<m2_emu::avail_io::RawAssurance>>>,
     /// CE 141 assurances the emulator offered the NUT.
@@ -278,6 +281,8 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
         shard_count,
         &mut segment_shards_served,
     );
+    let mut segments_served = lock(&data.segments_served).clone();
+    verify_import_proofs(data.ref_chain.oracle(), &mut segments_served);
     // Every block the harness has seen the node on. Which one it assures is
     // its own choice -- the head two seconds before a slot -- so the rule is
     // that the anchor names a block that exists, not a block the harness
@@ -329,6 +334,7 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
         nut_index: data.nut_index as u16,
         shards_served,
         segment_shards_served,
+        segments_served,
         assurances_seen,
         assurances_offered,
         availability_threshold: jam_types::supermajority_threshold(jam_types::max_val_count()),
@@ -452,6 +458,60 @@ pub fn verify_segment_shards(
                     shards.justifications_verified.push(None);
                     shards
                         .justification_details
+                        .push(Some(format!("the oracle could not say: {e}")));
+                }
+            }
+        }
+    }
+}
+
+/// Ask the engine whether each CE 148 import proof puts its segment under
+/// the segments root.
+///
+/// Done after the observation window, for the reason the other two are: the
+/// emulator records bytes, the engine decides, and holding the round trips
+/// out of the window keeps a slow oracle from shifting the timing the other
+/// lanes are graded on.
+///
+/// Public because `m2-sim`'s N4 test grades the same facts a run does.
+pub fn verify_import_proofs(
+    oracle: &Arc<m2_reference::oracle::Oracle>,
+    served: &mut [SegmentsServed],
+) {
+    for reply in served {
+        if reply.refused || reply.ragged || reply.proofs_unreadable {
+            continue;
+        }
+        // One proof per segment, paired by position: the reply carries no
+        // indices, so position is the only thing tying the two together.
+        for (i, segment) in reply.segments.iter().enumerate() {
+            let Some(proof) = reply.proofs.get(i) else {
+                reply.proofs_verified.push(None);
+                reply
+                    .proof_details
+                    .push(Some("no proof was sent for this segment".into()));
+                continue;
+            };
+            // The index the segment was asked for under, not its position
+            // in the reply: the proof is over that leaf of the tree, and
+            // checking it at the wrong index fails a node that answered
+            // correctly.
+            let segment_index = reply.requested.get(i).copied().unwrap_or(i as u16);
+            match m2_reference::availability::check_import_proof(
+                oracle,
+                reply.segments_root,
+                segment_index,
+                segment.clone(),
+                proof.clone(),
+            ) {
+                Ok(check) => {
+                    reply.proofs_verified.push(check.verified);
+                    reply.proof_details.push(check.detail);
+                }
+                Err(e) => {
+                    reply.proofs_verified.push(None);
+                    reply
+                        .proof_details
                         .push(Some(format!("the oracle could not say: {e}")));
                 }
             }

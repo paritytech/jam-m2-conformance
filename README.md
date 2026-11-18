@@ -10,11 +10,13 @@ artefact the NUT produces against the polkajam `hazmat` reference engine.
 
 ## Status
 
-**Implemented and green (2026-09):** P0 infrastructure complete plus conformance lanes **N0**
-(connectivity/sync), **N1** (block authoring), and **N2** (Safrole tickets). See [DESIGN.md](DESIGN.md)
-for the design; this README documents the current implementation state.
+**Implemented and green:** P0 infrastructure complete plus conformance lanes **N0**
+(connectivity/sync), **N1** (block authoring) and **N2** (Safrole tickets), which run by default,
+plus **N3** (guaranteeing) and **N4** (availability), which are graded by name — see the roadmap
+below for why. See [DESIGN.md](DESIGN.md) for the design; this README documents the current
+implementation state.
 
-- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **432 passed / 0 failed** ✓,
+- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **537 passed / 0 failed** ✓,
   `cargo fmt --all --check` ✓, no `unwrap`/`panic`/`expect`/`todo!` in non-test code.
 - Dry-run baseline: `cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/x`
   exits 0 with **all N0+N1+N2 checks HARD PASS** — the harness's own expectations are satisfiable.
@@ -221,21 +223,24 @@ N3's submission rows are now held to it too, by
 `m2-sim/tests/n3_sim_it.rs`: a guarantor that refuses every package, one
 that takes a package over its protocol's size cap, and one that shares with
 a single co-guarantor each fail their own row, over CE 133 and CE 146 alike.
-What is still unproven in N3 is the CE 135 distribution and inclusion rows,
-and its CE 148 rows are unwritten. Until those close, a green N3 means
+CE 148 is written and proven too, in N4 rather than N3: it asks by a
+segments root the node exported, so it rides the same mid-run plan the rest
+of availability does. What is still unproven is N3's CE 135 distribution and
+inclusion rows. Until those close, a green N3 means
 "nothing contradicted the node" rather than "the node was checked", and the
 lanes are asked for by name so that distinction is never made silently.
 
 **The pin is on an unmerged branch.** `Cargo.toml` and `oracle/Cargo.toml`
-point at polkajam `0aaa2cb20` (branch `jv-export-n4`, open as
-polkajam#1401), which exports two things the harness cannot do without.
+point at polkajam `b1ea8aca4` (branch `jv-export-n4`, open as
+polkajam#1401), which exports three things the harness cannot do without.
 `hazmat::merkle` is what checks and builds a CE 137 justification —
 `merkle_root` to check one, `merkle_proofs` and `pack_erasure_tree_entry` to
-build one, which is what lets a simulated node serve shards at all.
-`AuthoringHarness::submit_assurance` is what lets one carry an assurance it
-*received*, without which the CE 141 inclusion rows cannot be shown to fail.
-The pin goes back to a merge commit once that PR lands; see `findings.md`
-§9 and §14.
+build one, which is what lets a simulated node serve shards at all — and
+`cd_proof_root_ph`, without which a CE 148 import proof cannot be checked by
+anything outside the node crate. `AuthoringHarness::submit_assurance` is
+what lets a simulated node carry an assurance it *received*, without which
+the CE 141 inclusion rows cannot be shown to fail. The pin goes back to a
+merge commit once that PR lands; see `findings.md` §9, §14 and §16.
 
 Iterate-later items: full 2-epoch observation + epoch-boundary alignment of the ticket window;
 independent (non-`import_block`) seal/entropy VRF re-verification; full M1-style keyvals diff on
