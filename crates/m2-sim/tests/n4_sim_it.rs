@@ -12,10 +12,9 @@
 //! nothing outside `jam-node` could build one.
 //!
 //! **What this does not cover.** `n4_ce141_inclusion` asks whether the node
-//! carries valid assurances in its blocks and leaves invalid ones out. This
-//! stand-in authors through the reference chain and cannot put an assurance
-//! it received into a block, so that check is not graded here and its rows
-//! remain unproven.
+//! carries valid assurances in its blocks and leaves invalid ones out. That
+//! needs a stand-in that can pool an assurance it *received*, which is
+//! `n4_inclusion_sim_it.rs` and `AuthoringHarness::submit_assurance`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

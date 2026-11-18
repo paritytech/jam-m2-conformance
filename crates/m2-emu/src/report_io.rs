@@ -114,38 +114,85 @@ pub(crate) async fn handle_inbound_sharing(
     send.finish();
 }
 
-/// Record a CE 135 work-report distribution the NUT sent
+/// Record a CE 135 work-report distribution the NUT sent, and pool it
 /// (`simple.md:460-485`).
 ///
 /// The report is kept encoded as well as hashed. The lane compares against
 /// the reference's report, and a hash match alone would say the two agree
 /// without being able to show where they differ when they do not.
+///
+/// Returns the distribution so the caller can pool it, which is the other
+/// half of being sent one and is [`pool_distributed_report`]. Recording and
+/// pooling are split so this decoder can be tested without an engine behind
+/// it.
 pub fn handle_inbound_report(
     content: &[u8],
     peer: u16,
     obs: &Mutex<ObsLog>,
     seen: &Mutex<Vec<ReportSeen>>,
-) {
+) -> Option<GuaranteedWorkReport> {
     let at_wall_ms = wall_ts();
     let mut input: &[u8] = content;
     let Ok(distribution) = GuaranteedWorkReport::decode(&mut input) else {
         record(obs, peer, ObsKind::Other(NUT_SENT_BAD_REPORT));
-        return;
+        return None;
     };
     // `Report ++ Slot ++ len++[(Idx, Sig)]` and nothing after it.
     if !input.is_empty() {
         record(obs, peer, ObsKind::Other(NUT_SENT_BAD_REPORT));
-        return;
+        return None;
     }
     record(obs, peer, ObsKind::Ce135Report);
     crate::emu::lock(seen).push(ReportSeen {
         peer,
         report_hash: distribution.report.hash().0,
         slot: distribution.slot,
-        signatures: distribution.signatures,
+        signatures: distribution.signatures.clone(),
         encoded_report: jam_types::Encode::encode(&distribution.report),
         at_wall_ms,
     });
+    Some(distribution)
+}
+
+/// Pool a report the NUT distributed, so the next block the reference chain
+/// authors carries it.
+///
+/// What a validator does with a guaranteed report it is sent, and what the
+/// harness did not do. Recording alone left every live run with **no core
+/// engaged**: an assurance is valid only for a core carrying a report *on
+/// chain*, distributing one does not put it there, and the reference chain
+/// authors five slots in six. Every assurance the harness sent was
+/// therefore invalid, and the node lost each slot it owned to `assurances
+/// error: core not engaged` (`findings.md` §21).
+///
+/// A failure is said rather than swallowed. Everything downstream -- the CE
+/// 135 inclusion row and all of N4's assurance rows -- would otherwise go
+/// quiet, with no way to tell that from a node that did nothing.
+pub fn pool_distributed_report(
+    distribution: GuaranteedWorkReport,
+    ref_chain: &m2_reference::chain::RefChain,
+) {
+    let signatures: Vec<jam_std_common::ValSignature> = distribution
+        .signatures
+        .into_iter()
+        .map(|(val_index, signature)| jam_std_common::ValSignature {
+            val_index,
+            signature: jam_std_common::ed25519::Signature(signature.into()),
+        })
+        .collect();
+    // More signatures than a core has validators. The engine's bounded
+    // vector refuses it and so does the lane, which grades the count under
+    // `n3_ce135_has_enough_signatures`; nothing is owed here.
+    let Ok(signatures) = signatures.try_into() else {
+        return;
+    };
+    if let Err(e) = ref_chain.submit_guarantee(&jam_std_common::ReportGuarantee {
+        report: distribution.report,
+        slot: distribution.slot,
+        signatures,
+    }) {
+        eprintln!("[distributor] could not pool the report the NUT distributed: {e}");
+    }
 }
 
 /// Submit `plan`'s work package to the NUT over CE 133 or CE 146, as a
@@ -345,13 +392,25 @@ pub async fn spawn_report_sender(
 
     sleep_until_slot(slot).await;
 
+    // Both failures below are said rather than returned silently, the same
+    // as the compose arms above. A report that never left the harness and a
+    // report the node ignored both leave `n3_ce135_inclusion` reporting
+    // *not exercised*, and those are different facts about a run.
     let Ok((mut send, _recv)) = connection.open_bi().await else {
+        eprintln!(
+            "[distributor] could not open a stream to distribute the report in slot {}",
+            plan.slot
+        );
         return;
     };
     let wire = frame(CE135, &plan.wire);
     crate::emu::trace_record(peer, CE135, send.id(), &wire, &trace, TraceDir::Rx);
     record(&obs, peer, ObsKind::Other(EMU_SENT_135));
     if send.write_all(&wire).await.is_err() {
+        eprintln!(
+            "[distributor] the stream closed before the report for slot {} was written",
+            plan.slot
+        );
         return;
     }
     crate::emu::lock(&distributed).push(DistributedReport {

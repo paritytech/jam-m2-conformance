@@ -39,6 +39,124 @@ hard findings as before the re-pin — `ce129_boundary_parent_before_child` and
 `n2_proxy_duty_forwarded` and seven passes of `n2_gen_attempt_in_range`, and the node log
 has no `finality lagging` at all.
 
+### First live run of N3 and N4, 2026-11-18, pin `b1ea8aca4`
+
+`sessions/n3n4-1` and `sessions/n3n4-2`: `--lanes n0,n1,n2,n3,n4`,
+`--observe-secs 300`. Both lanes had been graded only against the dry-run
+baseline and the simulated node until now. 332 checks, 49 findings, exit 1.
+
+**Node behaviour the run reproduced.** Three findings previously seen once
+and marked "reproduce before filing" came back with the same evidence:
+`n3_ce133_oversized_reset` and `n3_ce133_extrinsic_mismatch_reset` (§4, §8),
+and `n3_ce134_answered` — a well-formed CE 134 share reset with `0x100`,
+`NoError` (§5), identical to the 2026-11-16 observation down to the core and
+the code. §4 also extended itself: `n3_ce146_oversized_reset` failed against
+CE 146's own 204,800-byte cap in the same run, so the node reads both
+protocols' size caps the same wrong way. All of these remain questions for
+the conformance group rather than filed defects, for the reasons §4 lists.
+
+**Harness defects the run found, all three fixed the same day.** This is
+what the run was for, and the ratio is the point — three harness defects to
+zero new node defects:
+
+| | what it was |
+|---|---|
+| §18 | `n3_ce133_unauthorized_not_shared` and `n3_ce133_not_a_guarantor_ignored` correlated CE 134 shares to submissions **by time alone**, so a run with an honest submission behind a faulty one graded the faulty one against shares the node was right to make. Neither row could pass a conforming node. Now bounded by the next submission, and proven by a simulated node that ignores a misaddressed package while sharing the next one. |
+| §19 | The CE 135 report plan was gated behind a `watch` that fires on the *ticket* plans, so every connection checked for a report plan that did not exist yet and gave up. Only one validator may distribute the report, so nothing ever did, and `n3_ce135_inclusion` reported *not exercised* for the whole run. |
+| §20 | The assurance offers ran for a fixed twelve slots. The node authored eight blocks in the 50-slot window and none inside those twelve — the nearest was one slot past the last offer — so every `n4_ce141_inclusion` row reported *not exercised*. The offers now run for the rest of the window. |
+
+Two of the three were invisible: a row that grades nothing and a row that
+passed report the same way on a green page. Both now print why, which is
+what named §19 and §20 in a single run.
+
+**What the third run found, and what it means for the N4 verdicts.**
+`sessions/n3n4-3` validated §19 — the CE 135 report was distributed, and
+`n3_ce135_inclusion` was graded for the first time — and did not validate
+§20. Widening the assurance window exposed why: **every assurance a live run
+sends is for a core that carries nothing** (§21). The core is read off the
+report the NUT *distributed*, distributing does not put a report on chain,
+and nothing in the run ever puts one there. The node lost all three
+authoring slots it owned inside the window to `assurances error: core not
+engaged`, which also made `n3_ce135_inclusion` fail for a reason that is not
+the node's (§22 records the node's side of the same event).
+
+So **N4's assurance verdicts from the first three runs say nothing about
+polkajam**: no valid assurance had ever been put in front of it. The serve
+rows (CE 137/138) are unaffected and passed throughout.
+
+**The fourth run, with §21's first half in.** The emulator now pools what
+the NUT distributes, so a core engages. `sessions/n3n4-4` is the first run
+in which polkajam sent an assurance of its own — 45 of them — and the first
+in which `n4_ce141_valid_assurance_included` was graded at all. Two N4 rows
+went from never-asked to asked.
+
+It also ran a row nothing had ever reached, which turned out to be broken:
+`n4_ce141_bits_have_reports` failed all 45 times, comparing core indices
+against a **truncated slot number** read out of the wrong tuple element
+(§23, fixed). Second-order lesson, and the same one as §18: a row can be
+wrong indefinitely while nothing reaches it, and the thing that reaches it
+is a live node doing something it had never been given the chance to do.
+
+**The fifth run, with §23 in.** The first run whose N4 assurance verdicts
+are about polkajam rather than about the harness:
+
+| row | run 4 | run 5 |
+|---|---|---|
+| `n4_ce141_well_formed` | 50 pass | 50 pass |
+| `n4_ce141_bits_have_reports` | **45 fail** | **50 pass** |
+| `n4_ce141_valid_assurance_included` | 3 graded | **3 pass** |
+
+`n4_ce141_valid_assurance_included` is the row PR #15 was written to fix.
+This is the first time it has been put to a real node and answered. §18's
+fix was confirmed at the same time: `n3_ce133_unauthorized_not_shared` and
+`n3_ce133_not_a_guarantor_ignored` now pass, so both were harness artefacts
+and neither is a polkajam defect.
+
+The run also surfaced §24 — a reconnection re-fetching shards the node had
+rightly let go, which failed the CE 137/138 serve rows 19 times each against
+a conforming node. Latent before §20 widened the window from twelve slots to
+the rest of the run; fixed by claiming the fetches once per validator.
+
+**The seventh run.** Both of §14's inclusion rows have now been put to a
+real node and answered: `n4_ce141_valid_assurance_included` three times and
+`n4_ce141_invalid_assurance_excluded` once, all passing. Neither had ever
+been exercised before today. The CE 137/138 serve rows are back to clean
+passes with §24's regression gone.
+
+It also found §25 by arithmetic rather than by failure: the availability
+exchange was started only on connections the *node* opened, so under N0's
+preferred-initiator rule roughly half the emulated validators never asked
+it for anything. Three validators' fetches instead of five, and nothing red
+to show for it.
+
+**The eighth run, and where N3/N4 stand.** `sessions/n3n4-8`, with every
+fix in: shard fetches for all five validators (three before §25), five
+graded `n4_ce141_valid_assurance_included`, thirty assurances the node sent
+graded well-formed and correctly aimed, and every N4 row passing. The hard
+failures are down to the known set and nothing else:
+
+| row | finding |
+|---|---|
+| `ce129_boundary_parent_before_child` | §3 |
+| `n2_unknown_epoch_reset_observed` | §3 |
+| `n3_ce133_oversized_reset` | §4 |
+| `n3_ce146_oversized_reset` | §4 |
+| `n3_ce133_extrinsic_mismatch_reset` | §8 |
+
+All five are node behaviour, three of them questions for the conformance
+group rather than filed defects. Across eight runs the harness produced
+**seven defects of its own and no new defect in polkajam**, which is the
+fair summary of what a first live outing of two lanes is worth.
+
+**What is left.** §21's second half — reading the engaged cores at send time
+instead of fixing them when the plan is written — is still open, and until
+it lands a run still costs the node two or three of its authoring slots.
+
+**What the run confirmed about §17.** `n4_ce139_140_not_exercised` and
+`n4_ce148_not_exercised`, exactly as predicted: the submitted package
+declares `export_count: 0`, so a live run asks nothing over any segment
+protocol. The prediction was made by reading the code; it is now measured.
+
 ## Milestone ladder
 
 | Milestone | Lanes | Coverage | Status |

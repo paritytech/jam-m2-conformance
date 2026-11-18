@@ -110,6 +110,11 @@ pub struct Emulator {
     avail_plan: Arc<Mutex<Option<crate::avail_io::AvailPlan>>>,
     /// Flips once an availability plan has been set.
     avail_set: Arc<watch::Sender<bool>>,
+    /// Validators whose one-off availability fetch has already run; see
+    /// [`EmuShared::fetched_shards`].
+    fetched_shards: Arc<Mutex<std::collections::HashSet<u16>>>,
+    /// Last anchor each validator assured; see [`EmuShared::last_assured`].
+    last_assured: Arc<Mutex<std::collections::HashMap<u16, [u8; 32]>>>,
     shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::ShardServed>>>,
     segment_shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentShardsServed>>>,
     segments_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::SegmentsServed>>>,
@@ -212,6 +217,24 @@ pub struct EmuShared {
     pub avail_plan: Arc<Mutex<Option<crate::avail_io::AvailPlan>>>,
     /// Flips once an availability plan exists.
     pub avail_set: watch::Receiver<bool>,
+    /// Validators whose CE 137/138/139/140/148 fetches have already run.
+    ///
+    /// The availability exchange is spawned per *connection*, and a run
+    /// re-dials: without this, every re-dial fetched the same shards again.
+    /// A node is right to refuse the later ones -- it no longer holds a
+    /// bundle whose report has left the core -- so the repeats failed the
+    /// serve rows against a conforming node (`findings.md` §24). Assuring
+    /// is not in here, because a validator assures every slot and a
+    /// reconnection should pick that back up.
+    pub fetched_shards: Arc<Mutex<std::collections::HashSet<u16>>>,
+    /// The last anchor each validator assured.
+    ///
+    /// Shared rather than held by the assurance loop, because a peer can
+    /// have two live connections -- one it dialled and one it accepted --
+    /// and both drive the exchange. Two loops each remembering their own
+    /// last anchor would put two assurances from one validator under one
+    /// anchor, which is the thing the loop skips for.
+    pub last_assured: Arc<Mutex<std::collections::HashMap<u16, [u8; 32]>>>,
     /// CE 137/138 replies the NUT served.
     pub shards_served: Arc<Mutex<Vec<m2_scenario::scenarios::n4::ShardServed>>>,
     /// CE 139/140 replies the NUT served.
@@ -400,6 +423,8 @@ impl Emulator {
             shared_to_nut: Arc::new(Mutex::new(Vec::new())),
             avail_plan: Arc::new(Mutex::new(None)),
             avail_set: Arc::new(watch::channel(false).0),
+            fetched_shards: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            last_assured: Arc::new(Mutex::new(std::collections::HashMap::new())),
             shards_served: Arc::new(Mutex::new(Vec::new())),
             segment_shards_served: Arc::new(Mutex::new(Vec::new())),
             segments_served: Arc::new(Mutex::new(Vec::new())),
@@ -458,6 +483,16 @@ impl Emulator {
     pub fn set_report_plan(&self, plan: ScheduledReport) {
         *lock(&self.report_plan) = Some(plan);
         self.plans_set.send_replace(true);
+    }
+
+    /// Take back a report plan no connection claimed.
+    ///
+    /// `Some` means it was never distributed: exactly one validator in the
+    /// cohort may send it, and a run with no connection to that validator
+    /// leaves the plan here. The run asks after the window, so the reason
+    /// the CE 135 inclusion rows went ungraded is on the record.
+    pub fn unclaimed_report_plan(&self) -> Option<ScheduledReport> {
+        lock(&self.report_plan).take()
     }
 
     /// Reports the emulator distributed, for the inclusion rows.
@@ -561,6 +596,8 @@ impl Emulator {
             distributed: Arc::clone(&self.distributed),
             share_plan: Arc::clone(&self.share_plan),
             avail_plan: Arc::clone(&self.avail_plan),
+            fetched_shards: Arc::clone(&self.fetched_shards),
+            last_assured: Arc::clone(&self.last_assured),
             avail_set: self.avail_set.subscribe(),
             shards_served: Arc::clone(&self.shards_served),
             segment_shards_served: Arc::clone(&self.segment_shards_served),
@@ -795,6 +832,13 @@ pub async fn dial_nut(
     // why, in half the runs.
     start_report_distribution(&connection, peer, &shared);
     start_share_to_nut(&connection, peer, &shared);
+    // And availability, which was missing here for the same reason and with
+    // the same effect: the N0 preferred-initiator rule means the NUT dials
+    // some peers and waits for the rest, so only the peers it dialled ever
+    // had an availability exchange. A live run fetched shards for three of
+    // five validators and nobody noticed, because three passing rows and
+    // five passing rows read alike (`findings.md` §25).
+    start_availability(&connection, peer, &shared);
     start_sync_probe(&connection, peer, &shared);
 
     // Serve the NUT's CE 128 / CE 129 requests on the dialed connection.
@@ -900,17 +944,30 @@ fn start_availability(connection: &Conn, peer: u16, shared: &EmuShared) {
         let Some(plan) = lock(&shared.avail_plan).clone() else {
             return;
         };
+        // The fetches happen once per validator per run; the assuring that
+        // follows them happens on whatever connection is up. A re-dial that
+        // fetched again asked for a bundle whose report had left the core,
+        // and the node's refusal failed the serve rows (`findings.md` §24).
+        //
+        // Claimed before the attempt, so two connections for one validator
+        // cannot both fetch, and given back below if the attempt never
+        // reached the node -- otherwise a connection that died on its way
+        // to the first request would cost that validator its fetch for the
+        // whole run.
+        let fetch_shards = lock(&shared.fetched_shards).insert(peer);
         let ref_chain = Arc::clone(&shared.ref_chain);
-        crate::avail_io::drive_availability(
+        let reached = crate::avail_io::drive_availability(
             &connection,
             peer,
             &plan,
+            fetch_shards,
             &shared.trace,
             &shared.obs,
             &shared.shards_served,
             &shared.segment_shards_served,
             &shared.segments_served,
             &shared.assurances_offered,
+            &shared.last_assured,
             // The chain's head, read at send time: the block to assure is
             // whichever one the chain is on, and a hash chosen when the plan
             // was written names a block several slots old by then.
@@ -924,6 +981,9 @@ fn start_availability(connection: &Conn, peer: u16, shared: &EmuShared) {
             move || ref_chain.best_block().ok().map(|(hash, _)| hash),
         )
         .await;
+        if fetch_shards && !reached {
+            lock(&shared.fetched_shards).remove(&peer);
+        }
     });
 }
 
@@ -937,12 +997,19 @@ fn start_share_to_nut(connection: &Conn, peer: u16, shared: &EmuShared) {
     let mut plans_set = shared.plans_set.clone();
     let shared = shared.clone();
     tokio::spawn(async move {
-        while !*plans_set.borrow_and_update() {
-            if plans_set.changed().await.is_err() {
-                return;
-            }
-        }
-        for plan in shared.take_share_plan() {
+        let Some(plans) = claim_when_planned(&mut plans_set, || {
+            let plans = shared.take_share_plan();
+            // Empty means not written yet *or* a run that planned no
+            // shares, and the two are not told apart here. A task that
+            // waits out a run which never had shares costs an idle await;
+            // a task that gave up on a plan not yet written is §19.
+            (!plans.is_empty()).then_some(plans)
+        })
+        .await
+        else {
+            return;
+        };
+        for plan in plans {
             crate::report_io::spawn_share_sender(
                 connection.clone(),
                 plan,
@@ -956,6 +1023,39 @@ fn start_share_to_nut(connection: &Conn, peer: u16, shared: &EmuShared) {
     });
 }
 
+/// Wait for the run's plans, retrying the claim on every change.
+///
+/// `plans_set` is one gate in front of several plans, and they are written
+/// at different times: the ticket plans first, then the report, the shares
+/// and the submission. A task that checked the gate once woke on the ticket
+/// plans, found the plan it wanted still absent and returned.
+///
+/// For the shares that was survivable, because any connection may claim
+/// them and connections keep arriving. For the report it was not: only one
+/// validator in the cohort may distribute it, and a live run found no
+/// connection to that validator arriving late enough to claim --
+/// `the report for slot 9880680 was never distributed: no connection to
+/// validator 2`. The CE 135 inclusion rows went ungraded for the whole run.
+///
+/// Claiming is the only thing that ends the wait, so a task that is not the
+/// one meant to claim simply waits until the run does.
+async fn claim_when_planned<T>(
+    plans_set: &mut watch::Receiver<bool>,
+    mut claim: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    loop {
+        if *plans_set.borrow_and_update() {
+            if let Some(claimed) = claim() {
+                return Some(claimed);
+            }
+        }
+        // Err only once the `Emulator` is dropped, which ends the run.
+        if plans_set.changed().await.is_err() {
+            return None;
+        }
+    }
+}
+
 /// Spawn the CE 135 distributor on this connection, if it claims this run's
 /// report.
 fn start_report_distribution(connection: &Conn, peer: u16, shared: &EmuShared) {
@@ -963,12 +1063,13 @@ fn start_report_distribution(connection: &Conn, peer: u16, shared: &EmuShared) {
     let mut plans_set = shared.plans_set.clone();
     let shared = shared.clone();
     tokio::spawn(async move {
-        while !*plans_set.borrow_and_update() {
-            if plans_set.changed().await.is_err() {
-                return;
-            }
-        }
-        let Some(plan) = shared.claim_report_plan(peer) else {
+        // Not this connection's to send unless it is the cohort member the
+        // plan names, so every other connection waits here for the whole
+        // run. Whether *anyone* claimed it is a question for after the
+        // window, where the run asks it.
+        let Some(plan) =
+            claim_when_planned(&mut plans_set, || shared.claim_report_plan(peer)).await
+        else {
             return;
         };
         crate::report_io::spawn_report_sender(
@@ -1171,12 +1272,14 @@ async fn handle_stream(
             .await;
         }
         CE135 => {
-            crate::report_io::handle_inbound_report(
+            if let Some(distribution) = crate::report_io::handle_inbound_report(
                 &content,
                 peer_index,
                 obs,
                 &shared.reports_seen,
-            );
+            ) {
+                crate::report_io::pool_distributed_report(distribution, ref_chain);
+            }
         }
         CE141 => {
             crate::avail_io::handle_inbound_assurance(

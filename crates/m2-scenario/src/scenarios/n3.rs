@@ -295,6 +295,48 @@ pub fn n3_ce146_submission(ctx: &N3Ctx) -> Check {
     submission_check(ctx, 146)
 }
 
+/// The CE 134 shares that answer `submitted`, and no others.
+///
+/// A run submits seven packages a slot apart, over both protocols, and the
+/// node sees one stream of them: a share belongs to the submission it
+/// followed, not to every submission before it. Filtering by
+/// `at_wall_ms >= submitted.sent_at_wall_ms` alone is how
+/// `n3_ce133_unauthorized_not_shared` and `n3_ce133_not_a_guarantor_ignored`
+/// came to fail a node for shares that two honest submissions later in the
+/// plan had caused -- rows that could not pass whatever the node did
+/// (`findings.md` §18). The positive rows had the same hole pointing the
+/// other way: a node that ignored a submission could pass
+/// `shares_with_both_co_guarantors` on a later one's shares.
+///
+/// The key is the window to the next submission, not the package. Nothing a
+/// share carries names the package: `SharingContext.mappings` is keyed by
+/// the work-package hash but is empty for a package that imports no
+/// segments, which is every package this harness builds, and the bundle in
+/// message 2 would have to be decoded by the engine to be read as one. The
+/// window is sound here because the lane also grades how long the node took
+/// -- `shares_within_the_window` holds it to about three seconds while
+/// submissions are a whole slot apart -- so a share late enough to land in
+/// the wrong window has already failed a row of its own.
+///
+/// Across both protocols, because the next submission is the next one the
+/// *node* saw. Bounding by the next CE 133 submission alone would let the
+/// CE 146 submission between them keep attributing its shares backwards.
+fn shares_answering<'a>(ctx: &'a N3Ctx, submitted: &SubmittedPackage) -> Vec<&'a SharingSeen> {
+    let next = ctx
+        .submissions
+        .iter()
+        .map(|s| s.sent_at_wall_ms)
+        .filter(|&at| at > submitted.sent_at_wall_ms)
+        .min();
+    ctx.shares
+        .iter()
+        .filter(|share| {
+            share.at_wall_ms >= submitted.sent_at_wall_ms
+                && next.is_none_or(|next| share.at_wall_ms < next)
+        })
+        .collect()
+}
+
 /// The shared body of the two submission checks, over one protocol's
 /// submissions.
 ///
@@ -355,13 +397,8 @@ fn submission_check(ctx: &N3Ctx, protocol: u16) -> Check {
                 continue;
             }
 
-            // Shares that answer *this* submission. A share recorded before
-            // the package went out cannot be a response to it.
-            let answering: Vec<&SharingSeen> = ctx
-                .shares
-                .iter()
-                .filter(|share| share.at_wall_ms >= submitted.sent_at_wall_ms)
-                .collect();
+            // Shares that answer *this* submission, and not a later one's.
+            let answering = shares_answering(&ctx, submitted);
             let reached: HashSet<u16> = answering.iter().map(|share| share.peer).collect();
 
             for co_guarantor in &submitted.co_guarantors {
@@ -617,12 +654,12 @@ fn grade_fault(
     fault: SubmissionFault,
 ) -> Vec<crate::dsl::CheckResult> {
     let protocol = submitted.protocol;
-    // Shares that answer this submission, by time. A node that shared
-    // something else earlier in the run has not shared *this*.
-    let shared_after: Vec<u16> = ctx
-        .shares
-        .iter()
-        .filter(|share| share.at_wall_ms >= submitted.sent_at_wall_ms)
+    // Shares that answer this submission, and not one the node made for a
+    // package it was handed later. The two rows below say the node shared
+    // something it should not have, so a share belonging to another
+    // submission is not evidence -- it is `findings.md` §18.
+    let shared_after: Vec<u16> = shares_answering(ctx, submitted)
+        .into_iter()
         .map(|share| share.peer)
         .collect();
 

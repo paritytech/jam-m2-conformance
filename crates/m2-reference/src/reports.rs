@@ -341,21 +341,39 @@ impl GuaranteedWork {
         let hash = self.report.hash();
         SharingAnswer {
             report_hash: hash.0,
-            signatures: cohort
-                .iter()
-                .map(|&validator| {
-                    let secret =
-                        jam_std_common::SecretKeyset::trivial(u32::from(validator)).ed25519;
-                    (
-                        validator,
-                        secret
-                            .sign(&jam_std_common::ed25519::Message::Guarantee(hash))
-                            .to_bytes(),
-                    )
-                })
-                .collect(),
+            signatures: guarantee_signatures(hash, cohort),
         }
     }
+}
+
+/// Sign `report_hash` as each of `cohort` would, in the order given.
+///
+/// One copy of the rule, because both sides of CE 135 compute it: the
+/// harness signs as a co-guarantor answering a CE 134 share, and a node
+/// distributing a guarantee signs the same hash the same way. A second copy
+/// in the simulated node would let the two drift, and a drift there would
+/// look like a node signing wrongly.
+///
+/// The message is `jam_guarantee ++ hash`, which is the engine's own
+/// [`jam_std_common::ed25519::Message::Guarantee`], so the bytes are not
+/// reconstructed here. The keys are the trivial keyset's, which is what
+/// every validator in a harness run holds.
+pub fn guarantee_signatures(
+    report_hash: jam_types::WorkReportHash,
+    cohort: &[u16],
+) -> Vec<(u16, [u8; 64])> {
+    cohort
+        .iter()
+        .map(|&validator| {
+            let secret = jam_std_common::SecretKeyset::trivial(u32::from(validator)).ed25519;
+            (
+                validator,
+                secret
+                    .sign(&jam_std_common::ed25519::Message::Guarantee(report_hash))
+                    .to_bytes(),
+            )
+        })
+        .collect()
 }
 
 impl SharingAnswer {
@@ -621,6 +639,39 @@ impl RefChain {
             report_hash: work.report.hash().0,
             wire: jam_types::Encode::encode(&distribution),
         }))
+    }
+
+    /// Pool a guaranteed work-report, so the next block this session
+    /// authors can carry it.
+    ///
+    /// What [`RefChain::guarantee_work`] deliberately does not do, for a
+    /// caller that does want it. A node's guarantees extrinsic carries what
+    /// its peers distributed to it over CE 135 as well as what it refined
+    /// itself, and until this existed a simulated node could receive a
+    /// distribution and had no way to act on one -- which left
+    /// `n3_ce135_report_included` with no fault to pose.
+    ///
+    /// Taken as already verified, like
+    /// [`RefChain::submit_assurances`](crate::availability). The engine
+    /// notes it into the guarantee table without checking it -- but unlike
+    /// an assurance that is survivable, because block composition re-checks
+    /// every guarantee it holds and skips the ones that do not. Pooling one
+    /// that does not hold up costs a block its guarantee, not its validity,
+    /// which is why the emulator can pool whatever the node distributes
+    /// without risking the reference chain's own authoring.
+    pub fn submit_guarantee(
+        &self,
+        guarantee: &jam_std_common::ReportGuarantee,
+    ) -> Result<(), ChainError> {
+        match self.ask(Message::SubmitGuarantee {
+            session: self.session(),
+            guarantee: jam_types::Encode::encode(guarantee),
+        })? {
+            Message::Done => Ok(()),
+            other => Err(ChainError::Oracle(format!(
+                "SubmitGuarantee answered {other:?}"
+            ))),
+        }
     }
 
     /// Build `items` into a package, refine it on `core`, and sign the

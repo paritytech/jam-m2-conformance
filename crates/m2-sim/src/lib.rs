@@ -24,20 +24,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_consensus::SigningKey;
-use jam_std_common::{bandersnatch::ring_vrf, Block, Extrinsic, TicketEnvelope};
+use jam_std_common::{
+    bandersnatch::ring_vrf, Block, Extrinsic, ReportGuarantee, TicketEnvelope, ValSignature,
+    WorkReport,
+};
 use jam_types::{Decode, Encode, HeaderHash};
 use jamnp_s::clock;
 use jamnp_s::codec::ce128_129::{
     BlockRequest, BlockResponse, BoundaryNode, Direction, KeyValue, StateRequest, StateResponse,
 };
-use jamnp_s::codec::ce131_136::{self, Ticket, TicketDistribution};
+use jamnp_s::codec::ce131_136::{self, GuaranteedWorkReport, Ticket, TicketDistribution};
 use jamnp_s::codec::ce137_148;
 use jamnp_s::codec::ce141_145::Assurance;
 use jamnp_s::codec::up0::{Announcement, Final, Handshake};
 use jamnp_s::endpoint::{EndpointConfig, EndpointError};
 use jamnp_s::framing::{
-    frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE133, CE134, CE137, CE138,
-    CE139, CE140, CE141, CE146, CE148, UP,
+    frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE133, CE134, CE135, CE137,
+    CE138, CE139, CE140, CE141, CE146, CE148, UP,
 };
 use jamnp_s::transport::{Conn, RecvHalf, SendHalf, Transport};
 use m2_reference::chain::RefChain;
@@ -236,6 +239,42 @@ pub enum SimFault {
     AssuranceIncludesInvalid,
     /// Pool nothing, so no assurance a peer sends is ever carried.
     AssuranceOmitsValid,
+    /// Distribute a guarantee carrying one signature.
+    ///
+    /// Below the quorum a guarantee needs, and the shape of a guarantor that
+    /// distributed before its co-guarantors had answered rather than after.
+    ReportUnderSigned,
+    /// Distribute the signatures out of order.
+    ///
+    /// Strictly ascending is both the stated order (`simple.md:478`) and
+    /// what makes a validator signing twice impossible to express, so a
+    /// node that sorts by arrival rather than by index breaks both at once.
+    ReportSignaturesUnsorted,
+    /// Have a validator that does not hold the core sign the guarantee.
+    ///
+    /// The signature is real -- the trivial keys are everyone's -- so
+    /// nothing but the assignment says it does not belong, which is the
+    /// point of the row.
+    ReportStrangerSigns,
+    /// Distribute a report refined from something other than the package
+    /// the node was given.
+    ///
+    /// Not a corruption: a second, well-formed report over different items,
+    /// which is what a node that refined the wrong bundle would produce. A
+    /// report mangled in place would fail to decode and be caught a step
+    /// earlier, by the row that says the distribution was well formed.
+    ReportIsNotTheReference,
+    /// Distribute to one validator instead of all of them.
+    ReportReachesOnePeer,
+    /// Pool no guarantee, so a report distributed to this node is never
+    /// included in a block it authors.
+    ReportNotIncluded,
+    /// Share a package addressed to a core this node does not hold.
+    ///
+    /// The package is none of its business (`simple.md:410-415`), so the
+    /// honest answer is to take the stream and do nothing with it. Sharing
+    /// it is the defect `n3_ce133_not_a_guarantor_ignored` names.
+    SharesForeignCore,
 }
 
 /// Application error code the node resets a refused ticket stream with.
@@ -311,6 +350,49 @@ pub struct SimNode {
     /// refuses it -- so does this one, unless it is posing
     /// [`SimFault::AssuranceIncludesInvalid`].
     reported_cores: Mutex<Vec<u16>>,
+    /// The guarantee this node distributes over CE 135 once it has taken a
+    /// package, and the pieces the faults need.
+    ///
+    /// `None` until a test hands it one, and a node with nothing to
+    /// guarantee distributes nothing -- which is what a node that was never
+    /// given a package does.
+    guarantee: Mutex<Option<GuaranteeOffer>>,
+    /// The core this node holds, when a test has told it.
+    ///
+    /// `None` is a node that does not check which core a submission names,
+    /// which is what every test but the not-a-guarantor one wants: there is
+    /// one core in play and every package belongs to it.
+    own_core: Mutex<Option<u16>>,
+}
+
+/// What a simulated guarantor distributes, and what it would take to get it
+/// wrong.
+///
+/// The reports are refined through the oracle by the test rather than here.
+/// Refining is the most expensive thing in a run, it happens once per
+/// report rather than once per submission, and a node that refined inside
+/// its own submission handler would make every test that takes a package
+/// pay for it.
+pub struct GuaranteeOffer {
+    /// The report this node refined from the package it took.
+    pub report: WorkReport,
+    /// A second well-formed report, over different items, for
+    /// [`SimFault::ReportIsNotTheReference`].
+    ///
+    /// `None` leaves that fault with nothing to pose, and the node
+    /// distributes its own report as usual.
+    pub other: Option<WorkReport>,
+    /// Validators holding the core with this node, which is who may sign.
+    ///
+    /// Injected for the same reason as [`SimNode::shares_with`]: the
+    /// assignment is a fact about the chain, and a stand-in that worked it
+    /// out would be grading the harness against its own arithmetic.
+    pub cohort: Vec<u16>,
+    /// A validator that does not hold the core, for
+    /// [`SimFault::ReportStrangerSigns`].
+    pub stranger: u16,
+    /// Slot the guarantee is stamped with.
+    pub slot: u32,
 }
 
 /// A bundle this node can serve shards of.
@@ -351,13 +433,31 @@ impl SimNode {
             sharing_peers: Mutex::new(Vec::new()),
             refused_assurances: Mutex::new(Vec::new()),
             reported_cores: Mutex::new(Vec::new()),
+            guarantee: Mutex::new(None),
+            own_core: Mutex::new(None),
         }
+    }
+
+    /// Say what this node guarantees and distributes once it takes a
+    /// package.
+    pub fn guarantees(&self, offer: GuaranteeOffer) {
+        *self.guarantee.lock().expect("sim guarantee") = Some(offer);
     }
 
     /// Say which validators hold a core with this node, so a package it
     /// takes is shared with them over CE 134.
     pub fn shares_with(&self, peers: &[u16]) {
         *self.sharing_peers.lock().expect("sim sharing peers") = peers.to_vec();
+    }
+
+    /// Say which core this node guarantees on, so it can tell a package
+    /// that is its business from one that is not.
+    ///
+    /// Injected like the rest of the assignment. `None` -- the default --
+    /// is a node that does not check, which takes and shares whatever it is
+    /// sent.
+    pub fn guards_core(&self, core: u16) {
+        *self.own_core.lock().expect("sim own core") = Some(core);
     }
 
     /// Say which cores this node has a report pending availability on.
@@ -857,6 +957,7 @@ impl SimNode {
                 self.receive_package(&mut send, kind, &mut reader, &content)
                     .await
             }
+            CE135 => self.receive_report(&content).await,
             CE141 => self.receive_assurance(&content, peer).await,
             // A real node resets an unserved kind; this one is not graded on
             // that, so it drops the stream.
@@ -910,7 +1011,161 @@ impl SimNode {
             return;
         }
         send.finish();
+
+        // A package for a core this node does not hold is none of its
+        // business: it takes the stream -- the sender is owed an answer --
+        // and goes no further (`simple.md:410-415`). Not a reset, which is
+        // what the lane expects for a malformed submission and not for a
+        // misaddressed one.
+        if !self.holds_core_of(kind, &messages) && self.fault != SimFault::SharesForeignCore {
+            return;
+        }
         self.share_package().await;
+        self.distribute_report().await;
+    }
+
+    /// Whether this node holds the core the submission names.
+    ///
+    /// True when no core was injected, which is the honest answer for a
+    /// test with one core in play: a stand-in that invented an assignment
+    /// would be grading the harness against its own arithmetic.
+    fn holds_core_of(&self, kind: u8, messages: &[Vec<u8>]) -> bool {
+        let Some(mine) = *self.own_core.lock().expect("sim own core") else {
+            return true;
+        };
+        let Some(first) = messages.first() else {
+            return true;
+        };
+        let addressed = if kind == CE146 {
+            ce137_148::BundleSubmission::decode_initial(&mut &first[..]).map(|(core, _)| core)
+        } else {
+            ce131_136::WorkPackageSubmission::decode_initial(&mut &first[..]).map(|(core, _)| core)
+        };
+        // An undecodable first message is not a question about the core.
+        // The node took it, and the rows that grade its shape are elsewhere.
+        addressed.map(|core| core == mine).unwrap_or(true)
+    }
+
+    /// Distribute the guaranteed work-report over CE 135
+    /// (`simple.md:460-485`).
+    ///
+    /// What a guarantor does once its co-guarantors have answered the share:
+    /// `Work-Report ++ Slot ++ len++[Validator Index ++ Ed25519 Signature]`,
+    /// to every validator, one stream each.
+    ///
+    /// The signatures are built by
+    /// [`m2_reference::reports::guarantee_signatures`] rather than here,
+    /// because the harness signs the same hash the same way when it answers
+    /// a CE 134 share. Two copies of that rule could drift, and a drift
+    /// would read as a node signing wrongly.
+    async fn distribute_report(&self) {
+        let (report, mut signers, slot, stranger) = {
+            let held = self.guarantee.lock().expect("sim guarantee");
+            let Some(offer) = held.as_ref() else {
+                return;
+            };
+            // A report refined from other items: well formed, signed by the
+            // right cohort, and simply not the one the node was asked for.
+            let report = match (self.fault, offer.other.as_ref()) {
+                (SimFault::ReportIsNotTheReference, Some(other)) => other.clone(),
+                _ => offer.report.clone(),
+            };
+            let mut cohort = offer.cohort.clone();
+            cohort.sort_unstable();
+            cohort.dedup();
+            (report, cohort, offer.slot, offer.stranger)
+        };
+        if self.fault == SimFault::ReportStrangerSigns {
+            // Replace rather than append: appending would push the count
+            // past `VALS_PER_CORE` and fail the quorum row as well, and a
+            // fault that trips two rows cannot say which one caught it.
+            if let Some(last) = signers.last_mut() {
+                *last = stranger;
+            }
+        }
+        let mut signatures = m2_reference::reports::guarantee_signatures(report.hash(), &signers);
+        match self.fault {
+            // One signature, which is below the quorum a guarantee needs.
+            SimFault::ReportUnderSigned => signatures.truncate(1),
+            // Descending, so the order is wrong without any signature being.
+            SimFault::ReportSignaturesUnsorted => signatures.reverse(),
+            _ => {}
+        }
+        let wire = frame(
+            CE135,
+            &GuaranteedWorkReport {
+                report,
+                slot,
+                signatures,
+            }
+            .encode(),
+        );
+
+        let mut peers: Vec<Conn> = {
+            let held = self.peers.lock().expect("sim peers");
+            held.iter().map(|(_, conn)| conn.clone()).collect()
+        };
+        if self.fault == SimFault::ReportReachesOnePeer {
+            peers.truncate(1);
+        }
+        for conn in peers {
+            let Ok((mut send, _recv)) = conn.open_bi().await else {
+                continue;
+            };
+            if send.write_all(&wire).await.is_ok() {
+                send.finish();
+            }
+        }
+    }
+
+    /// Receive a CE 135 distribution and pool it, so the next block this
+    /// node authors carries it.
+    ///
+    /// The guarantee is taken as it arrives. A real node checks the
+    /// signatures against the core's assignment first and this stand-in
+    /// does not, which is survivable here in a way the assurance path is
+    /// not: `note_guarantee` takes a guarantee unchecked, but block
+    /// composition re-checks every one it holds and skips those that do not
+    /// hold up (`guarantors/table.rs`, `context.check(guarantee)` ->
+    /// `continue`). So a node that pools rubbish authors a valid block
+    /// without it, where a node that pools a bad *assurance* cannot author
+    /// at all.
+    ///
+    /// That is what makes a future "the node left the bad guarantee out"
+    /// row posable through the pool, and it is not posed yet. What is posed
+    /// is the other direction: a node that pools nothing.
+    async fn receive_report(&self, content: &[u8]) {
+        if self.fault == SimFault::ReportNotIncluded {
+            return;
+        }
+        let mut input = content;
+        let Ok(distribution) = GuaranteedWorkReport::decode(&mut input) else {
+            return;
+        };
+        if !input.is_empty() {
+            return;
+        }
+        let signatures: Vec<ValSignature> = distribution
+            .signatures
+            .into_iter()
+            .map(|(val_index, signature)| ValSignature {
+                val_index,
+                signature: jam_std_common::ed25519::Signature(signature.into()),
+            })
+            .collect();
+        let Ok(signatures) = signatures.try_into() else {
+            // More signatures than a core has validators. The engine's
+            // bounded vector refuses it, and so does a node.
+            return;
+        };
+        let guarantee = ReportGuarantee {
+            report: distribution.report,
+            slot: distribution.slot,
+            signatures,
+        };
+        if let Err(e) = self.chain.submit_guarantee(&guarantee) {
+            eprintln!("[sim] could not pool a distributed guarantee: {e}");
+        }
     }
 
     /// Open CE 134 to the co-guarantors, as a guarantor does once it has
@@ -975,11 +1230,33 @@ impl SimNode {
     /// makes the rows provable is that the two faults move this decision
     /// without touching anything else.
     async fn receive_assurance(&self, content: &[u8], peer: Option<u16>) {
-        // Nobody to attribute it to. A real node reads the index off the
-        // connection's certificate; this one knows only the peers it dialled.
-        let Some(peer) = peer else { return };
         let Ok(assurance) = Assurance::decode(&mut &content[..]) else {
             return;
+        };
+        // A real node reads the sender's index off the connection's
+        // certificate. This transport carries no peer identity, so that
+        // works only for connections this node opened -- and once the
+        // emulator started driving availability on both sides
+        // (`findings.md` §25), a validator's assurance could arrive on one
+        // it merely accepted.
+        //
+        // Recovered from the signature instead, which answers the same
+        // question from what is on the wire: CE 141 carries no index, but
+        // exactly one validator's key verifies it.
+        let peer = match peer {
+            Some(peer) => peer,
+            None => {
+                let anchor = assurance.anchor.0;
+                match (0..jam_types::max_val_count()).find(|&index| {
+                    m2_reference::assurance::check_assurance(&assurance, index, &[anchor]).is_ok()
+                }) {
+                    Some(peer) => peer,
+                    // No key verifies it, so there is nobody to attribute
+                    // it to and nothing to pool. A node that cannot say who
+                    // sent an assurance cannot carry it.
+                    None => return,
+                }
+            }
         };
         if self.fault == SimFault::AssuranceOmitsValid {
             return;
