@@ -1695,3 +1695,68 @@ one-word changes. The `Auditor -> Node` change in CE 138 is one word.
 Related: §4, whose question survives this — the size-cap wording is
 untouched since 2026-03-22, so it is still unanswered at HEAD and not
 something a newer revision has already settled.
+
+---
+
+## 29. One dropped connection fails rows in three lanes, and reads as three defects
+
+**Status:** open, intermittent, and the cause is not yet established. Seen
+2026-11-19 across several runs; it predates both the re-pin (§9) and the
+advisory bumps, so neither caused it.
+
+The node loses its connection to one emulated validator part-way through a
+run and does not re-establish it:
+
+```
+WARN  authoring  Ticket broadcast failure, communication error with peer
+      eled3vb5nse3n7cii6ybvtms5s2bdwvlkivc7cnwa33oatby4txka:
+      Error opening stream: Not connected to the peer
+ERROR guarantee_broadcaster  failed to send guarantee to eled3vb5...:
+      Error opening stream: Not connected to the peer
+```
+
+That SAN is **validator 4** (`SecretKeyset::trivial(4)`). One drop, and
+the rows it costs are scattered across lanes that have nothing to do with
+each other:
+
+| row | lane | what the report says |
+|---|---|---|
+| `n2_self_proxy_ce132_all_peers` | N2 | "did not reach peer(s) [4]" |
+| `n3_ce133_shares_with_both_co_guarantors` | N3 | "never opened CE 134 to validator 4 ... it reached {0}" |
+
+Read off the report alone these are two unrelated node defects: one about
+ticket broadcast, one about work-package sharing. They are one connection.
+
+**How often.** Four runs on 2026-11-19, two pins and two dependency sets:
+
+| run | pin / deps | `Not connected` | rows it cost |
+|---|---|---|---|
+| `n3-imports-1` | old pin, old deps | — | `n2_self_proxy_ce132_all_peers` |
+| `repin-1` | new pin, old deps | — | none |
+| `bumps-1` | new pin, new deps | 4 | both of the above |
+| `bumps-2` | new pin, new deps | 1 | none |
+
+So it happens in most runs and only sometimes lands where a row is
+watching. That is the worst shape for a conformance report: the same node
+and the same harness produce a different verdict run to run, and nothing
+in the report says why.
+
+**What is not yet known.** Which side closes it. The harness opens its
+connections once and holds them for the whole observation window, and QUIC
+closes an idle connection — `run.rs` already notes that a builder
+connection held across a rotation is one QUIC closes underneath it, which
+is why submissions each dial afresh. A validator link carrying nothing for
+a stretch is in the same position. Whether the emulator fails to keep it
+alive, fails to accept a re-dial, or the node gives up on it is the thing
+to establish.
+
+**Why it is recorded now rather than fixed.** It was found while checking
+whether a dependency bump had broken anything, and the first useful thing
+is to separate it from that question: it is reproducible across pins and
+dependency sets, so it belongs to neither. The second is to stop it being
+read as a node defect, which is what the report currently invites.
+
+Related: §18, §23 and §27 — rows that failed for reasons that were not the
+node's. This one differs in that the row is right and the *subject* is
+wrong: the node really did not reach validator 4, because there was
+nothing there to reach.
