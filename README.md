@@ -318,9 +318,9 @@ for about one slot at a time, so an assurance is routinely valid when sent
 and stale when the node authors with it, and polkajam refuses to author at
 all rather than dropping it.
 
-**The pin is on a branch commit whose content is now upstream.**
-`Cargo.toml` and `oracle/Cargo.toml` point at polkajam `b1ea8aca4` (branch
-`jv-export-n4`), which exports three things the harness cannot do without.
+**The pin is on upstream main.** `Cargo.toml` and `oracle/Cargo.toml` point
+at polkajam `d92cadd30`, which exports three things the harness cannot do
+without.
 `hazmat::merkle` is what checks and builds a CE 137 justification —
 `merkle_root` to check one, `merkle_proofs` and `pack_erasure_tree_entry` to
 build one, which is what lets a simulated node serve shards at all — and
@@ -330,17 +330,16 @@ what lets a simulated node carry an assurance it *received*, without which
 the CE 141 inclusion rows cannot be shown to fail. See `findings.md` §9,
 §14 and §16.
 
-polkajam#1401 **has since merged**, squashed as `d92cadd30` (2026-11-18),
-and that commit carries all of it: `hazmat::merkle` re-exports
-`merkle_proofs`, `merkle_root`, `pack_erasure_tree_entry` and
-`cd_proof_root_ph`, and `submit_assurance`, `submit_guarantee` and
-`engaged_cores` are public on the harness. Because it was squashed, the
-current pin is **not** an ancestor of upstream main, so the re-pin is a move
-rather than a fast-forward and has not been made yet. Two other commits
-landed alongside it and want checking when it is: #1382 threads a chaos
-controller through the CE 133/134/146 receive path (gated off in an ordinary
-run), and #1404 fixes an STF divergence, which is the kind of thing that
-moves an N1 state diff without anyone intending it.
+Those exports reached main as polkajam#1401, squash-merged to `d92cadd30`
+(2026-11-18), and the pin moved there on 2026-11-19 — so the harness no
+longer depends on an unmerged branch. Because it was a squash, the old pin
+`b1ea8aca4` is not an ancestor of main and the move was to a different
+commit rather than a fast-forward. Two other commits came with it: #1382
+threads a chaos controller through the CE 133/134/146 receive path (gated
+off in an ordinary run), and #1404 fixes an STF divergence, which is the
+kind of thing that moves an N1 state diff without anyone intending it.
+Neither moved a verdict — `sessions/repin-1` reports the same hard failures
+as the run before, row for row.
 
 Iterate-later items: full 2-epoch observation + epoch-boundary alignment of the ticket window;
 independent (non-`import_block`) seal/entropy VRF re-verification; full M1-style keyvals diff on

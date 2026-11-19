@@ -1221,7 +1221,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jam-bootstrap-service-common"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=b1ea8aca42b1078fd89883da66e58a9304ff0d77#b1ea8aca42b1078fd89883da66e58a9304ff0d77"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=d92cadd30cd81f821c2814292a1881f9750ff16c#d92cadd30cd81f821c2814292a1881f9750ff16c"
 dependencies = [
  "bounded-collections",
  "jam-codec",
@@ -1262,7 +1262,7 @@ dependencies = [
 [[package]]
 name = "jam-std-common"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=b1ea8aca42b1078fd89883da66e58a9304ff0d77#b1ea8aca42b1078fd89883da66e58a9304ff0d77"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=d92cadd30cd81f821c2814292a1881f9750ff16c#d92cadd30cd81f821c2814292a1881f9750ff16c"
 dependencies = [
  "ark-vrf",
  "arrayvec",
@@ -1288,7 +1288,7 @@ dependencies = [
 [[package]]
 name = "jam-types"
 version = "0.1.29"
-source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=b1ea8aca42b1078fd89883da66e58a9304ff0d77#b1ea8aca42b1078fd89883da66e58a9304ff0d77"
+source = "git+ssh://git@github.com/paritytech/polkajam.git?rev=d92cadd30cd81f821c2814292a1881f9750ff16c#d92cadd30cd81f821c2814292a1881f9750ff16c"
 dependencies = [
  "atomic-traits",
  "base64 0.22.1",

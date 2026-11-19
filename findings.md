@@ -354,6 +354,11 @@ The two are not simply older and newer, either. The published crate has a
 test the published crate does not. They are points on different lines, both
 calling themselves 0.1.29.
 
+**Repeated on the re-pin to `d92cadd30` (2026-11-19):** unchanged. The pin
+still has `provided_count: u32` and `provided_size: u64` where the
+published 0.1.29 has `u16` and `u32`, so the conclusion stands and the
+dependencies stay on git.
+
 **What this means.** The version number is not a safe way to match a
 published crate to a revision, because polkajam publishes 0.1.x from a moving
 trunk and a crates.io version is immutable once published while the trunk is
@@ -498,7 +503,8 @@ checks nobody knows are checks, and this harness has already paid for that
 twice. With the pin moved, `m2-sim` holds a real coded bundle and
 `n4_sim_it` drives eleven faults through it.
 
-**Open upstream** as polkajam#1401, from branch `jv-export-n4`:
+**Upstream** as polkajam#1401, from branch `jv-export-n4`, merged
+2026-11-18:
 `util::merkle` becomes `pub(crate)` and `hazmat::merkle` re-exports
 `merkle_proofs`, `merkle_root`, `pack_erasure_tree_entry` and the proof
 types. The same shape as #1378 -- a re-export and a visibility bump, no
@@ -511,7 +517,16 @@ justification at all, since that protocol takes its segment root from the
 shards rather than from the justification (§11b). And `merkle_proofs` with
 `pack_erasure_tree_entry` are needed to *build* one, without which no
 simulated node can serve shards and none of N4's serve rows could be shown
-to fail. The pin goes back to a merge commit once #1401 lands.
+to fail. **#1401 merged 2026-11-18**, squashed as `d92cadd30`, and the pin moved
+there on 2026-11-19. Because it was squashed, `b1ea8aca4` is not an
+ancestor of upstream main, so the move was to a different commit rather
+than a fast-forward: `hazmat::merkle` re-exports all four symbols there,
+and `submit_assurance`, `submit_guarantee` and `engaged_cores` are public
+on the harness. Two other commits came with it — #1382, which threads a
+chaos controller through the CE 133/134/146 receive path, gated off in an
+ordinary run, and #1404, an STF divergence fix. Neither moved a verdict:
+the live run on the new pin (`sessions/repin-1`) reports the same hard
+failures as the run before it.
 
 ## 10. DESIGN had the erasure recovery threshold wrong
 
@@ -738,8 +753,8 @@ is unreachable outside `jam-node`. The authoring harness could sign its own
 assurance and never take one it was handed, so nothing could simulate the
 half that matters: a node's assurances extrinsic carries what its *peers*
 sent it. `AuthoringHarness::submit_assurance` is the entry point, pushed to
-the same branch as the Merkle exports (§9) and open as
-**paritytech/polkajam#1401**.
+the same branch as the Merkle exports (§9) and **merged as
+paritytech/polkajam#1401** (2026-11-18, `d92cadd30`).
 
 ## 15. The same shape-model defect in CE 146 and CE 148 — CLOSED 2026-11-18
 
@@ -798,10 +813,11 @@ A harness in that position can only grade shape: how many segments came
 back, whether the message is a whole number of them, whether a proof arrived
 for each. All true of a node serving somebody else's segments.
 
-**Open upstream** as part of **paritytech/polkajam#1401**: one more
-re-export in `hazmat::merkle`, beside the two added for the justification
-builders (§9). The same shape as those, and as `submit_assurance` (§14): a
-re-export and a visibility bump, no behaviour change.
+**Merged upstream** in **paritytech/polkajam#1401** (2026-11-18,
+`d92cadd30`): one more re-export in `hazmat::merkle`, beside the two added
+for the justification builders (§9). The same shape as those, and as
+`submit_assurance` (§14): a re-export and a visibility bump, no behaviour
+change.
 
 The pattern is now three for three. Every time this harness has gone to
 grade a new protocol, the engine could do the thing and could not be asked

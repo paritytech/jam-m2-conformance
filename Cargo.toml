@@ -49,15 +49,15 @@ repository = "https://github.com/paritytech/jam-m2-conformance"
 # the harness would be submitting work nobody asked for with every row still
 # green.
 [workspace.dependencies]
-jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "b1ea8aca42b1078fd89883da66e58a9304ff0d77" }
-jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "b1ea8aca42b1078fd89883da66e58a9304ff0d77" }
+jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "d92cadd30cd81f821c2814292a1881f9750ff16c" }
+jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "d92cadd30cd81f821c2814292a1881f9750ff16c" }
 # The dev chain spec's bootstrap service reads its work payload as an
 # encoded `Instructions`, so a harness that wants a package to *do*
 # anything -- export segments, import them -- has to build one. Its own
 # description is "useful for interoperating and constructing work items".
 # Same revision as the rest: the service running in the node and the types
 # used to address it have to agree.
-jam-bootstrap-service-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "b1ea8aca42b1078fd89883da66e58a9304ff0d77" }
+jam-bootstrap-service-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "d92cadd30cd81f821c2814292a1881f9750ff16c" }
 
 async-trait = "0.1"
 quinn = { version = "0.11", features = ["rustls", "runtime-tokio", "log"] }
