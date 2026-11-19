@@ -1609,3 +1609,73 @@ the node cannot answer, and the row says it was not exercised.
 Related: §18 and §23, also rows that could not pass a conforming node;
 §26, also found the first time anything reached it. Three of the four were
 invisible for the same reason — nothing had ever asked.
+
+---
+
+## 28. The spec moved under P3's design, and nothing said so
+
+**Status:** open, and it blocks nothing today. Found 2026-11-19 while
+checking §4's citations before putting that question to the spec authors.
+
+Every `simple.md:NNN` citation in this repository is against **a96dc6b
+(2026-09-02)**, which is the revision `DESIGN.md` §8 names, and all of them
+still land — checked against that revision rather than assumed. The
+harness is internally consistent.
+
+`jam-np` HEAD is **aa0e2b8 (2026-10-26)**. Four hunks of `simple.md`
+changed in between, and two of them rewrite sections P3 is designed
+against.
+
+**What changed, and what it costs:**
+
+| section | change | cost here |
+|---|---|---|
+| Shard assignment | $R$ for 6 validators, 2 → 3 | none. §10 had already taken 3 from the engine, before the spec said so |
+| CE 138 | `Auditor -> Assurer` becomes `Node -> Assurer`; non-validators may request, and assurers may throttle them | none. The harness asks as a validator, and no row asserts the requester's class |
+| CE 144 | announcement restructured | **DESIGN.md §11 N5 specifies the superseded wire format** |
+| CE 145 | judgments batched, guarantee moved inside the discriminator | **same** |
+
+**The two that matter.** DESIGN's N5 table says CE 144 is `HeaderHash ++ 0
+++ len++[(Core,WRHash)] ++ sig` followed by an `Evidence` message, and that
+later tranches carry `[sₙ(w) ++ len++[No-Show]]`. The spec now says:
+
+```
+Intent = 0 (Initial tranche) OR 1 ++ Core Index (1 byte discriminator)
+Announcement = Header Hash ++ Validator Index ++ Intent ++ Bandersnatch Signature
+--> [Announcement]
+```
+
+The tranche is no longer declared — recipients derive it from the
+signature's VRF output. The no-show evidence list is gone entirely. The
+cores are not declared for tranche 0. And "should broadcast ... unless they
+do not intend to audit any work-reports" became **must** broadcast whenever
+newly required.
+
+CE 145 moved the guarantee *inside* the validity discriminator, so the
+optional second message DESIGN describes does not exist:
+
+```
+Validity = 0 ++ Guarantee (Invalid) OR 1 (Valid) (1 byte discriminator)
+Judgment = Epoch Index ++ Validator Index ++ Validity ++ Work-Report Hash ++ Ed25519 Signature
+--> [Judgment]
+```
+
+**Why this is worth a finding rather than a fix.** Nothing is wrong in the
+code: N5 and N6 do not exist yet. What is wrong is the *plan*, and a plan
+is exactly the thing that gets followed without being re-checked. A lane
+built from DESIGN's N5 table would frame bytes no conforming node sends and
+fail every one of them — §18, §23 and §27 in advance, before a line is
+written.
+
+The DESIGN rows are marked rather than rewritten. Re-specifying them is
+P3's work and wants the whole section read at once, not a patch applied to
+a table from the outside.
+
+**What to do on re-reading the spec.** Diff it, do not re-read it:
+`git diff <the revision DESIGN names>..HEAD -- simple.md` is four hunks and
+takes a minute, where re-reading 800 lines takes an hour and misses the
+one-word changes. The `Auditor -> Node` change in CE 138 is one word.
+
+Related: §4, whose question survives this — the size-cap wording is
+untouched since 2026-03-22, so it is still unanswered at HEAD and not
+something a newer revision has already settled.
