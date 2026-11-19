@@ -612,6 +612,7 @@ pub(crate) fn fabricated_run_ctx(
         refused: false,
     };
     let segments_served = |protocol: u16| n4::SegmentShardsServed {
+        segment_count: 2,
         protocol,
         erasure_root: FAB_ERASURE_ROOT,
         shard_index: FAB_NUT_INDEX,

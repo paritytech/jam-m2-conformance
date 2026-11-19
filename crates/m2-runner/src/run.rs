@@ -1250,6 +1250,18 @@ async fn plan_availability(
         segments_root: spec.exports_root,
         shard_count: spec.erasure_shards,
         segment_indices,
+        // The whole coded segment set, which is the tree a justification
+        // proves against. Three different numbers meet here and only one is
+        // right (`findings.md` §26):
+        //
+        // - what a run asks for, capped by `MAX_SEGMENTS_ASKED`;
+        // - what the package exported, `exports_count`;
+        // - what was actually coded, which is the exports **plus their
+        //   import-proof pages**. `import_proof_pages` appends one page per
+        //   `PROVEN_PER_SEGMENT` segments before the set is shard-coded, and
+        //   `jam_types::max_export_segments` is this same formula at the
+        //   maximum.
+        segment_count: segment_tree_len(spec.exports_count),
         // A slot ahead, so the fetches have somewhere to finish before the
         // assurance that follows them.
         honest_slot: now + 1,
@@ -1283,6 +1295,21 @@ const ASSURANCE_TAIL_SLOTS: u32 = 2;
 /// about one slot in six, so a short stretch of offers leaves the inclusion
 /// rows unexercised -- not failing, but saying nothing.
 const MIN_ASSURANCE_SLOTS: u32 = 12;
+
+/// Segments a package of `exports` exports is coded into.
+///
+/// The exports themselves plus one import-proof page per
+/// `PROVEN_PER_SEGMENT` of them: `import_proof_pages` appends the pages to
+/// the segment vector and the whole thing is erasure-coded together, so the
+/// tree a CE 140 justification proves against is this size and not
+/// `exports`.
+///
+/// The engine states the same formula at its maximum, in
+/// `jam_types::max_export_segments`.
+fn segment_tree_len(exports: u16) -> u32 {
+    let exports = u32::from(exports);
+    exports + exports.div_ceil(jam_types::PROVEN_PER_SEGMENT as u32)
+}
 
 /// Most segment indices a run asks for over CE 139/140.
 ///

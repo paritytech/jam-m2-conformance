@@ -1455,3 +1455,85 @@ invisible as failures: §19 and §20 showed as rows reporting *nothing*, and
 this one as fewer subjects than the run deserved. A report that is green
 because a question went unasked looks exactly like a report that is green
 because the answer was right.
+
+---
+
+## 26. The segment-shard justification was checked against the wrong tree — CLOSED 2026-11-19
+
+**Status:** found and fixed the same day, on the first live run in which a
+package exported anything (`sessions/n4-exports-1`). A harness defect that
+the simulated node was structurally unable to see.
+
+`n4_ce140_justifications_verify` failed five times out of five against a
+node that was serving correctly:
+
+```
+CE 140 for root f38a03cd index 0: 0: did not verify, 1: did not verify,
+  2: did not verify, 3: did not verify
+```
+
+Every one, not some, which is the shape of a bad input rather than a bad
+proof.
+
+A segment justification proves that a slice sits at its index in a Merkle
+tree built over **every segment the package exported**. Checking one needs
+the size of that tree. The runner passed the size of the *request*:
+
+```rust
+segment_index,
+shards.requested.len() as u32,
+```
+
+**Why the simulated node could not catch it.** `n4_sim_it` held two
+segments and asked for both, so `requested.len()` and the true count were
+the same number. They are the same number in every arrangement the test
+could make, because the test chose both. The two only come apart when a
+package exports more than a run asks for — and until §17's fix landed, no
+package exported anything at all, so the live surface could not come apart
+either.
+
+That is a blind spot with a shape worth naming: a test that supplies both
+sides of an equation cannot discover that the equation is wrong.
+
+**The fix, and the second number it took to get there.** `AvailPlan`
+carries `segment_count`, `SegmentShardsServed` records it, and the check
+uses it. What that number *is* took two live runs to settle, because three
+of them meet at this call site:
+
+| | |
+|---|---|
+| what a run asks for | `MAX_SEGMENTS_ASKED`, capped — what the code used |
+| what the package exported | `exports_count` — the first fix, still wrong |
+| what was actually coded | the exports **plus their import-proof pages** |
+
+`import_proof_pages` appends one page per `PROVEN_PER_SEGMENT` (64)
+segments to the vector *before* the set is erasure-coded
+(`chain/logistics.rs:151`, `availability/mod.rs`: `segments.append(&mut
+proof_segments)`), so a four-export package is coded as five segments. The
+engine states the same formula at its maximum in
+`jam_types::max_export_segments`, which is the cross-check that this is the
+rule rather than an arithmetic that happens to fit.
+
+The first fix passed the sim and failed live, which is what sent the search
+to the engine instead of to another guess.
+
+**Proven.** `n4_sim_it` now holds four segments and asks for two. The
+honest node passes with the fix and fails all five rows without it, which
+is the live failure reproduced on demand in 0.16 s.
+
+**Why the simulated node cannot model the second half either.** It codes
+exactly the segments it is handed and appends no proof pages, so for the
+sim `segments.len()` really is the tree size. That is why the first fix
+passed there and failed live. The count is a property of how a segment set
+was produced, not a formula that holds everywhere, which is why it belongs
+on the plan rather than being derived at the point of the check.
+
+**Measured after the second fix** (`sessions/n4-exports-3`):
+`n4_ce140_justifications_verify` five of five HARD PASS, with CE 139's
+rows passing alongside. All three segment protocols have now been put to a
+real node: CE 139 and CE 140 answer and verify, and CE 148 is declined,
+which `simple.md:660` allows and the row records as Soft.
+
+Related: §23, also a row that could not pass, also found the first time
+anything reached it. §17, which had to be closed before this could be seen
+at all.

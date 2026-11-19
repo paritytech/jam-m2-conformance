@@ -41,7 +41,16 @@ const EMU_INDICES: [usize; 5] = [0, 1, 3, 4, 5];
 /// Validators the bundle is coded for, which is the whole set.
 const SHARD_COUNT: u16 = 6;
 /// Segments the package exports, so CE 139/140 have something to ask for.
-const SEGMENTS: usize = 2;
+const SEGMENTS: usize = 4;
+/// Segments a run asks for, fewer than the node holds.
+///
+/// Deliberately not all of them. A justification proves a segment sits at
+/// its index in a tree over *every* segment the package exported, so
+/// checking one needs the size of that tree -- and while the test held
+/// exactly as many as it asked for, `requested.len()` stood in for that
+/// size and nothing could tell the two apart. It took a live node
+/// exporting four segments to expose it (`findings.md` §26).
+const ASKED: usize = 2;
 /// The core the harness believes carried the report, so an assurance
 /// claiming any other core is claiming one with nothing on it.
 const REPORTED_CORE: u16 = 0;
@@ -106,7 +115,8 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         erasure_root,
         segments_root,
         shard_count: SHARD_COUNT,
-        segment_indices: (0..SEGMENTS as u16).collect(),
+        segment_indices: (0..ASKED as u16).collect(),
+        segment_count: SEGMENTS as u32,
         honest_slot: now + 1,
         // Two slots of offers: this test grades what the node *serves* and
         // what it sends, not what it carries, so one honest offer and one

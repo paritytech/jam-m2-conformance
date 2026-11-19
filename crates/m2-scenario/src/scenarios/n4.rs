@@ -92,6 +92,14 @@ pub struct SegmentShardsServed {
     pub shard_index: u16,
     /// The segment indices asked for, in request order.
     pub requested: Vec<u16>,
+    /// How many segments the package exports in total.
+    ///
+    /// Not `requested.len()`. A segment's justification proves it sits at
+    /// its index in a tree over *every* segment the package exported, so
+    /// checking one needs the size of that tree -- and a run that asks for
+    /// a subset would otherwise check the proofs against a tree the right
+    /// shape only by coincidence (`findings.md` §26).
+    pub segment_count: u32,
     /// The slices the NUT returned, split at the slice length the shard
     /// count fixes. One per index asked for, in the order asked: the reply
     /// carries no indices of its own, so position is the only thing tying a
@@ -1211,6 +1219,7 @@ mod tests {
     fn ce140_without_justifications_fails_rather_than_passing_vacuously() {
         let ctx = N4Ctx {
             segment_shards_served: vec![SegmentShardsServed {
+                segment_count: 2,
                 protocol: 140,
                 erasure_root: [0x44; 32],
                 shard_index: 1,
@@ -1238,6 +1247,7 @@ mod tests {
     fn ce139_is_not_graded_for_justifications() {
         let ctx = N4Ctx {
             segment_shards_served: vec![SegmentShardsServed {
+                segment_count: 2,
                 protocol: 139,
                 erasure_root: [0x44; 32],
                 shard_index: 1,
@@ -1268,6 +1278,7 @@ mod tests {
     fn a_ragged_reply_is_its_own_row() {
         let ctx = N4Ctx {
             segment_shards_served: vec![SegmentShardsServed {
+                segment_count: 2,
                 protocol: 140,
                 erasure_root: [0x44; 32],
                 shard_index: 1,
@@ -1299,6 +1310,7 @@ mod tests {
     fn a_short_reply_fails_the_count_row() {
         let ctx = N4Ctx {
             segment_shards_served: vec![SegmentShardsServed {
+                segment_count: 2,
                 protocol: 139,
                 erasure_root: [0x44; 32],
                 shard_index: 1,
