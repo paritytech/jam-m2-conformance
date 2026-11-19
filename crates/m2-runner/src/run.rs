@@ -247,7 +247,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             let nut_san = nut_san.clone();
             let index = emu_indices[i];
             dial_tasks.push(tokio::spawn(async move {
-                let _ = m2_emu::emu::dial_nut(index, genesis_hash, nut_addr, nut_san, shared).await;
+                hold_connection(index, genesis_hash, nut_addr, nut_san, shared).await;
             }));
         }
         for &i in &plan.wait_then_connect {
@@ -266,7 +266,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     return;
                 }
                 m2_emu::emu::record(&shared.obs, peer, ObsKind::Other(n0::FALLBACK_DIAL));
-                let _ = m2_emu::emu::dial_nut(index, genesis_hash, nut_addr, nut_san, shared).await;
+                hold_connection(index, genesis_hash, nut_addr, nut_san, shared).await;
             }));
         }
         // Only now is the plan laid out. Until the node has imported and
@@ -1408,6 +1408,52 @@ fn first_package_spec(
         exports_count: decoded.package_spec.exports_count,
     })
 }
+
+/// Dial the NUT as an emulated validator and keep that connection up for as
+/// long as the run lasts.
+///
+/// [`dial_nut`] returns when the connection ends, and the two call sites used
+/// to discard that with `let _ =`. Where the emulated validator is the
+/// preferred initiator the node is *right* to sit and wait for it
+/// (`simple.md:70-80`), so a connection that died stayed dead: the node had
+/// four peers for the rest of the run and the rows that needed the fifth
+/// failed, in two different lanes, reading as two unrelated node defects
+/// (`findings.md` §29).
+///
+/// So it re-dials, and says so. The delay is what keeps a node that is
+/// refusing connections from being hammered; the run ends by aborting this
+/// task, so there is no need to count attempts.
+async fn hold_connection(
+    index: usize,
+    genesis_hash: [u8; 32],
+    nut_addr: SocketAddr,
+    nut_san: String,
+    shared: m2_emu::emu::EmuShared,
+) {
+    loop {
+        match m2_emu::emu::dial_nut(
+            index,
+            genesis_hash,
+            nut_addr,
+            nut_san.clone(),
+            shared.clone(),
+        )
+        .await
+        {
+            Ok(()) => eprintln!(
+                "[connectivity] validator {index}: the connection to the NUT ended; re-dialling"
+            ),
+            Err(e) => eprintln!("[connectivity] validator {index}: connection to the NUT: {e}"),
+        }
+        jamnp_s::clock::current().sleep(REDIAL_DELAY).await;
+    }
+}
+
+/// How long to wait before dialling the NUT again after a connection ends.
+///
+/// Short enough that a run of 300 s loses little, long enough that a node
+/// refusing connections is not dialled in a tight loop.
+const REDIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn hex8(bytes: &[u8; 32]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()

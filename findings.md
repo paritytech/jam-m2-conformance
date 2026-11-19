@@ -1698,65 +1698,82 @@ something a newer revision has already settled.
 
 ---
 
-## 29. One dropped connection fails rows in three lanes, and reads as three defects
+## 29. A validator connection dies mid-run, and nothing re-dialled it
 
-**Status:** open, intermittent, and the cause is not yet established. Seen
-2026-11-19 across several runs; it predates both the re-pin (§9) and the
-advisory bumps, so neither caused it.
+**Status:** the consequence is fixed and measured; the **cause is still
+open**. Found 2026-11-19 while checking whether the advisory bumps had
+broken anything. It is neither the bumps nor the re-pin: it reproduces on
+both pins and both dependency sets.
 
 The node loses its connection to one emulated validator part-way through a
-run and does not re-establish it:
+run and does not get it back:
 
 ```
-WARN  authoring  Ticket broadcast failure, communication error with peer
-      eled3vb5nse3n7cii6ybvtms5s2bdwvlkivc7cnwa33oatby4txka:
-      Error opening stream: Not connected to the peer
 ERROR guarantee_broadcaster  failed to send guarantee to eled3vb5...:
       Error opening stream: Not connected to the peer
+WARN  authoring  Ticket broadcast failure, communication error with peer
+      eled3vb5...: Error opening stream: Not connected to the peer
 ```
 
-That SAN is **validator 4** (`SecretKeyset::trivial(4)`). One drop, and
-the rows it costs are scattered across lanes that have nothing to do with
-each other:
+That SAN is **validator 4** (`SecretKeyset::trivial(4)`). In
+`sessions/bumps-1` the node went from five peers to four 102 seconds in and
+stayed there, and the rows it cost were scattered across lanes that have
+nothing to do with each other:
 
-| row | lane | what the report says |
+| row | lane | what the report said |
 |---|---|---|
 | `n2_self_proxy_ce132_all_peers` | N2 | "did not reach peer(s) [4]" |
 | `n3_ce133_shares_with_both_co_guarantors` | N3 | "never opened CE 134 to validator 4 ... it reached {0}" |
 
-Read off the report alone these are two unrelated node defects: one about
-ticket broadcast, one about work-package sharing. They are one connection.
+Read off the report these are two unrelated node defects, one about ticket
+broadcast and one about work-package sharing. They are one connection.
 
-**How often.** Four runs on 2026-11-19, two pins and two dependency sets:
+**Why it stayed dead.** `preferred_initiator` makes the *emulator* the one
+that dials for validators 3 and 4, so the node is right to sit and wait
+(`simple.md:70-80`). On this side `dial_nut` returns when its connection
+ends, and both call sites discarded that with `let _ =`. The task finished,
+nothing re-dialled, and nothing was logged — the harness did not know it
+had lost a peer, and neither did the report.
 
-| run | pin / deps | `Not connected` | rows it cost |
-|---|---|---|---|
-| `n3-imports-1` | old pin, old deps | — | `n2_self_proxy_ce132_all_peers` |
-| `repin-1` | new pin, old deps | — | none |
-| `bumps-1` | new pin, new deps | 4 | both of the above |
-| `bumps-2` | new pin, new deps | 1 | none |
+**Counting it properly.** The first version of this entry said the drop
+happened in most runs. That was wrong, and the way it was wrong is worth
+keeping: three of the four occurrences were at 250 s, 259 s and 360 s into
+a 300-second window — the run tearing its own dial tasks down at the end.
+Only `bumps-1` lost a peer mid-run. Timestamps distinguished them; counting
+log lines did not.
 
-So it happens in most runs and only sometimes lands where a row is
-watching. That is the worst shape for a conformance report: the same node
-and the same harness produce a different verdict run to run, and nothing
-in the report says why.
+**The fix, in two halves.** A keep-alive, because quinn defaults to a
+30-second idle timeout and **no** keep-alive and this harness set neither,
+so any quiet link was a candidate. And `hold_connection`, which re-dials
+when a connection ends and says so, for the peers this side is responsible
+for initiating.
 
-**What is not yet known.** Which side closes it. The harness opens its
-connections once and holds them for the whole observation window, and QUIC
-closes an idle connection — `run.rs` already notes that a builder
-connection held across a rotation is one QUIC closes underneath it, which
-is why submissions each dial afresh. A validator link carrying nothing for
-a stretch is in the same position. Whether the emulator fails to keep it
-alive, fails to accept a re-dial, or the node gives up on it is the thing
-to establish.
+**Measured** (`sessions/keepalive-1`, the seed that failed before): no
+`Not connected` in the node's log at all, five peers for the whole window,
+and the hard rows back to the five known ones — `n2_self_proxy_ce132_all_peers`
+and `n3_ce133_shares_with_both_co_guarantors` both gone.
 
-**Why it is recorded now rather than fixed.** It was found while checking
-whether a dependency bump had broken anything, and the first useful thing
-is to separate it from that question: it is reproducible across pins and
-dependency sets, so it belongs to neither. The second is to stop it being
-read as a node defect, which is what the report currently invites.
+**What is still open, and it is the interesting half.** The run logged
+**eight** re-dials, every one of them validator 4:
+
+```
+[connectivity] validator 4: the connection to the NUT ended; re-dialling
+```
+
+So that connection still ends about every 37 seconds. The keep-alive did
+not prevent it, which rules out a plain idle timeout, and it is still only
+validator 4 — never 3, which this side also dials. The run now survives it
+in about two seconds, which is why no row notices, but surviving a thing is
+not understanding it.
+
+The hypothesis worth testing first: that the node is *also* dialling
+validator 4 despite not being the preferred initiator, and the two
+connections displace each other. `n0_preferred_initiator` would not catch
+that, because it grades the opening of a run and this is a steady state.
+If it holds, it is a node defect and this entry has been looking at the
+wrong end of it the whole time.
 
 Related: §18, §23 and §27 — rows that failed for reasons that were not the
-node's. This one differs in that the row is right and the *subject* is
-wrong: the node really did not reach validator 4, because there was
-nothing there to reach.
+node's. This one differs: the row was right and the *subject* was missing.
+The node really did not reach validator 4, because there was nothing there
+to reach.
