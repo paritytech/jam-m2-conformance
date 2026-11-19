@@ -354,6 +354,11 @@ The two are not simply older and newer, either. The published crate has a
 test the published crate does not. They are points on different lines, both
 calling themselves 0.1.29.
 
+**Repeated on the re-pin to `d92cadd30` (2026-11-19):** unchanged. The pin
+still has `provided_count: u32` and `provided_size: u64` where the
+published 0.1.29 has `u16` and `u32`, so the conclusion stands and the
+dependencies stay on git.
+
 **What this means.** The version number is not a safe way to match a
 published crate to a revision, because polkajam publishes 0.1.x from a moving
 trunk and a crates.io version is immutable once published while the trunk is
@@ -498,7 +503,8 @@ checks nobody knows are checks, and this harness has already paid for that
 twice. With the pin moved, `m2-sim` holds a real coded bundle and
 `n4_sim_it` drives eleven faults through it.
 
-**Open upstream** as polkajam#1401, from branch `jv-export-n4`:
+**Upstream** as polkajam#1401, from branch `jv-export-n4`, merged
+2026-11-18:
 `util::merkle` becomes `pub(crate)` and `hazmat::merkle` re-exports
 `merkle_proofs`, `merkle_root`, `pack_erasure_tree_entry` and the proof
 types. The same shape as #1378 -- a re-export and a visibility bump, no
@@ -511,7 +517,16 @@ justification at all, since that protocol takes its segment root from the
 shards rather than from the justification (§11b). And `merkle_proofs` with
 `pack_erasure_tree_entry` are needed to *build* one, without which no
 simulated node can serve shards and none of N4's serve rows could be shown
-to fail. The pin goes back to a merge commit once #1401 lands.
+to fail. **#1401 merged 2026-11-18**, squashed as `d92cadd30`, and the pin moved
+there on 2026-11-19. Because it was squashed, `b1ea8aca4` is not an
+ancestor of upstream main, so the move was to a different commit rather
+than a fast-forward: `hazmat::merkle` re-exports all four symbols there,
+and `submit_assurance`, `submit_guarantee` and `engaged_cores` are public
+on the harness. Two other commits came with it — #1382, which threads a
+chaos controller through the CE 133/134/146 receive path, gated off in an
+ordinary run, and #1404, an STF divergence fix. Neither moved a verdict:
+the live run on the new pin (`sessions/repin-1`) reports the same hard
+failures as the run before it.
 
 ## 10. DESIGN had the erasure recovery threshold wrong
 
@@ -738,8 +753,8 @@ is unreachable outside `jam-node`. The authoring harness could sign its own
 assurance and never take one it was handed, so nothing could simulate the
 half that matters: a node's assurances extrinsic carries what its *peers*
 sent it. `AuthoringHarness::submit_assurance` is the entry point, pushed to
-the same branch as the Merkle exports (§9) and open as
-**paritytech/polkajam#1401**.
+the same branch as the Merkle exports (§9) and **merged as
+paritytech/polkajam#1401** (2026-11-18, `d92cadd30`).
 
 ## 15. The same shape-model defect in CE 146 and CE 148 — CLOSED 2026-11-18
 
@@ -798,10 +813,11 @@ A harness in that position can only grade shape: how many segments came
 back, whether the message is a whole number of them, whether a proof arrived
 for each. All true of a node serving somebody else's segments.
 
-**Open upstream** as part of **paritytech/polkajam#1401**: one more
-re-export in `hazmat::merkle`, beside the two added for the justification
-builders (§9). The same shape as those, and as `submit_assurance` (§14): a
-re-export and a visibility bump, no behaviour change.
+**Merged upstream** in **paritytech/polkajam#1401** (2026-11-18,
+`d92cadd30`): one more re-export in `hazmat::merkle`, beside the two added
+for the justification builders (§9). The same shape as those, and as
+`submit_assurance` (§14): a re-export and a visibility bump, no behaviour
+change.
 
 The pattern is now three for three. Every time this harness has gone to
 grade a new protocol, the engine could do the thing and could not be asked
@@ -1679,3 +1695,68 @@ one-word changes. The `Auditor -> Node` change in CE 138 is one word.
 Related: §4, whose question survives this — the size-cap wording is
 untouched since 2026-03-22, so it is still unanswered at HEAD and not
 something a newer revision has already settled.
+
+---
+
+## 29. One dropped connection fails rows in three lanes, and reads as three defects
+
+**Status:** open, intermittent, and the cause is not yet established. Seen
+2026-11-19 across several runs; it predates both the re-pin (§9) and the
+advisory bumps, so neither caused it.
+
+The node loses its connection to one emulated validator part-way through a
+run and does not re-establish it:
+
+```
+WARN  authoring  Ticket broadcast failure, communication error with peer
+      eled3vb5nse3n7cii6ybvtms5s2bdwvlkivc7cnwa33oatby4txka:
+      Error opening stream: Not connected to the peer
+ERROR guarantee_broadcaster  failed to send guarantee to eled3vb5...:
+      Error opening stream: Not connected to the peer
+```
+
+That SAN is **validator 4** (`SecretKeyset::trivial(4)`). One drop, and
+the rows it costs are scattered across lanes that have nothing to do with
+each other:
+
+| row | lane | what the report says |
+|---|---|---|
+| `n2_self_proxy_ce132_all_peers` | N2 | "did not reach peer(s) [4]" |
+| `n3_ce133_shares_with_both_co_guarantors` | N3 | "never opened CE 134 to validator 4 ... it reached {0}" |
+
+Read off the report alone these are two unrelated node defects: one about
+ticket broadcast, one about work-package sharing. They are one connection.
+
+**How often.** Four runs on 2026-11-19, two pins and two dependency sets:
+
+| run | pin / deps | `Not connected` | rows it cost |
+|---|---|---|---|
+| `n3-imports-1` | old pin, old deps | — | `n2_self_proxy_ce132_all_peers` |
+| `repin-1` | new pin, old deps | — | none |
+| `bumps-1` | new pin, new deps | 4 | both of the above |
+| `bumps-2` | new pin, new deps | 1 | none |
+
+So it happens in most runs and only sometimes lands where a row is
+watching. That is the worst shape for a conformance report: the same node
+and the same harness produce a different verdict run to run, and nothing
+in the report says why.
+
+**What is not yet known.** Which side closes it. The harness opens its
+connections once and holds them for the whole observation window, and QUIC
+closes an idle connection — `run.rs` already notes that a builder
+connection held across a rotation is one QUIC closes underneath it, which
+is why submissions each dial afresh. A validator link carrying nothing for
+a stretch is in the same position. Whether the emulator fails to keep it
+alive, fails to accept a re-dial, or the node gives up on it is the thing
+to establish.
+
+**Why it is recorded now rather than fixed.** It was found while checking
+whether a dependency bump had broken anything, and the first useful thing
+is to separate it from that question: it is reproducible across pins and
+dependency sets, so it belongs to neither. The second is to stop it being
+read as a node defect, which is what the report currently invites.
+
+Related: §18, §23 and §27 — rows that failed for reasons that were not the
+node's. This one differs in that the row is right and the *subject* is
+wrong: the node really did not reach validator 4, because there was
+nothing there to reach.

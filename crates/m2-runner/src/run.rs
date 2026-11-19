@@ -1118,8 +1118,15 @@ async fn submit_as_builder(
     // for what it names to have reached a block before it is sent.
     let mut exported: Option<m2_reference::reports::ImportSource> = None;
     for schedule in plan {
-        if let Some(source) =
-            submit_one(addr, &expected_san, genesis_hash, &shared, schedule, &exported).await
+        if let Some(source) = submit_one(
+            addr,
+            &expected_san,
+            genesis_hash,
+            &shared,
+            schedule,
+            &exported,
+        )
+        .await
         {
             exported.get_or_insert(source);
         }

@@ -16,7 +16,7 @@ plus **N3** (guaranteeing) and **N4** (availability), which are graded by name �
 below for why. See [DESIGN.md](DESIGN.md) for the design; this README documents the current
 implementation state.
 
-- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **537 passed / 0 failed** ✓,
+- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **546 passed / 0 failed** ✓,
   `cargo fmt --all --check` ✓, no `unwrap`/`panic`/`expect`/`todo!` in non-test code.
 - Dry-run baseline: `cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/x`
   exits 0 with **all N0+N1+N2 checks HARD PASS** — the harness's own expectations are satisfiable.
@@ -27,11 +27,11 @@ implementation state.
 |---|---|
 | `jamnp-s` | Independent JAMNP-S: QUIC/TLS endpoint (quinn 0.11 + rustls), Ed25519 cert + custom SAN, ALPN `jamnp-s/1/<8hex>[/builder]`, preferred-initiator rule, kind-once stream framing (`u32 LE` messages), typed codecs for every UP/CE protocol (UP 0, CE 128–148), message trace recorder, and the `transport` and `clock` boundaries (QUIC or an in-process mock; the machine's clock or a virtual one) that everything above it speaks through. |
 | `m2-oracle-proto` | The wire protocol between the harness and the reference oracle: a 4-byte length prefix and a JAM-codec message, with the fuzz protocol's own tags kept where they were. |
-| `m2-reference` | Client of the reference oracle: `RefChain` (tiny 6-validator chain, deterministic authoring of emulated slots), NUT-block import + state diff (`import.rs`/`state.rs`), ticket generation/planning/verification (`tickets.rs`). Holds a connection and a session id; the engine itself is in `oracle/`. |
+| `m2-reference` | Client of the reference oracle: `RefChain` (tiny 6-validator chain, deterministic authoring of emulated slots), NUT-block import + state diff (`import.rs`/`state.rs`), ticket generation/planning/verification (`tickets.rs`), work packages and guaranteed reports (`reports.rs`), erasure-coded bundles and segment justifications (`availability.rs`). Holds a connection and a session id; the engine itself is in `oracle/`. |
 | `oracle/` | **Outside the workspace.** The reference engine, behind a unix socket: the one crate that depends on polkajam's `jam-node` and its `hazmat` feature. Built by `scripts/prepare-nut.sh` from the same revision as the node under test, which is what makes its answers a standard to grade that node by. |
-| `m2-emu` | Five emulated validators (skeletons — no core logic; all values/decisions injected from `m2-reference`): UP 0 announce, CE 128/129 serve, NUT-block fetch (N1), CE 131/132 ticket send/receive (N2). |
-| `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `n0.rs` (9 checks), `n1.rs` (6), `n2.rs` (7). |
-| `m2-runner` | CLI: keygen → spec → NUT launch (docker/polkajam presets) → connectivity → scenario (N0/N1/N2) → `report.md`/`findings.json`/trace → exit code. |
+| `m2-emu` | Five emulated validators (skeletons — no core logic; all values/decisions injected from `m2-reference`): UP 0 announce, CE 128/129 serve, NUT-block fetch (N1), CE 131/132 ticket send/receive (N2), CE 133/146 submission and CE 134/135 share and report receive (N3), CE 137–140 and CE 148 fetch with CE 141 assurances (N4). |
+| `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `n0.rs` (9 checks), `n1.rs` (6), `n2.rs` (7), `n3.rs` (6), `n4.rs` (6). A check reports one row per thing it graded, so a run's row count is far larger than its check count. |
+| `m2-runner` | CLI: keygen → spec → NUT launch (docker/polkajam presets) → connectivity → scenario (N0–N4) → `report.md`/`findings.json`/trace → exit code. |
 | `m2-sim` | A simulated node the harness can grade in-process: honest, or broken in one named way, so a check can be shown to fail when it should. |
 
 ## Build and run
@@ -61,14 +61,27 @@ preferred-initiator rule), `--base-port`, `--preset` (`polkajam`/`docker`/`mock`
 `--lanes` (which lanes to grade, default `n0,n1,n2`; a lane left out is neither graded nor
 exercised, and `--lanes n0` skips ticket proving entirely), `--dry-run`.
 
-## Real-surface results vs polkajam-as-NUT (2026-10)
+## Real-surface results vs polkajam-as-NUT (2026-11)
 
 The harness runs end-to-end against the polkajam NUT and produces a genuine conformance
 report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,json}`).
 `M2-status.md` records the milestone evidence in full, and how to point the suite at a
-third-party node. Latest run, `sessions/unitB-9` (a 300 s window): **278 checks, two hard
-findings, both of them node defects**, plus two soft rows — one of them a second instance
-of a known defect, the other a coverage gap this node cannot close.
+third-party node.
+
+Latest run, `sessions/n3-imports-1`, all five lanes over a 300 s window: **589 rows, seven
+hard findings.** None of the seven is the harness's:
+
+| row | what it is |
+|---|---|
+| `ce129_boundary_parent_before_child` | a node defect, standing since the first N0 runs |
+| `n2_unknown_epoch_reset_observed` | a node defect: the ticket is rejected, the stream is not reset |
+| `n2_self_proxy_ce132_all_peers` | one self-proxied ticket did not reach one peer; seen in consecutive runs and not yet written up |
+| `n3_ce133_oversized_reset`, `n3_ce146_oversized_reset` | `findings.md` §4 — a **should** whose binding on the receiver the spec does not state. Unsettled, not a verdict |
+| `n3_ce133_extrinsic_mismatch_reset` | `findings.md` §8 — reproduced, but it may be a change in the node rather than a standing defect |
+| `n3_ce134_answered` | `findings.md` §5 — a well-formed share reset with `NoError` |
+
+The count moves between runs, and 589 is near the top of its range rather than a baseline:
+the window length sets the ceiling and the lottery sets the rest.
 
 - **N0 connectivity and sync**: 26/27 HARD PASS — real TLS 1.3 mutual handshake, Ed25519 cert +
   SAN, ALPN `jamnp-s/1/…` with a mismatched ALPN refused, preferred-initiator split, 21 `/builder`
@@ -86,11 +99,24 @@ of a known defect, the other a coverage gap this node cannot close.
   resetting the stream either, which is the same defect in a second place
   (`n2_proxy_duty_bad_proof_ignored`); and the stopping rule
   (`n2_forward_stops_at_finality`) reports itself unexercised, because polkajam sends each
-  ticket to each peer exactly once and so never had a forward to stop.
+  ticket to each peer exactly once and so never had a forward to stop. A second hard row,
+  `n2_self_proxy_ce132_all_peers`, has failed in recent runs with one ticket short of one
+  peer; it is in the table above and not yet written up.
+- **N3 guaranteeing**: the node takes the harness's work packages over CE 133 and CE 146,
+  shares each with both co-guarantors over CE 134 with the right segments-root mappings,
+  and distributes a correctly-signed report over CE 135 that it then includes. Four
+  deliberately-broken CE 133 submissions and one over CE 146 are each graded by their own
+  rule, since two of them ask for a reset and two for silence. Four hard rows fail: §4's
+  two oversize rows, §8's extrinsic mismatch, and §5.
+- **N4 availability**: the node serves CE 137, CE 138 and CE 139/140 with justifications
+  that verify against the engine, declines CE 148 (which the spec permits, and the row
+  records as Soft), and its CE 141 assurances are graded well-formed, correctly aimed, and
+  to inclusion. No hard findings in the latest runs; §22 records what the node does to its
+  own authoring instead.
 - Runner exits 1 (correct — hard failures exist).
 
-**Every hard failure the harness has ever reported against this node but those two was its
-own.** Five have been found and closed, and they are one defect in five shapes: *the harness
+**Most hard failures the harness has ever reported against this node were its own.** In N0
+to N2, five were found and closed, and they are one defect in five shapes: *the harness
 grading the node against its own intentions rather than against what happened on the wire.*
 
 - Ticket delivery ran on slot arithmetic with no readiness gate, so the first batch went out
@@ -158,24 +184,35 @@ forwarding window, and an unknown-epoch probe that was never scheduled.
 
 ## Dependency wiring
 
-The workspace takes two polkajam crates, `jam-types` and `jam-std-common`, as
-ordinary **git dependencies** pinned to a commit in the root `Cargo.toml`
-(DESIGN.md §8). It does not take `jam-node`: `cargo tree -i jam-node` finds
-nothing here, because the engine runs out of process. Nothing from polkajam
-is vendored into this repository.
+The workspace takes three polkajam crates as ordinary **git dependencies**
+pinned to a commit in the root `Cargo.toml` (DESIGN.md §8): `jam-types` and
+`jam-std-common` for the types and codecs the harness reads the wire with,
+and `jam-bootstrap-service-common` for the payload shape the dev chain
+spec's bootstrap service reads -- a work item that exports or imports
+segments is an encoded `Instructions` addressed to it. It does not take
+`jam-node`: `cargo tree -i jam-node` finds nothing here, because the engine
+runs out of process. Nothing from polkajam is vendored into this
+repository.
 
-Not from crates.io, though both are published at the same 0.1.29 the pin
-carries. They are different code -- the published `ServiceActivityRecord` has
-`provided_count: u16` where the pin has `u32`, in a struct that derives
-`Encode` -- so a harness built against one and an oracle built against the
-other would disagree about bytes in the state a lane diffs. polkajam
-publishes 0.1.x from a moving trunk, so a version number does not identify a
-revision; findings.md §6 has the diff and the check to repeat on a re-pin.
+Not from crates.io, though the first two are published at the same 0.1.29
+the pin carries. They are different code -- the published
+`ServiceActivityRecord` has `provided_count: u16` where the pin has `u32`,
+in a struct that derives `Encode` -- so a harness built against one and an
+oracle built against the other would disagree about bytes in the state a
+lane diffs. polkajam publishes 0.1.x from a moving trunk, so a version
+number does not identify a revision; findings.md §6 has the diff and the
+check to repeat on a re-pin.
 
 The reference oracle (`oracle/`) is **outside the workspace** and pins the
 same revision in its own `oracle/Cargo.toml`. `prepare-nut.sh` reads the pin
 from there -- the oracle's manifest is the one that still names `jam-node` --
-and refuses to build if the two manifests disagree. It produces both
+and refuses to build unless **every** polkajam dependency in the workspace
+manifest is on that same revision. (It used to look for `jam-node` in the
+workspace manifest, which has never had one, so the guard read an empty
+string and could not fire.) The one that would drift quietly is
+`jam-bootstrap-service-common`: the other two decode the node's own bytes
+and would fail loudly, while a drifted payload shape encodes an instruction
+the running service misreads, with every row still green. It produces both
 binaries, from one revision, so the node under test and the engine that
 grades it are the same build:
 
@@ -246,11 +283,24 @@ run submits a package that imports a segment from an earlier one, and
 three ways of getting it wrong -- including no mappings at all, which is the
 case the old gate made unreportable.
 
+**And every one of them has now been put to the real node.** The three
+segment protocols were the last that had never been: until the harness
+could build a package that *exports*, a run asked nothing over CE 139, CE
+140 or CE 148 and all three reported themselves unexercised — truthfully,
+and in a way that reads on a green report exactly like a node that
+answered (`findings.md` §17). The dev bootstrap service turned out never to
+have been the blocker, only unexplored. Opening that door immediately found
+§26: the CE 140 justification check had been comparing each proof against
+the size of the *request* rather than the tree it proves against, which no
+simulated node could have caught, because the test held exactly as many
+segments as it asked for.
+
 So the coverage reason for keeping N3 and N4 out of the default set is
-gone, and what is left is a judgement rather than a gap: `n3_ce133_oversized_reset`
-and `n3_ce146_oversized_reset` are Hard against a reading of `simple.md`
-that §4 records as unsettled, and making these lanes default would fail a
-third-party node on a **should**. They stay opt-in until that is settled.
+gone twice over, and what is left is a judgement rather than a gap:
+`n3_ce133_oversized_reset` and `n3_ce146_oversized_reset` are Hard against a
+reading of `simple.md` that §4 records as unsettled, and making these lanes
+default would fail a third-party node on a **should**. They stay opt-in
+until that is settled.
 
 **N4's assurance rows have now been answered by a real node.** As of
 2026-11-18 a live run grades `n4_ce141_well_formed`,
@@ -261,21 +311,35 @@ four. Getting there took seven runs and six harness fixes
 (`findings.md` §19 to §25): until then no live run had ever
 engaged a core, so the node never sent an assurance and the rows reported
 themselves *not exercised* — which on a green report reads exactly like a
-node that did nothing. One piece is still open, §21's second half: the
-engaged cores are read when the availability plan is written rather than at
-send time, so a run still costs the node two or three authoring slots.
+node that did nothing. §21's second half then closed too: the engaged cores
+are read per slot rather than fixed when the plan is written. What is left
+is on the node's side, written up as `findings.md` §22 — a core is engaged
+for about one slot at a time, so an assurance is routinely valid when sent
+and stale when the node authors with it, and polkajam refuses to author at
+all rather than dropping it.
 
-**The pin is on an unmerged branch.** `Cargo.toml` and `oracle/Cargo.toml`
-point at polkajam `b1ea8aca4` (branch `jv-export-n4`, open as
-polkajam#1401), which exports three things the harness cannot do without.
+**The pin is on upstream main.** `Cargo.toml` and `oracle/Cargo.toml` point
+at polkajam `d92cadd30`, which exports three things the harness cannot do
+without.
 `hazmat::merkle` is what checks and builds a CE 137 justification —
 `merkle_root` to check one, `merkle_proofs` and `pack_erasure_tree_entry` to
 build one, which is what lets a simulated node serve shards at all — and
 `cd_proof_root_ph`, without which a CE 148 import proof cannot be checked by
 anything outside the node crate. `AuthoringHarness::submit_assurance` is
 what lets a simulated node carry an assurance it *received*, without which
-the CE 141 inclusion rows cannot be shown to fail. The pin goes back to a
-merge commit once that PR lands; see `findings.md` §9, §14 and §16.
+the CE 141 inclusion rows cannot be shown to fail. See `findings.md` §9,
+§14 and §16.
+
+Those exports reached main as polkajam#1401, squash-merged to `d92cadd30`
+(2026-11-18), and the pin moved there on 2026-11-19 — so the harness no
+longer depends on an unmerged branch. Because it was a squash, the old pin
+`b1ea8aca4` is not an ancestor of main and the move was to a different
+commit rather than a fast-forward. Two other commits came with it: #1382
+threads a chaos controller through the CE 133/134/146 receive path (gated
+off in an ordinary run), and #1404 fixes an STF divergence, which is the
+kind of thing that moves an N1 state diff without anyone intending it.
+Neither moved a verdict — `sessions/repin-1` reports the same hard failures
+as the run before, row for row.
 
 Iterate-later items: full 2-epoch observation + epoch-boundary alignment of the ticket window;
 independent (non-`import_block`) seal/entropy VRF re-verification; full M1-style keyvals diff on
@@ -284,6 +348,8 @@ private).
 
 References:
 - JAM prize: https://jam.web3.foundation/
-- JAMNP-S spec: https://github.com/zdave-parity/jam-np (`simple.md`)
+- JAMNP-S spec: https://github.com/zdave-parity/jam-np (`simple.md`). Every `simple.md:NNN`
+  in this repository refers to **a96dc6b** (2026-09-02); upstream has moved since, and
+  `findings.md` §28 says what changed and which of it costs anything.
 - Graypaper: https://graypaper.com/
 - M1 conformance (fuzz-proto, reports): https://github.com/davxy/jam-conformance

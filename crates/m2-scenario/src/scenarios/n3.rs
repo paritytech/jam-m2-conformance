@@ -875,12 +875,9 @@ pub fn n3_ce134_mappings(ctx: &N3Ctx) -> Check {
                 continue;
             }
             for share in answering {
-                let mapped = share
-                    .mappings
-                    .iter()
-                    .any(|(package, root)| {
-                        package.0 == from.package_hash && *root == from.exports_root
-                    });
+                let mapped = share.mappings.iter().any(|(package, root)| {
+                    package.0 == from.package_hash && *root == from.exports_root
+                });
                 results.push(log::check_detail(
                     "n3_ce134_maps_the_imported_package",
                     mapped,

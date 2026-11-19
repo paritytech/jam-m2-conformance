@@ -238,7 +238,9 @@ async fn the_mapping_row_catches_a_guarantor_that_resolves_an_import_wrongly() {
             "{fault:?} must still reach the row: {rows:?}"
         );
         assert!(
-            graded.iter().all(|outcome| matches!(outcome, Outcome::Fail(_))),
+            graded
+                .iter()
+                .all(|outcome| matches!(outcome, Outcome::Fail(_))),
             "{fault:?} must fail {ROW}: {rows:?}"
         );
     }
