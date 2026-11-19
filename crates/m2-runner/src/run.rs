@@ -351,7 +351,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         // A different payload from the submission's, or the
                         // two are the same package and the node refuses the
                         // second as a duplicate.
-                        vec![work_item_with_payload(b"n3-distributed".to_vec())],
+                        vec![m2_reference::reports::work_item_with_payload(
+                            b"n3-distributed".to_vec(),
+                        )],
                         nut_index as u16,
                         honest_slot,
                     ) {
@@ -1031,24 +1033,6 @@ fn plan_package_for_this_run(
         });
     }
     Ok(plans)
-}
-
-/// A work item with a distinguishing payload, so two packages built in one
-/// run are two packages.
-///
-/// The submission and the distributed report were once both built from the
-/// empty item, which made them one package: the node noted the report and
-/// then refused the submission as already reported.
-fn work_item_with_payload(payload: Vec<u8>) -> m2_oracle_proto::WireItem {
-    m2_oracle_proto::WireItem {
-        service: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
-        payload,
-        ref_gas: jam_types::max_refine_gas(),
-        acc_gas: jam_types::max_accumulate_gas(),
-        xts: Vec::new(),
-        imports: Vec::new(),
-        export_count: 0,
-    }
 }
 
 /// Wait until the chain's cached epoch view names the epoch its own head is
