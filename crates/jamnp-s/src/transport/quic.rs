@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use ed25519_consensus::SigningKey;
 
 use super::{
-    Conn, Connection, Incoming, Listener, ReadError, RecvHalf, RecvStream, SendHalf, SendStream,
-    Transport, TransportError,
+    Conn, Connection, ConnectionEnd, Incoming, Listener, ReadError, RecvHalf, RecvStream, SendHalf,
+    SendStream, Transport, TransportError,
 };
 use crate::endpoint::{Endpoint, EndpointConfig, EndpointError};
 
@@ -94,6 +94,32 @@ impl Connection for QuicConnection {
     async fn accept_bi(&self) -> Result<(SendHalf, RecvHalf), TransportError> {
         let (send, recv) = self.0.accept_bi().await.map_err(TransportError::new)?;
         Ok(halves(send, recv))
+    }
+
+    fn end_reason(&self) -> Option<ConnectionEnd> {
+        self.0.close_reason().map(|e| match e {
+            // The two closes a peer sends deliberately: one from the
+            // application, one from the QUIC layer. Both carry a code and a
+            // reason, and both mean the peer decided.
+            quinn::ConnectionError::ApplicationClosed(close) => ConnectionEnd::PeerClosed {
+                code: close.error_code.into_inner(),
+                reason: String::from_utf8_lossy(&close.reason).into_owned(),
+            },
+            quinn::ConnectionError::ConnectionClosed(close) => ConnectionEnd::PeerClosed {
+                code: close.error_code.into(),
+                reason: String::from_utf8_lossy(&close.reason).into_owned(),
+            },
+            quinn::ConnectionError::TimedOut => ConnectionEnd::TimedOut,
+            quinn::ConnectionError::LocallyClosed => ConnectionEnd::Local,
+            other => ConnectionEnd::Other(other.to_string()),
+        })
+    }
+
+    fn close(&self, code: u64, reason: &str) {
+        self.0.close(
+            quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::MAX),
+            reason.as_bytes(),
+        );
     }
 }
 

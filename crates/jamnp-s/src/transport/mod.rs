@@ -55,6 +55,35 @@ pub enum ReadError {
     Other(String),
 }
 
+/// Why a connection is over.
+///
+/// Stringly-typed except for the case the harness must tell apart: the peer
+/// closing the connection on purpose, with the code and the reason it gave.
+/// A rejected CE message costs its stream and nothing else
+/// (`simple.md:115-120`), so a peer that answers one by closing the whole
+/// connection has taken every other protocol down with it -- and read off a
+/// report, that looks like several unrelated defects rather than one
+/// (`findings.md` §29, §30).
+///
+/// [`ConnectionEnd::TimedOut`] is kept apart from the rest for the same
+/// reason: it is the one end a keep-alive would have prevented, so a harness
+/// that cannot name it cannot tell its own idleness from the peer's choice.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectionEnd {
+    /// The peer closed it, with the application code and reason it sent.
+    #[error("closed by the peer: {reason} (code {code})")]
+    PeerClosed { code: u64, reason: String },
+    /// Nothing arrived for long enough that the transport gave up.
+    #[error("timed out")]
+    TimedOut,
+    /// This side closed it, or dropped the last handle to it.
+    #[error("closed locally")]
+    Local,
+    /// Anything else the transport reported.
+    #[error("{0}")]
+    Other(String),
+}
+
 /// Why a write, an open or an accept did not complete.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -126,6 +155,19 @@ pub trait Connection: Send + Sync + fmt::Debug {
 
     /// Accept the next bidirectional stream the peer opens.
     async fn accept_bi(&self) -> Result<(SendHalf, RecvHalf), TransportError>;
+
+    /// Why the connection is over, or `None` while it is still up.
+    ///
+    /// Asked after an open or an accept fails: that failure says only that
+    /// there is no stream, where this says what happened to the connection
+    /// under it.
+    fn end_reason(&self) -> Option<ConnectionEnd>;
+
+    /// Close the connection, telling the peer this code and reason.
+    ///
+    /// Here because a simulated node has to be able to pose the defect of
+    /// answering one bad message this way; nothing in the emulator calls it.
+    fn close(&self, code: u64, reason: &str);
 }
 
 /// The send half of a bidirectional stream.

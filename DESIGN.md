@@ -520,6 +520,7 @@ Line numbers refer to `jam-np/simple.md`. Severity is hard unless marked *(soft)
 | CE 128 serve `:238-265` | ascending-exclusive and descending-inclusive requests | ordered, ≤ Max, both halves FIN; ascending from genesis equals the reference chain; unknown hash → reset | Max=0, Max=2³²−1 (must cap), Dir=2 → reset |
 | CE 128 fetch | reply to NUT requests | after an announcement of an unknown block the NUT fetches missing parents; never re-fetches known blocks *(soft)* | wrong-parent block → not announced; reset → retry another peer *(soft)* |
 | CE 129 `:267-303` | ranges with various Max Size | 31-byte sorted keys in range; boundary nodes parent-before-child, no duplicates `:275-281`; size cap `:283-285`; `len++` values | unknown hash → reset |
+| Rejection stays on its stream `:115-120` | every connection the run holds, dialled and accepted | a message the NUT refuses costs that stream, not the connection it arrived on *(soft)* | stand-in closes the connection on an assurance it will not pool → reported with the code and reason it closed with (`findings.md` §30) |
 
 ### N1 — block authoring, fuzzer-validated (2 epochs)
 

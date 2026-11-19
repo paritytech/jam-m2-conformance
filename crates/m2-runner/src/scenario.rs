@@ -741,6 +741,9 @@ pub(crate) fn fabricated_run_ctx(
             }),
             nut_preferred_peers: vec![n0::PEER_1],
             emu_preferred_peers: Vec::new(),
+            // A conforming node refuses by resetting the stream, so it ends
+            // no connections.
+            connection_ends: Vec::new(),
         },
         n1: Some(n1),
         n2: Some(n2),

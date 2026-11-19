@@ -68,25 +68,32 @@ report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,jso
 `M2-status.md` records the milestone evidence in full, and how to point the suite at a
 third-party node.
 
-Latest run, `sessions/n3-imports-1`, all five lanes over a 300 s window: **589 rows, seven
-hard findings.** None of the seven is the harness's:
+Latest run, `sessions/teardown-4`, all five lanes over a 300 s window: **581 rows, six
+hard findings.** None of the six is the harness's:
 
 | row | what it is |
 |---|---|
 | `ce129_boundary_parent_before_child` | a node defect, standing since the first N0 runs |
 | `n2_unknown_epoch_reset_observed` | a node defect: the ticket is rejected, the stream is not reset |
-| `n2_self_proxy_ce132_all_peers` | one self-proxied ticket did not reach one peer; seen in consecutive runs and not yet written up |
 | `n3_ce133_oversized_reset`, `n3_ce146_oversized_reset` | `findings.md` §4 — a **should** whose binding on the receiver the spec does not state. Unsettled, not a verdict |
 | `n3_ce133_extrinsic_mismatch_reset` | `findings.md` §8 — reproduced, but it may be a change in the node rather than a standing defect |
 | `n3_ce134_answered` | `findings.md` §5 — a well-formed share reset with `NoError` |
 
-The count moves between runs, and 589 is near the top of its range rather than a baseline:
+Six where earlier runs reported seven: `n2_self_proxy_ce132_all_peers` is gone, and it was
+never an N2 defect. The node had closed the connection to that peer over an assurance it
+would not accept, so there was nothing there to reach — `findings.md` §29 and §30. It is now
+reported where it belongs, by the Soft row `rejection_keeps_the_connection`, which fired
+thirteen times in this run and quotes the node's own words each time.
+
+The count moves between runs, and 581 is near the top of its range rather than a baseline:
 the window length sets the ceiling and the lottery sets the rest.
 
-- **N0 connectivity and sync**: 26/27 HARD PASS — real TLS 1.3 mutual handshake, Ed25519 cert +
+- **N0 connectivity and sync**: 24/25 HARD PASS — real TLS 1.3 mutual handshake, Ed25519 cert +
   SAN, ALPN `jamnp-s/1/…` with a mismatched ALPN refused, preferred-initiator split, 21 `/builder`
   connections accepted, UP 0 handshake with genesis Final, and the node's own CE 128 and CE 129
-  replies graded. One hard finding: `ce129_boundary_parent_before_child`.
+  replies graded. One hard finding: `ce129_boundary_parent_before_child`. The lane also grades
+  what becomes of the connections themselves: `rejection_keeps_the_connection` (Soft) reports
+  every connection the node closed, with the code and reason it closed with.
 - **N1 authoring**: the node authors, the harness imports and grades each block — parent,
   seal, prior and posterior state roots. No hard findings in the latest runs.
 - **N2 Safrole tickets**: the node accepts the emulator's tickets, runs its own lottery and

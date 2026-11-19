@@ -24,7 +24,9 @@ use jamnp_s::{
         frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE134, CE135, CE141, UP,
     },
     trace::{mono_ts, wall_ts, Direction as TraceDir, Trace, TraceRecord},
-    transport::{quic::QuicTransport, Conn, Listener, RecvHalf, SendHalf, Transport},
+    transport::{
+        quic::QuicTransport, Conn, ConnectionEnd, Listener, RecvHalf, SendHalf, Transport,
+    },
 };
 use m2_reference::chain::RefChain;
 use m2_reference::reports::{ScheduledReport, ScheduledShare, SharingAnswer, SubmissionSchedule};
@@ -32,7 +34,7 @@ use m2_reference::tickets::ScheduledTicket;
 use m2_scenario::ctx::{DeliveredTicket, NutBlock};
 use m2_scenario::dsl::{Obs, ObsKind, ObsLog};
 use m2_scenario::scenarios::n0;
-use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
+use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe, ConnectionEnded};
 use m2_scenario::scenarios::n3::{
     DistributedReport, ReportSeen, SharedToNut, SharingSeen, SubmittedPackage,
 };
@@ -130,6 +132,7 @@ pub struct Emulator {
     /// CE 141 assurances the NUT broadcast, as received. Judged by the N4
     /// lane, which has the anchor and the reported cores to judge against.
     assurances_seen: Arc<Mutex<Vec<crate::avail_io::RawAssurance>>>,
+    connection_ends: Arc<Mutex<Vec<ConnectionEnded>>>,
     sync_probe_pending: Arc<AtomicBool>,
     /// Highest finalized slot the NUT has advertised over UP 0; see
     /// [`EmuShared::nut_final_slot`].
@@ -257,6 +260,14 @@ pub struct EmuShared {
     /// CE 135 report distributions the NUT sent (`simple.md:460-485`).
     pub reports_seen: Arc<Mutex<Vec<ReportSeen>>>,
     pub assurances_seen: Arc<Mutex<Vec<crate::avail_io::RawAssurance>>>,
+    /// Connections to the NUT that ended, and why, dialled and accepted
+    /// alike.
+    ///
+    /// A connection that goes mid-run costs every protocol on it at once, so
+    /// the rows it fails are scattered across lanes and read as unrelated
+    /// node defects. This is the one record that puts them back together
+    /// (`findings.md` §29, §30).
+    pub connection_ends: Arc<Mutex<Vec<ConnectionEnded>>>,
     /// Cleared by whichever connection runs the sync probes, so they run once
     /// per run rather than once per peer.
     pub sync_probe_pending: Arc<AtomicBool>,
@@ -435,6 +446,7 @@ impl Emulator {
             sharing_seen: Arc::new(Mutex::new(Vec::new())),
             reports_seen: Arc::new(Mutex::new(Vec::new())),
             assurances_seen: Arc::new(Mutex::new(Vec::new())),
+            connection_ends: Arc::new(Mutex::new(Vec::new())),
             sync_probe_pending: Arc::new(AtomicBool::new(true)),
             nut_final_slot: Arc::new(AtomicU32::new(NO_ADVERTISED_FINAL)),
             announce: broadcast::Sender::new(ANNOUNCE_BUFFER),
@@ -574,6 +586,15 @@ impl Emulator {
         Arc::clone(&self.assurances_seen)
     }
 
+    /// Connections that ended during the run, with the reason each gave.
+    ///
+    /// Read as a snapshot when the observation window closes, not at report
+    /// time: the teardown that follows ends every remaining connection, and
+    /// an end recorded then says nothing about the node (`findings.md` §29).
+    pub fn connection_ends(&self) -> Vec<ConnectionEnded> {
+        lock(&self.connection_ends).clone()
+    }
+
     pub fn reports_seen(&self) -> Arc<Mutex<Vec<ReportSeen>>> {
         Arc::clone(&self.reports_seen)
     }
@@ -610,6 +631,7 @@ impl Emulator {
             sharing_seen: Arc::clone(&self.sharing_seen),
             reports_seen: Arc::clone(&self.reports_seen),
             assurances_seen: Arc::clone(&self.assurances_seen),
+            connection_ends: Arc::clone(&self.connection_ends),
             sync_probe_pending: Arc::clone(&self.sync_probe_pending),
             nut_final_slot: Arc::clone(&self.nut_final_slot),
         }
@@ -733,13 +755,17 @@ const ANNOUNCE_BUFFER: usize = 16;
 /// open UP 0 as the connection initiator, then serve the NUT's CE 128 / CE 129
 /// requests. Used where the emulated validator is the preferred initiator
 /// (DESIGN.md §4.3).
+///
+/// `Ok` carries why the connection ended -- the node closing it, an idle
+/// timeout, a local drop -- because a caller that re-dials has to be able to
+/// say which of those it is answering.
 pub async fn dial_nut(
     index: usize,
     genesis_hash: [u8; 32],
     nut_addr: SocketAddr,
     nut_san: String,
     shared: EmuShared,
-) -> Result<(), EmuError> {
+) -> Result<ConnectionEnd, EmuError> {
     let (ref_chain, trace, obs) = (
         Arc::clone(&shared.ref_chain),
         Arc::clone(&shared.trace),
@@ -842,8 +868,7 @@ pub async fn dial_nut(
     start_sync_probe(&connection, peer, &shared);
 
     // Serve the NUT's CE 128 / CE 129 requests on the dialed connection.
-    handle_connection(connection, peer, genesis_hash, shared).await;
-    Ok(())
+    Ok(handle_connection(connection, peer, genesis_hash, shared).await)
 }
 
 /// Serve a CE 128 block request against `chain` (genesis-first).
@@ -918,7 +943,14 @@ async fn endpoint_task(
         // accept loop and the peer's redials would never be answered.
         let shared = shared.clone();
         tokio::spawn(async move {
-            handle_connection(connection, peer_index, genesis_hash, shared).await;
+            let reason = handle_connection(connection, peer_index, genesis_hash, shared).await;
+            // Nothing re-dials here -- the node is the preferred initiator for
+            // this peer, so recovery is its move. Saying so anyway is what
+            // makes a node that drops a connection and comes straight back
+            // distinguishable from one that never left (`findings.md` §29).
+            eprintln!(
+                "[connectivity] validator {peer_index}: the NUT-initiated connection ended: {reason}"
+            );
         });
     }
 }
@@ -1147,13 +1179,32 @@ const STREAM_REFUSED: u32 = 1;
 /// would block every later one — nor drop a stream's halves once its first
 /// message is handled. Each accepted stream gets its own task instead, living
 /// exactly as long as the peer keeps the stream open.
+///
+/// Returns why the connection ended, and records it. Discarded, as it was,
+/// the harness could not tell a node that closed on purpose from an idle
+/// timeout or a local drop -- which was the whole question in `findings.md`
+/// §29, and the answer turned out to be a node defect (§30).
 async fn handle_connection(
     connection: Conn,
     peer_index: u16,
     genesis_hash: [u8; 32],
     shared: EmuShared,
-) {
-    while let Ok((send, recv)) = connection.accept_bi().await {
+) -> ConnectionEnd {
+    loop {
+        let (send, recv) = match connection.accept_bi().await {
+            Ok(halves) => halves,
+            Err(e) => {
+                // The accept says only that there is no stream; the
+                // connection under it says what happened.
+                let end = connection.end_reason().unwrap_or(ConnectionEnd::Other(e.0));
+                lock(&shared.connection_ends).push(ConnectionEnded {
+                    peer: peer_index,
+                    at_wall_ms: wall_ts(),
+                    end: end.clone(),
+                });
+                return end;
+            }
+        };
         let connection = connection.clone();
         let announce = shared.announce.subscribe();
         let shared = shared.clone();
