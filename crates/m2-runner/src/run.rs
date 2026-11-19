@@ -351,7 +351,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                         // A different payload from the submission's, or the
                         // two are the same package and the node refuses the
                         // second as a duplicate.
-                        vec![work_item_with_payload(b"n3-distributed".to_vec())],
+                        vec![m2_reference::reports::work_item_with_payload(
+                            b"n3-distributed".to_vec(),
+                        )],
                         nut_index as u16,
                         honest_slot,
                     ) {
@@ -964,6 +966,7 @@ fn plan_package_for_this_run(
         protocol: u16::from(jamnp_s::framing::CE133),
         co_guarantors: plan.co_guarantors.clone(),
         fault: None,
+        imports: false,
     }];
     // The CE 133 faults, then CE 146: the same package over the whole-bundle
     // protocol, honest and then over its own size cap.
@@ -974,13 +977,22 @@ fn plan_package_for_this_run(
     // is the framing: five messages instead of two, and a cap on the
     // work-package message alone rather than on it plus the core index. A
     // node that reads the bundle as one value gets neither right.
-    for (i, (protocol, fault)) in [
-        (jamnp_s::framing::CE133, Some(Oversized)),
-        (jamnp_s::framing::CE133, Some(Unauthorized)),
-        (jamnp_s::framing::CE133, Some(ExtrinsicSizeMismatch)),
-        (jamnp_s::framing::CE133, Some(NotAGuarantor)),
-        (jamnp_s::framing::CE146, None),
-        (jamnp_s::framing::CE146, Some(Oversized)),
+    //
+    // The importing submission comes last, and that is timing rather than
+    // taste. It names the run's first package by hash, and a guarantor can
+    // only resolve that hash once the guarantee for it is in a block it
+    // holds -- `available_data` reads the packages the chain has seen, not
+    // the ones a peer mentioned. Six slots behind the package it imports
+    // from is room for the node to guarantee it, distribute it and see it
+    // included.
+    for (i, (protocol, fault, imports)) in [
+        (jamnp_s::framing::CE133, Some(Oversized), false),
+        (jamnp_s::framing::CE133, Some(Unauthorized), false),
+        (jamnp_s::framing::CE133, Some(ExtrinsicSizeMismatch), false),
+        (jamnp_s::framing::CE133, Some(NotAGuarantor), false),
+        (jamnp_s::framing::CE146, None, false),
+        (jamnp_s::framing::CE146, Some(Oversized), false),
+        (jamnp_s::framing::CE133, None, true),
     ]
     .into_iter()
     .enumerate()
@@ -1017,27 +1029,10 @@ fn plan_package_for_this_run(
                 .filter(|v| *v != nut_index as u16)
                 .collect(),
             fault,
+            imports,
         });
     }
     Ok(plans)
-}
-
-/// A work item with a distinguishing payload, so two packages built in one
-/// run are two packages.
-///
-/// The submission and the distributed report were once both built from the
-/// empty item, which made them one package: the node noted the report and
-/// then refused the submission as already reported.
-fn work_item_with_payload(payload: Vec<u8>) -> m2_oracle_proto::WireItem {
-    m2_oracle_proto::WireItem {
-        service: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
-        payload,
-        ref_gas: jam_types::max_refine_gas(),
-        acc_gas: jam_types::max_accumulate_gas(),
-        xts: Vec::new(),
-        imports: Vec::new(),
-        export_count: 0,
-    }
 }
 
 /// Wait until the chain's cached epoch view names the epoch its own head is
@@ -1115,8 +1110,19 @@ async fn submit_as_builder(
         eprintln!("[builder] no submission plan to claim");
         return;
     }
+    // What the run's first exporting package turned out to be, for the
+    // submission that imports from it.
+    //
+    // The *first*, not the most recent. A later exporting package would be
+    // fewer slots ahead of the import, and the import needs the guarantee
+    // for what it names to have reached a block before it is sent.
+    let mut exported: Option<m2_reference::reports::ImportSource> = None;
     for schedule in plan {
-        submit_one(addr, &expected_san, genesis_hash, &shared, schedule).await;
+        if let Some(source) =
+            submit_one(addr, &expected_san, genesis_hash, &shared, schedule, &exported).await
+        {
+            exported.get_or_insert(source);
+        }
     }
 }
 
@@ -1125,21 +1131,68 @@ async fn submit_as_builder(
 /// A connection of its own per submission. They are a rotation apart, which
 /// is far longer than QUIC holds an idle one open, and a builder that
 /// submits twice on one connection would be relying on it surviving the gap.
+///
+/// Returns what this package exported, where it exported anything, so a
+/// later submission can import from it.
 async fn submit_one(
     addr: SocketAddr,
     expected_san: &str,
     genesis_hash: [u8; 32],
     shared: &m2_emu::emu::EmuShared,
     schedule: m2_reference::reports::SubmissionSchedule,
-) {
+    exported: &Option<m2_reference::reports::ImportSource>,
+) -> Option<m2_reference::reports::ImportSource> {
     sleep_until_slot(schedule.slot.saturating_sub(PACKAGE_BUILD_LEAD_SLOTS)).await;
-    let (plan, answer) = match shared.ref_chain.submission_now(&schedule) {
+    // A package that imports by work-package hash is only submittable once
+    // the guarantee for the package it names is in a block. Before that the
+    // node takes the submission, fails to resolve the import, and never
+    // shares -- which on the report reads as a node refusing to share a
+    // package it was given, a failure the harness caused.
+    //
+    // So the run checks, and skips the submission rather than posing a
+    // question the node cannot be expected to answer. The mapping row then
+    // reports itself unexercised, which is what it is.
+    let importing = exported.as_ref().filter(|_| schedule.imports);
+    if let Some(from) = importing {
+        match shared.ref_chain.carries_package(&from.package_hash) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "[builder] skipping the importing submission for slot {}: no block yet \
+                     carries a guarantee for package {}, so the node could not resolve the \
+                     import",
+                    schedule.slot,
+                    hex8(&from.package_hash)
+                );
+                return None;
+            }
+            Err(e) => {
+                eprintln!("[builder] could not check the chain for the exporting package: {e}");
+                return None;
+            }
+        }
+    }
+    let (plan, answer) = match shared.ref_chain.submission_now(&schedule, importing) {
         Ok(built) => built,
         Err(e) => {
             eprintln!("[builder] could not build the package: {e}");
-            return;
+            return None;
         }
     };
+    if let Some(from) = plan.imports_from {
+        eprintln!(
+            "[builder] slot {} imports segment {} of package {}",
+            schedule.slot,
+            from.index,
+            hex8(&from.package_hash)
+        );
+    }
+    // Read before the plan is handed to the sender, which consumes it.
+    let produced = (plan.exports_count > 0).then_some(m2_reference::reports::ImportSource {
+        package_hash: plan.package_hash,
+        exports_root: plan.exports_root,
+        index: 0,
+    });
     // Only the honest submission's answer. Set for every submission, each
     // overwrote the last, so the hash the lane compared the node's report
     // against was whichever fault happened to be built last -- and the
@@ -1177,7 +1230,7 @@ async fn submit_one(
         Ok(connection) => connection,
         Err(e) => {
             eprintln!("[builder] could not connect as a builder: {e}");
-            return;
+            return None;
         }
     };
     m2_emu::report_io::spawn_package_sender(
@@ -1190,6 +1243,7 @@ async fn submit_one(
     )
     .await;
     drop(connection);
+    produced
 }
 
 /// Watch for a report the NUT guaranteed, and plan this run's availability
@@ -1250,6 +1304,18 @@ async fn plan_availability(
         segments_root: spec.exports_root,
         shard_count: spec.erasure_shards,
         segment_indices,
+        // The whole coded segment set, which is the tree a justification
+        // proves against. Three different numbers meet here and only one is
+        // right (`findings.md` §26):
+        //
+        // - what a run asks for, capped by `MAX_SEGMENTS_ASKED`;
+        // - what the package exported, `exports_count`;
+        // - what was actually coded, which is the exports **plus their
+        //   import-proof pages**. `import_proof_pages` appends one page per
+        //   `PROVEN_PER_SEGMENT` segments before the set is shard-coded, and
+        //   `jam_types::max_export_segments` is this same formula at the
+        //   maximum.
+        segment_count: segment_tree_len(spec.exports_count),
         // A slot ahead, so the fetches have somewhere to finish before the
         // assurance that follows them.
         honest_slot: now + 1,
@@ -1283,6 +1349,21 @@ const ASSURANCE_TAIL_SLOTS: u32 = 2;
 /// about one slot in six, so a short stretch of offers leaves the inclusion
 /// rows unexercised -- not failing, but saying nothing.
 const MIN_ASSURANCE_SLOTS: u32 = 12;
+
+/// Segments a package of `exports` exports is coded into.
+///
+/// The exports themselves plus one import-proof page per
+/// `PROVEN_PER_SEGMENT` of them: `import_proof_pages` appends the pages to
+/// the segment vector and the whole thing is erasure-coded together, so the
+/// tree a CE 140 justification proves against is this size and not
+/// `exports`.
+///
+/// The engine states the same formula at its maximum, in
+/// `jam_types::max_export_segments`.
+fn segment_tree_len(exports: u16) -> u32 {
+    let exports = u32::from(exports);
+    exports + exports.div_ceil(jam_types::PROVEN_PER_SEGMENT as u32)
+}
 
 /// Most segment indices a run asks for over CE 139/140.
 ///

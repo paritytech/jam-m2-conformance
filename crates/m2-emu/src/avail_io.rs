@@ -199,6 +199,9 @@ pub async fn request_segment_shards(
     shard_index: u16,
     shard_count: u16,
     segment_indices: Vec<u16>,
+    // Segments the package exports in total, which is the size of the tree
+    // a justification proves against -- not the number asked for here.
+    segment_count: u32,
     peer: u16,
     trace: &Arc<Mutex<Trace>>,
     obs: &Arc<Mutex<ObsLog>>,
@@ -215,6 +218,7 @@ pub async fn request_segment_shards(
         erasure_root,
         shard_index,
         requested: segment_indices,
+        segment_count,
         shards: Vec::new(),
         justifications: Vec::new(),
         justifications_verified: Vec::new(),
@@ -375,6 +379,12 @@ pub struct AvailPlan {
     pub segments_root: [u8; 32],
     /// Shards the report declared it was coded into (`erasure_shards`).
     pub shard_count: u16,
+    /// Segments the package exports in total.
+    ///
+    /// The size of the tree a segment justification proves against, which
+    /// is not the number of segments a run asks for: those coincide only
+    /// when a run asks for all of them (`findings.md` §26).
+    pub segment_count: u32,
     /// Segment indices to ask for over CE 139 and CE 140.
     ///
     /// Empty where the package exported nothing, in which case those two
@@ -499,6 +509,7 @@ pub async fn drive_availability(
                     shard_index,
                     plan.shard_count,
                     plan.segment_indices.clone(),
+                    plan.segment_count,
                     peer,
                     trace,
                     obs,

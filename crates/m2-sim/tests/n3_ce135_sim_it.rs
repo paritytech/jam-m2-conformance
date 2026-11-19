@@ -84,6 +84,9 @@ fn submission(slot: u32) -> ScheduledSubmission {
         import_proofs: Vec::new(),
         fault: None,
         co_guarantors: CO_GUARANTORS.to_vec(),
+        exports_root: [0u8; 32],
+        exports_count: 0,
+        imports_from: None,
     }
 }
 

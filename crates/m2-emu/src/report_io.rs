@@ -312,6 +312,12 @@ pub async fn spawn_package_sender(
             reset_code: None,
             fault: lane_fault(plan.fault),
             co_guarantors: plan.co_guarantors.clone(),
+            imports_from: plan.imports_from.map(|from| {
+                m2_scenario::scenarios::n3::ImportedFrom {
+                    package_hash: from.package_hash,
+                    exports_root: from.exports_root,
+                }
+            }),
         });
         recorded.len() - 1
     };

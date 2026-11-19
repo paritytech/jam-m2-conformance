@@ -819,7 +819,7 @@ once it has guaranteed a package and published a report. The same report and
 the same mid-run plan N4 already waits for (§12). DESIGN is updated to say
 so rather than left to disagree with the code.
 
-## 17. The segment protocols cannot be exercised against a live node
+## 17. The segment protocols cannot be exercised against a live node — CLOSED 2026-11-19
 
 **Status:** open. Found while writing the CE 148 rows, by asking what the
 run would actually ask for. Opened 2026-11-18.
@@ -843,31 +843,35 @@ This is not a defect in the rows. They are held to the bar by
 and real proofs through eight faults across the three protocols. What is
 missing is the *live* half: nothing has ever asked polkajam for a segment.
 
-**What it takes to close.** A work item that exports segments, which means
-the dev bootstrap service actually exporting them during refine —
-`export_count` is a declaration, and a refine that does not produce that many
-fails. So this is not a one-line change to the item; it is a question about
-what the service can be asked to do, and it needs a live run to settle rather
-than a guess. Until then:
+**What it took to close.** The service can be asked, and was not blocked at
+all — only unexplored. The dev bootstrap service reads its payload as an
+encoded `Instructions` and carries an `Export { data }` instruction that
+calls `export_slice` per blob. `jam-bootstrap-service-common` is published
+and host-buildable, and its own description is "useful for interoperating
+and constructing work items".
 
-- a green CE 139/140 or CE 148 row against a live node means "the harness
-  never asked", and the lane's own docs say so;
-- the simulated node is the only thing those rows have been measured
-  against, which is better than nothing and is not the same as a node.
+So the honest submission now exports four segments, and a live run asks for
+them. `a_work_item_asked_to_export_does` holds the service to it, with a
+non-exporting control so a passing count cannot just be the engine echoing
+back what it was handed.
 
-**A fourth row has the same cause**, found 2026-11-18 while proving the CE
-134 receive rows. `n3_ce134_shares_the_submitted_package` grades the
-mappings on a share the node *sends* and is gated on those mappings being
-non-empty — deliberately, because a package with no imported segments
-correctly has none and a row written as "names it, or there were none"
-could not fail. Mappings map the **import** list to the roots it comes
-from, so the gate opens only for a package that imports segments, and no
-package this harness builds does. The row has therefore never run against
-anything, live or simulated, and is not counted among N3's proven rows.
+**Measured** (`sessions/n4-exports-3`): CE 139 and CE 140 answer and
+verify against polkajam, five of five on every row. CE 148 is declined,
+which `simple.md:660` allows and the row records as Soft — the first time
+any of the three has been put to a real node.
 
-That makes four rows waiting on the same thing: CE 139, CE 140, CE 148 and
-this one. A work item that exports segments would let an later package
-import them and open all four at once.
+Opening the door immediately found §26 behind it: the row checking CE 140's
+justifications had been comparing against the wrong tree the whole time,
+and nothing could have noticed while no package exported anything.
+
+**The import half, closed the same way.** The fourth row waiting on this
+was `n3_ce134_shares_the_submitted_package`, which grades the mappings on a
+share the node *sends*. It needed a package that imports segments, and the
+exports made one possible: the run now submits a last package whose work
+item imports segment 0 of the first one, naming it by work-package hash so
+the node has to resolve the hash to a segments-root and say so.
+
+Opening that door found the row was asking for the wrong thing — §27.
 
 Related: §12, which is why the plan is mid-run at all.
 
@@ -1440,3 +1444,238 @@ invisible as failures: §19 and §20 showed as rows reporting *nothing*, and
 this one as fewer subjects than the run deserved. A report that is green
 because a question went unasked looks exactly like a report that is green
 because the answer was right.
+
+---
+
+## 26. The segment-shard justification was checked against the wrong tree — CLOSED 2026-11-19
+
+**Status:** found and fixed the same day, on the first live run in which a
+package exported anything (`sessions/n4-exports-1`). A harness defect that
+the simulated node was structurally unable to see.
+
+`n4_ce140_justifications_verify` failed five times out of five against a
+node that was serving correctly:
+
+```
+CE 140 for root f38a03cd index 0: 0: did not verify, 1: did not verify,
+  2: did not verify, 3: did not verify
+```
+
+Every one, not some, which is the shape of a bad input rather than a bad
+proof.
+
+A segment justification proves that a slice sits at its index in a Merkle
+tree built over **every segment the package exported**. Checking one needs
+the size of that tree. The runner passed the size of the *request*:
+
+```rust
+segment_index,
+shards.requested.len() as u32,
+```
+
+**Why the simulated node could not catch it.** `n4_sim_it` held two
+segments and asked for both, so `requested.len()` and the true count were
+the same number. They are the same number in every arrangement the test
+could make, because the test chose both. The two only come apart when a
+package exports more than a run asks for — and until §17's fix landed, no
+package exported anything at all, so the live surface could not come apart
+either.
+
+That is a blind spot with a shape worth naming: a test that supplies both
+sides of an equation cannot discover that the equation is wrong.
+
+**The fix, and the second number it took to get there.** `AvailPlan`
+carries `segment_count`, `SegmentShardsServed` records it, and the check
+uses it. What that number *is* took two live runs to settle, because three
+of them meet at this call site:
+
+| | |
+|---|---|
+| what a run asks for | `MAX_SEGMENTS_ASKED`, capped — what the code used |
+| what the package exported | `exports_count` — the first fix, still wrong |
+| what was actually coded | the exports **plus their import-proof pages** |
+
+`import_proof_pages` appends one page per `PROVEN_PER_SEGMENT` (64)
+segments to the vector *before* the set is erasure-coded
+(`chain/logistics.rs:151`, `availability/mod.rs`: `segments.append(&mut
+proof_segments)`), so a four-export package is coded as five segments. The
+engine states the same formula at its maximum in
+`jam_types::max_export_segments`, which is the cross-check that this is the
+rule rather than an arithmetic that happens to fit.
+
+The first fix passed the sim and failed live, which is what sent the search
+to the engine instead of to another guess.
+
+**Proven.** `n4_sim_it` now holds four segments and asks for two. The
+honest node passes with the fix and fails all five rows without it, which
+is the live failure reproduced on demand in 0.16 s.
+
+**Why the simulated node cannot model the second half either.** It codes
+exactly the segments it is handed and appends no proof pages, so for the
+sim `segments.len()` really is the tree size. That is why the first fix
+passed there and failed live. The count is a property of how a segment set
+was produced, not a formula that holds everywhere, which is why it belongs
+on the plan rather than being derived at the point of the check.
+
+**Measured after the second fix** (`sessions/n4-exports-3`):
+`n4_ce140_justifications_verify` five of five HARD PASS, with CE 139's
+rows passing alongside. All three segment protocols have now been put to a
+real node: CE 139 and CE 140 answer and verify, and CE 148 is declined,
+which `simple.md:660` allows and the row records as Soft.
+
+Related: §23, also a row that could not pass, also found the first time
+anything reached it. §17, which had to be closed before this could be seen
+at all.
+
+---
+
+## 27. The CE 134 mapping row asked for a mapping no node can send — CLOSED 2026-11-19
+
+**Status:** found and fixed the same day, while building the importing
+package §17 was waiting on. A harness defect, in a row that had never run
+against anything.
+
+`n3_ce134_shares_the_submitted_package` graded the segments-root mappings
+on a share the node sends, and asked that they name **the package being
+shared**:
+
+```rust
+let names_it = share
+    .mappings
+    .iter()
+    .any(|(package, _)| package.0 == submitted.package_hash);
+```
+
+They never can. The mappings are `len++[Work-Package Hash ++
+Segments-Root]` (`simple.md:449`), and `simple.md:412-415` says what they
+are for: a guarantor may share a package only once "all import segments
+have been retrieved. Note that this will involve mapping any WP hashes in
+the import list to segments-roots." The mapping is the **import list's**
+resolution, carried to the co-guarantors so they can fetch the same
+segments and check the bundle against them.
+
+The package being shared cannot appear in it. Its own segments-root does
+not exist yet — producing it is the refining the share is asking for.
+
+polkajam agrees, and says so in one line: `collect_imports` builds the
+lookup from `RootIdentifier::Indirect(wph)` entries of the import list
+(`chain/logistics.rs:51`), and `guarantor.rs:244` puts exactly that
+`sr_lookup` into the sharing context.
+
+**Why nothing caught it.** The row was gated on the mappings being
+non-empty, and mappings are empty for a package that imports nothing,
+which was every package this harness built. The gate never opened, so the
+row never ran — against a live node or a simulated one. It was counted,
+correctly, as unproven (§17), and the unprovenness was read as "waiting
+for an arrangement" rather than "waiting to be found wrong".
+
+The gate also made the most plausible defect unreportable. A node that
+fetched its own import segments and never passed the resolution on sends
+*no* mappings — and a row that only looks at shares with mappings cannot
+fail that node.
+
+**The fix.** `n3_ce134_maps_the_imported_package`, in a check of its own
+(`n3_ce134_mappings`) because it is gated on something no other row needs:
+a submission that imports. The submission carries what it imported from,
+so the row compares against a known pair rather than against a shape:
+
+| | |
+|---|---|
+| the key | the hash of the package imported from |
+| the value | that package's `exports_root`, as the engine computed it |
+
+Both halves, because a node that sends the right key under the wrong root
+has resolved the import *wrongly*, and `simple.md:444-446` lets the
+receiving guarantor trust the mapping blindly — so a wrong one sends it to
+fetch the wrong segments.
+
+**Proven.** `m2-sim/tests/n3_ce134_mappings_sim_it.rs` passes the pair a
+conforming node sends and fails three ways of not sending it: no mappings
+at all, a mapping for some other package, and the right package under the
+wrong root. The positive is in the same arrangement as the negatives,
+because a row that is absent is not a row that passed — which is the whole
+of how this one survived.
+
+**And the run can now ask it.** The last submission of a run imports
+segment 0 of the first, by work-package hash. It is gated on the chain: a
+guarantor resolves that hash out of the packages its chain has seen
+(`state_db.rs:1309`), so until the guarantee for the exporting package is
+in a block the import names nothing — and a node asked too early does not
+refuse the submission, it takes it, fails to fetch, and never shares. That
+would read on the report as a node refusing to share a package it was
+given. So the builder checks first and skips rather than poses a question
+the node cannot answer, and the row says it was not exercised.
+
+Related: §18 and §23, also rows that could not pass a conforming node;
+§26, also found the first time anything reached it. Three of the four were
+invisible for the same reason — nothing had ever asked.
+
+---
+
+## 28. The spec moved under P3's design, and nothing said so
+
+**Status:** open, and it blocks nothing today. Found 2026-11-19 while
+checking §4's citations before putting that question to the spec authors.
+
+Every `simple.md:NNN` citation in this repository is against **a96dc6b
+(2026-09-02)**, which is the revision `DESIGN.md` §8 names, and all of them
+still land — checked against that revision rather than assumed. The
+harness is internally consistent.
+
+`jam-np` HEAD is **aa0e2b8 (2026-10-26)**. Four hunks of `simple.md`
+changed in between, and two of them rewrite sections P3 is designed
+against.
+
+**What changed, and what it costs:**
+
+| section | change | cost here |
+|---|---|---|
+| Shard assignment | $R$ for 6 validators, 2 → 3 | none. §10 had already taken 3 from the engine, before the spec said so |
+| CE 138 | `Auditor -> Assurer` becomes `Node -> Assurer`; non-validators may request, and assurers may throttle them | none. The harness asks as a validator, and no row asserts the requester's class |
+| CE 144 | announcement restructured | **DESIGN.md §11 N5 specifies the superseded wire format** |
+| CE 145 | judgments batched, guarantee moved inside the discriminator | **same** |
+
+**The two that matter.** DESIGN's N5 table says CE 144 is `HeaderHash ++ 0
+++ len++[(Core,WRHash)] ++ sig` followed by an `Evidence` message, and that
+later tranches carry `[sₙ(w) ++ len++[No-Show]]`. The spec now says:
+
+```
+Intent = 0 (Initial tranche) OR 1 ++ Core Index (1 byte discriminator)
+Announcement = Header Hash ++ Validator Index ++ Intent ++ Bandersnatch Signature
+--> [Announcement]
+```
+
+The tranche is no longer declared — recipients derive it from the
+signature's VRF output. The no-show evidence list is gone entirely. The
+cores are not declared for tranche 0. And "should broadcast ... unless they
+do not intend to audit any work-reports" became **must** broadcast whenever
+newly required.
+
+CE 145 moved the guarantee *inside* the validity discriminator, so the
+optional second message DESIGN describes does not exist:
+
+```
+Validity = 0 ++ Guarantee (Invalid) OR 1 (Valid) (1 byte discriminator)
+Judgment = Epoch Index ++ Validator Index ++ Validity ++ Work-Report Hash ++ Ed25519 Signature
+--> [Judgment]
+```
+
+**Why this is worth a finding rather than a fix.** Nothing is wrong in the
+code: N5 and N6 do not exist yet. What is wrong is the *plan*, and a plan
+is exactly the thing that gets followed without being re-checked. A lane
+built from DESIGN's N5 table would frame bytes no conforming node sends and
+fail every one of them — §18, §23 and §27 in advance, before a line is
+written.
+
+The DESIGN rows are marked rather than rewritten. Re-specifying them is
+P3's work and wants the whole section read at once, not a patch applied to
+a table from the outside.
+
+**What to do on re-reading the spec.** Diff it, do not re-read it:
+`git diff <the revision DESIGN names>..HEAD -- simple.md` is four hunks and
+takes a minute, where re-reading 800 lines takes an hour and misses the
+one-word changes. The `Auditor -> Node` change in CE 138 is one word.
+
+Related: §4, whose question survives this — the size-cap wording is
+untouched since 2026-03-22, so it is still unanswered at HEAD and not
+something a newer revision has already settled.

@@ -86,6 +86,21 @@ pub struct ScheduledSubmission {
     /// be grading the node against its own arithmetic rather than against the
     /// chain.
     pub co_guarantors: Vec<u16>,
+    /// What the reference's report says this package exports, and the root
+    /// those exports sit under.
+    ///
+    /// Zero for a package built without a report -- the unauthorized fault
+    /// is never refined -- and that is the honest answer rather than a gap:
+    /// a package nobody refined has no exports-root.
+    pub exports_root: [u8; 32],
+    pub exports_count: u16,
+    /// The earlier package this one imports a segment from, if any.
+    ///
+    /// The lane needs it to grade CE 134's mappings: they must map exactly
+    /// this hash to exactly this root (`simple.md:449`). Carried on the
+    /// submission rather than looked up per run, because a run that
+    /// submitted two importing packages would have two answers.
+    pub imports_from: Option<ImportSource>,
 }
 
 /// The smallest work item that refines: no payload, no imports, no
@@ -110,6 +125,144 @@ pub fn work_item_with_payload(payload: Vec<u8>) -> WireItem {
         xts: Vec::new(),
         imports: Vec::new(),
         export_count: 0,
+    }
+}
+
+/// Segments the honest submission exports.
+///
+/// Four, to match the most the availability plan will ask for: fewer would
+/// leave the plan asking for slices that do not exist, and more would cost
+/// refine gas for segments nothing fetches.
+const EXPORTS_PER_PACKAGE: u16 = 4;
+
+/// A salt that makes two packages in one run two packages, derived from the
+/// slot they are aimed at.
+///
+/// Derived rather than random, because a run that cannot be repeated cannot
+/// be bisected -- the same reason the ticket faults are chosen by index.
+fn salt_for_slot(slot: u32) -> [u8; 32] {
+    let mut salt = [0u8; 32];
+    salt[..4].copy_from_slice(&slot.to_le_bytes());
+    salt
+}
+
+/// Segment length the engine codes and serves in, which is what an exported
+/// blob is padded to.
+///
+/// Named from the engine rather than repeated: a blob shorter than this is
+/// padded, and a blob longer than this is more than one segment, so the
+/// count a work item declares and the count refine produces only agree
+/// when each blob fits in one.
+const EXPORT_BLOB_LEN: usize = 64;
+
+/// A work item that exports `count` segments during refine.
+///
+/// The dev bootstrap service reads its payload as an encoded `Instructions`
+/// and acts on each one; `Export { data }` makes it call `export_slice` per
+/// blob. So a package that exports anything has to be *asked* to, and
+/// `export_count` is a declaration the refine has to live up to -- declare
+/// more than refine produces and the item fails.
+///
+/// This is what `findings.md` §17 needs. Until it existed, every package
+/// this harness built declared `export_count: 0`, so a run asked nothing
+/// over CE 139, CE 140 or CE 148 and all three reported themselves
+/// unexercised against a live node.
+///
+/// The salt is what makes two otherwise identical items different packages.
+/// Taken from the caller rather than randomised, because a run that cannot
+/// be repeated cannot be bisected.
+pub fn work_item_that_exports(count: u16, salt: [u8; 32]) -> WireItem {
+    let data: Vec<Vec<u8>> = (0..count)
+        .map(|i| vec![(i as u8).wrapping_add(1); EXPORT_BLOB_LEN])
+        .collect();
+    instruction_item(
+        vec![jam_bootstrap_service_common::Instruction::Export { data }],
+        salt,
+        count,
+    )
+}
+
+/// A package built earlier in the same run, and the one segment of it a
+/// later package imports.
+///
+/// Carried rather than recomputed. The exports-root is what the *engine*
+/// put in the earlier package's report, and a harness that derived its own
+/// would be checking the node against its own arithmetic -- the same reason
+/// [`package_hash`] is not recomputed here either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportSource {
+    /// GP hash of the exporting package. This is what CE 134's mappings are
+    /// keyed by, and what the import spec names.
+    pub package_hash: [u8; 32],
+    /// The exports-root its report declared, which is what the mappings
+    /// must map that hash *to*.
+    pub exports_root: [u8; 32],
+    /// Which of its exported segments to import.
+    pub index: u16,
+}
+
+/// Bytes of the exported blob a work item imports back.
+///
+/// The engine pads an export out to a whole segment and the service
+/// truncates it back on import, so this is a length the import asks for and
+/// not a length anything checks. It matches [`EXPORT_BLOB_LEN`] so the two
+/// halves of the run describe the same blob.
+const IMPORT_BLOB_LEN: u64 = EXPORT_BLOB_LEN as u64;
+
+/// A work item that imports one segment exported by an earlier package.
+///
+/// The import spec names the earlier package by *hash*, not by its
+/// exports-root (`RootIdentifier::Indirect`). That is deliberate and is the
+/// whole point of the row this feeds: a guarantor given such a package has
+/// to resolve the hash to a segments-root before it can fetch anything, and
+/// `simple.md:412-415` makes it carry the resolution to its co-guarantors
+/// in CE 134's mappings. An import by direct root needs no mapping, so it
+/// would leave the mappings empty and the row unexercised -- which is
+/// exactly the state `findings.md` §17 describes.
+///
+/// `Import { items }` is what makes refine actually read the segment: the
+/// service calls `import(index)` and panics if it is not there, so a report
+/// at all is evidence the node resolved the mapping and fetched the data.
+pub fn work_item_that_imports(from: &ImportSource, salt: [u8; 32]) -> WireItem {
+    let spec = jam_types::ImportSpec {
+        root: jam_types::RootIdentifier::Indirect(jam_types::WorkPackageHash::from(
+            from.package_hash,
+        )),
+        index: from.index,
+    };
+    let mut item = instruction_item(
+        vec![jam_bootstrap_service_common::Instruction::Import {
+            items: vec![(0, IMPORT_BLOB_LEN)],
+        }],
+        salt,
+        0,
+    );
+    item.imports = vec![jam_types::Encode::encode(&spec)];
+    item
+}
+
+/// Build a work item whose payload is `instructions`, addressed to the dev
+/// bootstrap service.
+///
+/// One encoder, because the payload's shape is the service's and a second
+/// copy of it would drift from the service the node is running.
+fn instruction_item(
+    instructions: Vec<jam_bootstrap_service_common::Instruction>,
+    salt: [u8; 32],
+    export_count: u16,
+) -> WireItem {
+    let payload = jam_types::Encode::encode(&jam_bootstrap_service_common::Instructions {
+        instructions,
+        salt: jam_bootstrap_service_common::PayloadSalt(salt),
+    });
+    WireItem {
+        service: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+        payload,
+        ref_gas: jam_types::max_refine_gas(),
+        acc_gas: jam_types::max_accumulate_gas(),
+        xts: Vec::new(),
+        imports: Vec::new(),
+        export_count,
     }
 }
 
@@ -145,6 +298,15 @@ pub struct SubmissionSchedule {
     pub co_guarantors: Vec<u16>,
     /// What is deliberately wrong with this submission, if anything.
     pub fault: Option<SubmissionFault>,
+    /// Whether this package imports a segment from an earlier one in the
+    /// same run.
+    ///
+    /// A flag here and a value at build time, because the package it would
+    /// import from does not exist when the run is planned: its hash and its
+    /// exports-root are only known once the reference has refined it. The
+    /// plan says what the submission is *for*; the builder supplies the
+    /// package it turned out to be.
+    pub imports: bool,
 }
 
 /// A deliberate defect in a CE 133 submission (DESIGN §11 N3).
@@ -419,13 +581,49 @@ impl RefChain {
     pub fn submission_now(
         &self,
         schedule: &SubmissionSchedule,
+        imports_from: Option<&ImportSource>,
     ) -> Result<(ScheduledSubmission, SharingAnswer), ChainError> {
+        // A plan that asked to import and was given nothing to import from
+        // is a run that lost its exporting package, not a package with no
+        // imports. Said out loud: building it anyway would hand the lane a
+        // submission that looks honest and quietly grades nothing.
+        if schedule.imports && imports_from.is_none() {
+            return Err(ChainError::Chain(format!(
+                "the submission for slot {} imports, but no earlier package in this run \
+                 exported anything to import",
+                schedule.slot
+            )));
+        }
         let items = match schedule.fault {
             // Big enough to clear the cap on its own, with the package's own
             // overhead on top.
             Some(SubmissionFault::Oversized) => {
                 vec![work_item_with_payload(vec![0x5a; OVERSIZED_PAYLOAD])]
             }
+            // The honest submission exports segments, and it is the only one
+            // that needs to: the availability plan is built from the first
+            // report the node distributes, and the honest submission leads
+            // the run. Without this the report declares `exports_count: 0`,
+            // the plan asks for no segments, and CE 139, CE 140 and CE 148
+            // report themselves unexercised -- truthfully, and in a way that
+            // reads on a green report exactly like a node that answered
+            // (`findings.md` §17).
+            //
+            // The faulty submissions keep the trivial item. Each exists to
+            // pose one defect, and giving them work to do as well would put
+            // a second reason in front of every row they feed.
+            None => match imports_from {
+                // The importing submission imports and exports nothing. It
+                // is here to make a node resolve a work-package hash to a
+                // segments-root and say so in CE 134's mappings, and a
+                // package that also exported would give the run a second
+                // root to confuse that with.
+                Some(from) => vec![work_item_that_imports(from, salt_for_slot(schedule.slot))],
+                None => vec![work_item_that_exports(
+                    EXPORTS_PER_PACKAGE,
+                    salt_for_slot(schedule.slot),
+                )],
+            },
             _ => vec![trivial_work_item()],
         };
         let work = match schedule.fault {
@@ -447,6 +645,9 @@ impl RefChain {
                         import_proofs: Vec::new(),
                         fault: schedule.fault,
                         co_guarantors: schedule.co_guarantors.clone(),
+                        exports_root: [0u8; 32],
+                        exports_count: 0,
+                        imports_from: imports_from.copied(),
                     },
                     SharingAnswer {
                         report_hash: [0u8; 32],
@@ -470,9 +671,35 @@ impl RefChain {
                 import_proofs: Vec::new(),
                 fault: schedule.fault,
                 co_guarantors: schedule.co_guarantors.clone(),
+                exports_root: work.report.package_spec.exports_root.0,
+                exports_count: work.report.package_spec.exports_count,
+                imports_from: imports_from.copied(),
             },
             answer,
         ))
+    }
+
+    /// Whether a block on this chain carries a guarantee for `package`.
+    ///
+    /// What a guarantor needs before it can act on a package that imports
+    /// by work-package hash: `available_data` resolves the hash out of the
+    /// packages the chain has seen, so until the guarantee for the
+    /// exporting package is in a block, the import names nothing. A node
+    /// asked too early does not refuse the submission -- it takes it, fails
+    /// to fetch, and never shares -- which would read on the report as a
+    /// node that would not share a package it was given.
+    ///
+    /// Read off the whole chain, not the node's own blocks. The reference
+    /// and the node import each other's blocks, so either one carrying the
+    /// guarantee is enough, and the node authors one slot in six.
+    pub fn carries_package(&self, package: &[u8; 32]) -> Result<bool, ChainError> {
+        Ok(self.chain_blocks()?.iter().any(|block| {
+            block
+                .extrinsic
+                .guarantees
+                .iter()
+                .any(|guarantee| guarantee.report.package_spec.hash.0 == *package)
+        }))
     }
 
     /// Build `items` into an authorized package for a builder to submit.
@@ -897,4 +1124,105 @@ fn decode<T: Decode>(encoded: &[u8], what: &str) -> Result<T, ChainError> {
         )));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use crate::oracle::Oracle;
+
+    /// Slots to author before refining: enough to reach the current epoch
+    /// and leave a lookup anchor that is not genesis.
+    const WALK: u32 = 12;
+
+    /// A package asked to export segments exports them, and one that is not
+    /// asked exports nothing.
+    ///
+    /// The whole of `findings.md` §17 rests on the first half. Every package
+    /// this harness built declared `export_count: 0`, so the availability
+    /// plan asked for no segments and CE 139, CE 140 and CE 148 reported
+    /// themselves unexercised against a live node -- truthfully, and in a
+    /// way that reads on a green report exactly like a node that answered.
+    ///
+    /// The second half is the control. Without it a passing assertion could
+    /// mean the engine reports a count it was handed rather than one it
+    /// produced.
+    #[test]
+    fn a_work_item_asked_to_export_does() -> Result<(), ChainError> {
+        let oracle = Oracle::for_tests();
+        let chain = RefChain::tiny(&oracle, 5)?;
+        let from = crate::chain::wall_clock_slot();
+        let authored = (from..from + WALK)
+            .filter(|&slot| matches!(chain.author_block(slot), Ok(Some(_))))
+            .count();
+        assert!(
+            authored > 1,
+            "the chain must reach the current epoch to refine"
+        );
+
+        let exporting = chain.guarantee_work(vec![work_item_that_exports(2, [7u8; 32])], 0)?;
+        assert_eq!(
+            exporting.report.package_spec.exports_count, 2,
+            "a package that asked to export two segments must report two"
+        );
+        assert_ne!(
+            exporting.report.package_spec.exports_root.0, [0u8; 32],
+            "two exported segments must sit under a root"
+        );
+
+        let plain = chain.guarantee_work(vec![work_item_with_payload(b"nothing".to_vec())], 0)?;
+        assert_eq!(
+            plain.report.package_spec.exports_count, 0,
+            "the control must export nothing, or the count above says nothing"
+        );
+        Ok(())
+    }
+
+    /// A package that imports a segment from an earlier one refines, and
+    /// its report carries the mapping that made it possible.
+    ///
+    /// Both halves matter. Refining at all is the harder one: the service
+    /// calls `import(0)` and panics if the segment is not there, so a report
+    /// is evidence that the hash in the import spec was resolved to a
+    /// segments-root and the data behind it fetched. The lookup on the
+    /// report is what `simple.md:449` then puts on the wire as CE 134's
+    /// mappings, and is the value `n3_ce134_maps_the_imported_package`
+    /// holds a node to -- so asserting it here is asserting the row's
+    /// expectation and not just the reference's arithmetic.
+    #[test]
+    fn a_work_item_that_imports_resolves_the_package_it_imports_from() -> Result<(), ChainError> {
+        let oracle = Oracle::for_tests();
+        let chain = RefChain::tiny(&oracle, 5)?;
+        let from = crate::chain::wall_clock_slot();
+        let authored = (from..from + WALK)
+            .filter(|&slot| matches!(chain.author_block(slot), Ok(Some(_))))
+            .count();
+        assert!(
+            authored > 1,
+            "the chain must reach the current epoch to refine"
+        );
+
+        let exporting = chain.guarantee_work(vec![work_item_that_exports(2, [9u8; 32])], 0)?;
+        let source = ImportSource {
+            package_hash: package_hash(&exporting.package).0,
+            exports_root: exporting.report.package_spec.exports_root.0,
+            index: 0,
+        };
+
+        let importing =
+            chain.guarantee_work(vec![work_item_that_imports(&source, [10u8; 32])], 0)?;
+        let mapped: Vec<([u8; 32], [u8; 32])> = importing
+            .report
+            .sr_lookup
+            .iter()
+            .map(|(hash, root)| (hash.0, root.0))
+            .collect();
+        assert_eq!(
+            mapped,
+            vec![(source.package_hash, source.exports_root)],
+            "the importing report must resolve the exporting package's hash to its \
+             exports-root, which is what a guarantor shares over CE 134"
+        );
+        Ok(())
+    }
 }

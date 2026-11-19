@@ -17,14 +17,12 @@
 //! whether the hash it named is the reference's. Each fault moves exactly
 //! one of those.
 //!
-//! A fourth row sits next door and is **not** provable here.
-//! `n3_ce134_shares_the_submitted_package` grades the mappings on a share
-//! the node *sends*, and is gated on those mappings being non-empty. They
-//! map imported segments to the roots they come from, and no package this
-//! harness builds imports any -- so the gate never opens, against a live
-//! node or a simulated one. That is the same blocker as `findings.md` §17
-//! and is recorded there rather than papered over with a row that cannot
-//! run.
+//! A fourth row sits next door and is proven in a file of its own.
+//! `n3_ce134_maps_the_imported_package` grades the mappings on a share the
+//! node *sends*, which only a package that imports has any, so it needs an
+//! arrangement this file does not make. See
+//! `n3_ce134_mappings_sim_it.rs` -- and `findings.md` §27, for what that
+//! row was asking before anything reached it.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

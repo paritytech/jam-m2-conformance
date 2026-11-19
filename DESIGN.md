@@ -39,7 +39,7 @@ measurement (M3/M4); testing more than one NUT per run.
 
 | Input | Location | Notes |
 |---|---|---|
-| JAMNP-S spec | `jam-np/simple.md` (HEAD 2026-09-02, untagged) | Only file in the repo. ALPN protocol version `1`. Line numbers below refer to it. |
+| JAMNP-S spec | `jam-np/simple.md` at **a96dc6b (2026-09-02)**, untagged | Only file in the repo. ALPN protocol version `1`. Every `simple.md:NNN` in this repository refers to that revision. Upstream HEAD is aa0e2b8 (2026-10-26) and four hunks differ; findings.md §28 says which, and which of them cost anything. **Diff, do not re-read, when moving to a newer one.** |
 | Graypaper | `graypaper/` v0.8.0 | Off-chain duties: `text/work_packages_and_reports.tex:15` (Honest Behavior), `guaranteeing.tex`, `assurance.tex`, `auditing.tex`, `best_chain.tex`, `safrole.tex`. |
 | Reference engine | `polkajam/crates/node` (`hazmat` feature), reached over a socket from `oracle/` | Authoring engine, STF import, state diff. `polkajam-fuzz` is read for its trace framing and mutation vocabulary (§8), not depended on. |
 | Tiny parameters | `w3f/jamtestvectors` README | V=6, C=2, E=12, Y=10, N=3, rotation R=4, **EC recovery 3 shards**. |
@@ -401,6 +401,16 @@ crates.io at the same 0.1.29 the pin carries, and they are different code: the p
 derives `Encode`. Both stay git dependencies on the pin. findings.md §6 has the diff and the
 check to repeat on a re-pin.
 
+**The workspace carries a third, and it is the quiet one.** `jam-bootstrap-service-common` is the
+payload shape the dev chain spec's bootstrap service reads: a work item that exports or imports
+segments is an encoded `Instructions` addressed to it (`m2-reference::reports`). The other two
+would fail loudly on a drift, because the harness decodes the node's own bytes with them. This one
+would not -- a drifted copy encodes an instruction the running service misreads, and the harness
+would be submitting work nobody asked for with every row still green. So `prepare-nut.sh` checks
+*every* polkajam dependency in the workspace manifest against the oracle's pin, not one crate by
+name: the check it replaced looked for `jam-node` in a manifest that has never had one, and had
+therefore never fired.
+
 `polkajam-fuzz` is no longer a dependency of anything here. The following small changes in
 polkajam remain prerequisites:
 
@@ -624,14 +634,22 @@ building it twice.
 
 ### N5 — auditing and disputes, CE 136/144/145/147 (2–3 epochs)
 
+> **Three rows below are written against `simple.md` at a96dc6b and the spec
+> has since replaced those sections.** CE 144's announcement no longer
+> declares a tranche or carries no-show evidence, and CE 145's guarantee
+> moved inside the validity discriminator, so the optional second message
+> does not exist. findings.md §28 has both new shapes. Re-specify from the
+> current spec before building these; a lane built from the table as it
+> stands would frame bytes no conforming node sends.
+
 | Check | Assertions | Faults |
 |---|---|---|
-| CE 144 tranche 0 `:743-793` | per block with newly available reports: `HeaderHash ++ 0 ++ len++[(Core,WRHash)] ++ sig`, then `Evidence` s₀ (96 bytes); at tranche start; covers all reports; none announced twice `:757-758`; nothing when nothing to audit `:749-750` | — |
+| CE 144 tranche 0 `:743-793` **SUPERSEDED, see findings.md §28** | per block with newly available reports: `HeaderHash ++ 0 ++ len++[(Core,WRHash)] ++ sig`, then `Evidence` s₀ (96 bytes); at tranche start; covers all reports; none announced twice `:757-758`; nothing when nothing to audit `:749-750` | — |
 | CE 147 `:582-595` | requests the bundle from a guarantor first, falls back to 138 `:587`; serves own bundles | corrupt bundle → reconstruct via 138, still judges |
-| CE 145 `:795-833` | `Epoch ++ ValIdx ++ Validity ++ WRHash ++ Sig`; positive within 8 s *(soft)*; Validity=0 followed by the `Guarantee` message `:819-830`; also to the succeeding set | — |
+| CE 145 `:795-833` **SUPERSEDED, see findings.md §28** | `Epoch ++ ValIdx ++ Validity ++ WRHash ++ Sig`; positive within 8 s *(soft)*; Validity=0 followed by the `Guarantee` message `:819-830`; also to the succeeding set | — |
 | Negative judgment | emulated guarantors include an invalid report (two emulated signatures) and serve the real bundle → NUT publishes Validity=0 plus guarantees; forwards received negative judgments to grid neighbours `:813-815`; disputes extrinsic in its next block | emulated negative judgment on a valid report → NUT publishes Validity=1; fault recorded |
 | CE 136 `:487-504` | serves held reports; on an unknown negatively-judged report requests it from the judging peer `:494-495` | — |
-| Later tranches | two or more emulated auditors no-show → NUT sends a tranche-n announcement 8 s later with `[sₙ(w) ++ len++[No-Show]]` `:769-775` | — |
+| Later tranches **SUPERSEDED, see findings.md §28** | two or more emulated auditors no-show → NUT sends a tranche-n announcement 8 s later with `[sₙ(w) ++ len++[No-Show]]` `:769-775` | — |
 
 ### N6 — preimages, CE 142/143 (1–2 epochs)
 

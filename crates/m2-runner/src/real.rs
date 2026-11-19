@@ -486,7 +486,12 @@ pub fn verify_segment_shards(
                 shards.shard_index,
                 shard_count,
                 segment_index,
-                shards.requested.len() as u32,
+                // The size of the tree the proof walks, which is every
+                // segment the package exported -- not the handful this
+                // request asked for. They coincide only when a run asks
+                // for all of them, which is why the simulated node could
+                // not see this (`findings.md` §26).
+                shards.segment_count,
                 slice.clone(),
                 justification.clone(),
             ) {

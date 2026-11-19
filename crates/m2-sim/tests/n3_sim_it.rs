@@ -75,6 +75,12 @@ fn submission(protocol: u16, slot: u32, package_len: usize) -> ScheduledSubmissi
         import_proofs: Vec::new(),
         fault: None,
         co_guarantors: CO_GUARANTORS.to_vec(),
+        exports_root: [0u8; 32],
+        exports_count: 0,
+        // This test grades the submission rows, not the mapping row. A
+        // package that imported here would put the stand-in's mappings in
+        // front of every row below it.
+        imports_from: None,
     }
 }
 

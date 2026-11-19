@@ -30,13 +30,33 @@ if [ -z "$PINNED" ]; then
     exit 1
 fi
 
-# While the workspace still carries its own polkajam dependencies, the two
-# pins have to agree: the reference would otherwise be built from one engine
-# and the oracle from another, and nothing downstream would notice.
-WORKSPACE_PIN=$(sed -n 's/^jam-node = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml | head -1)
-if [ -n "$WORKSPACE_PIN" ] && [ "$WORKSPACE_PIN" != "$PINNED" ]; then
-    echo "the workspace pins polkajam at ${WORKSPACE_PIN} and oracle/Cargo.toml" >&2
-    echo "pins ${PINNED}. Re-pin both before building." >&2
+# Every polkajam dependency the workspace carries has to be on the oracle's
+# revision: the reference would otherwise be built from one engine and the
+# oracle from another, and nothing downstream would notice.
+#
+# Read off every polkajam.git line rather than off one crate name. This
+# looked for `jam-node` in the workspace manifest, which has never had one --
+# `jam-node` lives in oracle/Cargo.toml, which is the whole point of the
+# split -- so the guard was empty and could not fire. There are three such
+# dependencies now, and the newest of them is the one that would do damage
+# quietly: `jam-bootstrap-service-common` is the *payload shape* the dev
+# service reads, so a drifted copy encodes an instruction the running
+# service misreads, and the harness would be submitting work nobody asked
+# for while every row stayed green.
+# `|| true` because the happy path is `grep -v` matching nothing, which
+# exits 1 and would take `set -e` with it -- a guard that killed the build
+# whenever the pins agreed would have been found at once, but the same
+# reflex is what left the old one unable to fire at all.
+MISMATCHED=$(grep -o 'polkajam\.git", rev = "[0-9a-f]\{40\}"' Cargo.toml |
+    grep -o '[0-9a-f]\{40\}' | grep -v "^${PINNED}\$" | sort -u || true)
+if [ -n "$MISMATCHED" ]; then
+    echo "oracle/Cargo.toml pins polkajam at ${PINNED}, but the workspace also" >&2
+    echo "pins: ${MISMATCHED}. Re-pin every polkajam dependency together." >&2
+    exit 1
+fi
+if ! grep -q 'polkajam\.git", rev = "'"${PINNED}"'"' Cargo.toml; then
+    echo "the workspace manifest has no polkajam dependency on ${PINNED}; the" >&2
+    echo "pin-agreement check would pass by having nothing to compare." >&2
     exit 1
 fi
 
