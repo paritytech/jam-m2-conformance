@@ -16,7 +16,9 @@ use std::time::Duration;
 use ed25519_consensus::{SigningKey, VerificationKey};
 use jamnp_s::cert::san_for_key;
 use jamnp_s::endpoint::EndpointConfig;
-use jamnp_s::transport::{mock::MockNetwork, quic::QuicTransport, Conn, ReadError, Transport};
+use jamnp_s::transport::{
+    mock::MockNetwork, quic::QuicTransport, Conn, ConnectionEnd, ReadError, Transport,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const GENESIS: [u8; 32] = [0xaa; 32];
@@ -206,5 +208,56 @@ async fn streams_are_independent_and_distinctly_numbered() {
                 other => panic!("{name}: expected the first stream reset, got {other:?}"),
             }
         }
+    }
+}
+
+/// The other property the boundary exists to preserve: a peer *closing the
+/// connection* reaches this side as the peer's own decision, with the code
+/// and the reason it sent, rather than as one more way for a stream to go
+/// quiet.
+///
+/// Discarded, every connection death looked alike: a node closing on purpose
+/// was read first as an idle timeout and then as a dial collision, through
+/// five sessions, before the transport was asked what had happened
+/// (`findings.md` §29, §30).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_arrives_as_the_peer_closing_with_its_code_and_reason() {
+    for (name, transport) in carriers() {
+        let (dialer, accepted) = pair(&transport).await;
+        // Nothing has gone wrong yet, and the connection says so.
+        assert_eq!(
+            accepted.end_reason(),
+            None,
+            "{name}: a live connection has not ended"
+        );
+
+        dialer.close(257, "Bad assurance: Invalid message");
+
+        // The close wakes whatever was waiting on the connection, which is
+        // how the emulator learns of it: its accept loop returns.
+        let failed = tokio::time::timeout(TIMEOUT, accepted.accept_bi())
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the close wakes the accept"))
+            .is_err();
+        assert!(failed, "{name}: no stream arrives on a closed connection");
+
+        match accepted.end_reason() {
+            Some(ConnectionEnd::PeerClosed { code, reason }) => {
+                assert_eq!(code, 257, "{name}: the peer's code survives the boundary");
+                assert_eq!(
+                    reason, "Bad assurance: Invalid message",
+                    "{name}: and so do its words"
+                );
+            }
+            other => panic!("{name}: expected the peer's close, got {other:?}"),
+        }
+
+        // And the side that hung up knows it was not the peer's doing: the
+        // row that reads these must not count this side's own teardown.
+        assert_eq!(
+            dialer.end_reason(),
+            Some(ConnectionEnd::Local),
+            "{name}: the closer sees its own close"
+        );
     }
 }

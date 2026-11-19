@@ -37,7 +37,9 @@
 //! | 39 | NUT initiated a connection (preferred-initiator) |
 //! | 40 | NUT re-announced a learned block |
 
-use crate::dsl::{check, log, Check, ObsKind, Severity};
+use jamnp_s::transport::ConnectionEnd;
+
+use crate::dsl::{check, log, Check, Control, ObsKind, Severity};
 
 /// The first emulated peer when the NUT sits at validator index 0 — the
 /// fabricated dry-run log and the lane's own tests are built around it.
@@ -305,6 +307,90 @@ pub fn up0_announce() -> Check {
             ),
         ]
     })
+}
+
+/// A message the node refuses costs its stream, not the connection.
+///
+/// `simple.md:115-120` gives a CE stream one job and one way to refuse it:
+/// the acceptor resets the stream, and that reset *is* the rejection.
+/// Nothing there says a connection may be closed instead, and the difference
+/// is not cosmetic -- every other protocol with that peer rides the same
+/// connection, so one refused message takes block requests, ticket
+/// distribution, package sharing and availability down with it. Read off a
+/// report that is several unrelated defects; it is one close
+/// (`findings.md` §29, §30).
+///
+/// **Soft, deliberately.** The spec gives the stream reset as the way to
+/// reject, but nowhere forbids closing the connection, and a row that hard-
+/// fails a node on a rule nobody wrote is the mistake §18 and §27 record.
+/// So this reports what the node did, in the node's own words, and the
+/// question of whether it is allowed goes to the spec's author.
+///
+/// Only the peer's own closes count. This side's teardown and an idle
+/// timeout are ends too, and neither is the node rejecting anything --
+/// §29's first count read four "lost peer" lines as four lost peers, when
+/// three of them were the run tearing its own dial tasks down at the end.
+pub fn connection_close(ends: Vec<ConnectionEnded>, connected: bool) -> Check {
+    check("connection_close", Severity::Soft, move |_obs| {
+        let closed: Vec<&ConnectionEnded> = ends
+            .iter()
+            .filter(|end| matches!(end.end, ConnectionEnd::PeerClosed { .. }))
+            .collect();
+        // The subject is a live connection, not a provocation: a run that
+        // never had one cannot say what the node does with one. Every run
+        // that does have one sends the node plenty it might object to.
+        let control = Control::new(
+            "rejection_not_exercised",
+            "a connection to the NUT for the window to close",
+            connected,
+        );
+        if !control.present() {
+            return vec![control.absent("rejection_keeps_the_connection")];
+        }
+        if closed.is_empty() {
+            return vec![log::check(
+                "rejection_keeps_the_connection",
+                true,
+                Severity::Soft,
+            )];
+        }
+        closed
+            .iter()
+            .map(|end| {
+                let ConnectionEnd::PeerClosed { code, reason } = &end.end else {
+                    unreachable!("filtered to peer closes");
+                };
+                log::check_detail(
+                    "rejection_keeps_the_connection",
+                    false,
+                    Severity::Soft,
+                    || {
+                        format!(
+                            "the NUT closed the whole connection to validator {} with \
+                             \"{reason}\" (code {code}) at wall {} ms, where rejecting a CE \
+                             message is a reset of the stream it arrived on",
+                            end.peer, end.at_wall_ms
+                        )
+                    },
+                )
+            })
+            .collect()
+    })
+}
+
+/// A connection to the node under test that ended during the run, and why.
+///
+/// Recorded by the emulator at the moment the connection went, on both the
+/// connections it dialled and the ones it accepted. Kept as a lane fact
+/// rather than an observation because the observation log carries a kind and
+/// a peer, and the question here is what the node *said* when it closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionEnded {
+    pub peer: u16,
+    /// The same clock the trace records, so a row naming this instant points
+    /// at the bytes that preceded it.
+    pub at_wall_ms: u64,
+    pub end: ConnectionEnd,
 }
 
 /// A block the node under test returned for a CE 128 request.
@@ -677,9 +763,11 @@ pub struct N0Ctx {
     /// Emulated peers the emulator is the preferred initiator for: it dials
     /// these, and the NUT should wait.
     pub emu_preferred_peers: Vec<u16>,
+    /// Connections that ended while the window was open, and why.
+    pub connection_ends: Vec<ConnectionEnded>,
 }
 
-/// All nine N0 checks in dependency order (N0 first; later lanes build on it).
+/// All ten N0 checks in dependency order (N0 first; later lanes build on it).
 pub fn all(ctx: &N0Ctx) -> Vec<Check> {
     vec![
         tls_cert(ctx.handshake_completed),
@@ -694,6 +782,7 @@ pub fn all(ctx: &N0Ctx) -> Vec<Check> {
         up0_announce(),
         ce128_serve(ctx.reference_chain.clone(), ctx.ce128_probes.clone()),
         ce129_serve(ctx.ce129_probes.clone()),
+        connection_close(ctx.connection_ends.clone(), ctx.handshake_completed),
     ]
 }
 
@@ -1192,11 +1281,12 @@ mod tests {
             builder: None,
             nut_preferred_peers: vec![PEER_1],
             emu_preferred_peers: Vec::new(),
+            connection_ends: Vec::new(),
         });
-        assert_eq!(checks.len(), 9);
+        assert_eq!(checks.len(), 10);
         let mut ids: Vec<&str> = checks.iter().map(|c| c.id).collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 9, "all check ids are distinct");
+        assert_eq!(ids.len(), 10, "all check ids are distinct");
     }
 }

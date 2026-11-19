@@ -94,6 +94,11 @@ pub enum SimFault {
     /// Accept a ticket whose ring proof does not verify, instead of refusing
     /// it by resetting the stream it arrived on.
     AcceptsBadProof,
+    /// Answer an assurance it will not pool by closing the whole connection,
+    /// where refusing costs the stream it arrived on and nothing else
+    /// (`simple.md:115-120`). Every other protocol with that validator goes
+    /// with it (`findings.md` §30).
+    ClosesOnBadAssurance,
     /// Accept a ticket for an epoch past its horizon, instead of resetting
     /// the stream (`simple.md:335-337`).
     AcceptsUnknownEpoch,
@@ -1003,13 +1008,20 @@ impl SimNode {
     async fn serve_connection(self: Arc<Self>, connection: Conn, peer: Option<u16>) {
         while let Ok((send, recv)) = connection.accept_bi().await {
             let node = Arc::clone(&self);
-            tokio::spawn(node.serve_stream(send, recv, peer));
+            let connection = Arc::clone(&connection);
+            tokio::spawn(node.serve_stream(connection, send, recv, peer));
         }
     }
 
     /// Dispatch one accepted stream on the kind byte its opening frame
     /// carries (`simple.md:122-124`).
-    async fn serve_stream(self: Arc<Self>, mut send: SendHalf, recv: RecvHalf, peer: Option<u16>) {
+    async fn serve_stream(
+        self: Arc<Self>,
+        connection: Conn,
+        mut send: SendHalf,
+        recv: RecvHalf,
+        peer: Option<u16>,
+    ) {
         let mut reader = StreamReader::new(recv);
         let Some((kind, content)) = reader.next().await else {
             return;
@@ -1028,7 +1040,7 @@ impl SimNode {
             }
             CE134 => self.receive_share(&mut send, &mut reader, &content).await,
             CE135 => self.receive_report(&content).await,
-            CE141 => self.receive_assurance(&content, peer).await,
+            CE141 => self.receive_assurance(&connection, &content, peer).await,
             // A real node resets an unserved kind; this one is not graded on
             // that, so it drops the stream.
             _ => {}
@@ -1372,7 +1384,7 @@ impl SimNode {
     /// the node and the *grading*, and the grading reads the block. What
     /// makes the rows provable is that the two faults move this decision
     /// without touching anything else.
-    async fn receive_assurance(&self, content: &[u8], peer: Option<u16>) {
+    async fn receive_assurance(&self, connection: &Conn, content: &[u8], peer: Option<u16>) {
         let Ok(assurance) = Assurance::decode(&mut &content[..]) else {
             return;
         };
@@ -1407,6 +1419,14 @@ impl SimNode {
         let received = m2_reference::assurance::as_received(&assurance, peer);
         if self.assurance_holds(&assurance, peer) {
             let _ = self.chain.submit_assurances(&[received]);
+            return;
+        }
+        // The defect this fault poses: answer the refusal at the connection
+        // rather than at the stream. The code and wording are the ones
+        // polkajam sends (`findings.md` §30), so the row is read against the
+        // shape of a real close.
+        if self.fault == SimFault::ClosesOnBadAssurance {
+            connection.close(257, "Bad assurance: Invalid message");
             return;
         }
         // Refused, and remembered only by the node that carries what it

@@ -1700,8 +1700,10 @@ something a newer revision has already settled.
 
 ## 29. A validator connection dies mid-run, and nothing re-dialled it
 
-**Status:** the consequence is fixed and measured; the **cause is still
-open**. Found 2026-11-19 while checking whether the advisory bumps had
+**Status:** CLOSED 2026-11-19. The consequence is fixed and measured here;
+the cause turned out to be a node defect and is §30.
+
+Found 2026-11-19 while checking whether the advisory bumps had
 broken anything. It is neither the bumps nor the re-pin: it reproduces on
 both pins and both dependency sets.
 
@@ -1753,27 +1755,130 @@ for initiating.
 and the hard rows back to the five known ones — `n2_self_proxy_ce132_all_peers`
 and `n3_ce133_shares_with_both_co_guarantors` both gone.
 
-**What is still open, and it is the interesting half.** The run logged
-**eight** re-dials, every one of them validator 4:
+**The cause, since 2026-11-19: §30.** The node closes the whole connection
+when it will not accept a message, and the harness spoils one assurance per
+validator partway through every run. Validator 4's is signed with the wrong
+key, so from the spoil slot on, each of its assurances cost it the
+connection — which is the "every 37 seconds" above.
 
-```
-[connectivity] validator 4: the connection to the NUT ended; re-dialling
-```
-
-So that connection still ends about every 37 seconds. The keep-alive did
-not prevent it, which rules out a plain idle timeout, and it is still only
-validator 4 — never 3, which this side also dials. The run now survives it
-in about two seconds, which is why no row notices, but surviving a thing is
-not understanding it.
-
-The hypothesis worth testing first: that the node is *also* dialling
-validator 4 despite not being the preferred initiator, and the two
-connections displace each other. `n0_preferred_initiator` would not catch
-that, because it grades the opening of a run and this is a steady state.
-If it holds, it is a node defect and this entry has been looking at the
-wrong end of it the whole time.
+Two things in this entry were wrong, and both are worth keeping. The
+hypothesis — that the node was *also* dialling validator 4 and the two
+connections displaced each other — was already contradicted by the run that
+proposed it: `nut_waits_where_not_preferred` reads the whole log, not the
+opening, and it passed. And "it is still only validator 4 — never 3" was an
+artefact of this entry's own fix: validator 1 was being dropped twice as
+often, on a connection the node re-dialled itself, and the fix logged only
+the side the harness dials. A log that covers half the subject will find
+half the pattern and make it look like the whole one.
 
 Related: §18, §23 and §27 — rows that failed for reasons that were not the
 node's. This one differs: the row was right and the *subject* was missing.
 The node really did not reach validator 4, because there was nothing there
 to reach.
+
+## 30. A message the node refuses closes the whole connection
+
+**Status:** open, and it is a node defect. Found 2026-11-19, chasing §29's
+open half: a connection to one emulated validator that ended every few
+slots and nothing could explain.
+
+The node answers a message it will not accept by closing the QUIC
+connection, with an application close that says what it did not like:
+
+```
+closed by peer: Bad assurance: Invalid message (code 257)
+closed by peer: Invalid guarantee: Invalid work report hash (code 257)
+```
+
+A CE stream has one way to be refused. The acceptor resets it, and that
+reset *is* the rejection: "resetting/stopping of a stream by the stream
+acceptor should be considered rejection of the request or failure to
+process the request" (`simple.md:115-120`, at a96dc6b, the revision
+`DESIGN.md` §8 names — and byte-identical at those same lines at upstream
+HEAD aa0e2b8, so §28's spec drift does not reach this). Closing the connection
+instead takes every other protocol with that validator down with it —
+block requests, ticket distribution, package sharing, availability — none
+of which had anything to do with the message that offended.
+
+**The evidence, from `sessions/teardown-2`.** The harness spoils one
+assurance per validator from a chosen slot, and which fault each poses is
+fixed by index (`spoil_for`, `peer % 3`): validators 0 and 3 send a wrong
+anchor, 2 claims a core carrying nothing, **1 and 4 sign with the wrong
+key**. From the spoil slot at t=217.9 s:
+
+| validator | fault posed | assurances after the spoil | connections closed |
+|---|---|---|---|
+| 0 | wrong anchor | 6 | 0 |
+| 1 | **bad signature** | 16 | **16** |
+| 2 | empty core | 18 | 0 |
+| 3 | wrong anchor | 18 | 0 |
+| 4 | **bad signature** | 8 | **8** |
+
+One close per bad-signature assurance, none anywhere else. The controls are
+in the same run and on the same transport: validator 3 is dialled by the
+same side as 4 and sends its assurance in the same instant, and its
+connection survived the whole window. **An assurance the node cannot accept
+is fine; an assurance it cannot verify costs the connection.**
+
+The second reason closed one connection each on validators 0 and 1. That is
+the same behaviour reached through CE 134 rather than CE 141, which is what
+`bumps-1` — the session §29 was written from — had been showing all along.
+
+One more control, found by running the lanes wrong. `sessions/teardown-1`
+was launched without `--lanes`, so N3 and N4 never ran, no assurance was
+ever sent — and across the whole 300-second window the node closed nothing
+and held five peers throughout. No invalid message, no close.
+
+**It reproduces.** `keepalive-1`, `bumps-2`, `repin-1` and `n3-imports-1`
+all show it, before this was understood: in each, validator 4's *last*
+assurance is the first one whose anchor diverges from validator 3's, which
+is the spoil slot, and the connection never came back. Validator 1 poses
+the same fault and was dropped just as often — invisibly, because the node
+is the preferred initiator there and re-dialled itself within the
+millisecond.
+
+**What it costs a report.** §29's table: `n2_self_proxy_ce132_all_peers`
+"did not reach peer(s) [4]" and `n3_ce133_shares_with_both_co_guarantors`
+"never opened CE 134 to validator 4". Two lanes, two unrelated-looking node
+defects, one connection — and neither row is about assurances at all.
+
+**The hypothesis this replaces.** §29 proposed that the node was also
+dialling validator 4 despite not being the preferred initiator, the two
+connections displacing each other. That was wrong, and the run already had
+the answer: `nut_waits_where_not_preferred` reads every `NUT_INITIATED`
+observation in the log, not just the opening ones, and it passed. The node
+never dialled 3 or 4 at all. What made the hypothesis attractive was that
+validator 4's drops were the only ones visible — and that was an artefact
+of §29's own fix, which logged re-dials on the side the harness dials and
+said nothing on the side it accepts.
+
+**The row.** `rejection_keeps_the_connection` (Soft), which reports each
+close with the node's own code and reason. Soft on purpose: `simple.md`
+gives the stream reset as the way to reject but nowhere forbids closing the
+connection, and hard-failing a node on a rule nobody wrote is the mistake
+§18 and §27 record.
+
+Two write-ups are owed and neither is written yet: whether the escalation
+is allowed at all is the spec author's to answer, and the behaviour itself
+is polkajam's to hear about. If the answer is that a rejection must stay on
+its stream, this row becomes Hard.
+
+`crates/m2-sim/tests/n0_connection_close_sim_it.rs` grades both directions
+against a stand-in that closes on a refusal, with the honest node as the
+control. Both runs put the same bytes on the wire; only the answer differs.
+
+**Live** (`sessions/teardown-4`, 581 rows): thirteen closes, thirteen rows,
+each naming the validator, the node's own wording and code, and the instant
+— which is the same clock the trace records, so a row points at the bytes
+that preceded it. Eleven were `Bad assurance: Invalid message`, eight of
+them validator 4's and three validator 1's; the other two were
+`Invalid guarantee: Invalid work report hash`, one each on validators 0
+and 1.
+
+**What made it findable.** `handle_connection` discarded the error that
+ended its accept loop, so every connection death looked alike. The
+transport now reports the end as [`ConnectionEnd`] — the peer's close with
+its code and reason kept apart from an idle timeout and from this side
+hanging up — and the emulator records every one, on the connections it
+dials and the ones it accepts. The accepted half had never been logged at
+all, which is why validator 1 went unnoticed through five sessions.

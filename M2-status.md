@@ -254,6 +254,56 @@ N5 plan specifies a wire format the spec has replaced**, before a line of
 N5 is written.
 
 
+### After PR #22: §29's cause, and a node that closes connections, 2026-11-19
+
+**§29 closed, and its hypothesis was wrong.** The connection to validator 4
+that died every few slots was not a dial collision. The node closes the
+whole QUIC connection when it refuses a message, and says so in the close
+frame: `Bad assurance: Invalid message (code 257)`, and on another
+protocol `Invalid guarantee: Invalid work report hash (code 257)`. That is
+§30.
+
+The evidence is arithmetic. The harness spoils one assurance per validator
+from a chosen slot, and which fault each poses is fixed by index: 0 and 3
+send a wrong anchor, 2 claims an empty core, **1 and 4 sign with the wrong
+key**. In `sessions/teardown-2`, after the spoil slot, validator 1 sent 16
+assurances and lost 16 connections, validator 4 sent 8 and lost 8, and
+validators 0, 2 and 3 sent 6, 18 and 18 equally invalid ones and lost
+none. Validator 3 is dialled by the same side as 4 and sends in the same
+instant: an assurance the node cannot *accept* is fine, an assurance it
+cannot *verify* costs the connection.
+
+**Why five sessions held the evidence and none of them showed it.** `handle_connection` discarded the
+error that ended its accept loop, so every connection death looked alike.
+And §29's own fix logged re-dials only on the side the harness dials —
+validator 1 was being dropped twice as often, on a connection the node
+re-dialled itself within the millisecond, and nothing said so. A log that
+covers half the subject finds half the pattern and makes it look whole.
+
+**What changed.** The transport now reports a connection's end as
+`ConnectionEnd`: the peer's close with its code and reason, kept apart from
+an idle timeout and from this side hanging up — the treatment
+`ReadError::Reset` already had, for the same reason. `transport_it` proves
+it over real QUIC and the mock alike. The emulator records every end, on
+both halves, read as a snapshot when the window closes so that the teardown
+that follows cannot be mistaken for the node.
+
+**The row.** `rejection_keeps_the_connection` (Soft), reporting each close
+with the node's own words and the instant, so the row points back into the
+trace. Soft deliberately: `simple.md:115-120` gives the stream reset as the
+way to reject but nowhere forbids closing the connection, and hard-failing
+a node on a rule nobody wrote is the mistake §18 and §27 record.
+`n0_connection_close_sim_it` grades both directions — both runs put the
+same bytes on the wire and only the node's answer differs. Live
+(`sessions/teardown-4`, 581 rows): thirteen closes and thirteen rows,
+eleven of them over an assurance and two over a guarantee.
+
+**One known failure explained.** `n2_self_proxy_ce132_all_peers`, "one
+self-proxied ticket did not reach one peer, seen in consecutive runs and
+not yet written up", is not an N2 defect: the node had closed the
+connection to that peer, so there was nothing there to reach.
+
+
 ## Milestone ladder
 
 | Milestone | Lanes | Coverage | Status |
@@ -385,8 +435,8 @@ Result: the node accepts every ticket the emulator offers. `invalid ticket signa
 | | |
 |---|---|
 | Crates | 6 (`jamnp-s`, `m2-reference`, `m2-emu`, `m2-scenario`, `m2-runner`, `m2-sim`) |
-| Rust | ~24.2k lines, 429 test functions |
-| `cargo test --workspace` | **432 passed / 0 failed** |
+| Rust | 36.4k lines under `crates/*/src`, 41.3k with the integration tests; 549 test functions |
+| `cargo test --workspace` | **549 passed / 0 failed** |
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets` | 3 warnings, all pre-existing |
 | Dry-run baseline | exits 0 — the harness's own expectations are satisfiable |

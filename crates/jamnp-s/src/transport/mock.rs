@@ -20,8 +20,8 @@ use ed25519_consensus::SigningKey;
 use tokio::sync::{mpsc, Notify};
 
 use super::{
-    Conn, Connection, Incoming, Listener, ReadError, RecvHalf, RecvStream, SendHalf, SendStream,
-    Transport, TransportError,
+    Conn, Connection, ConnectionEnd, Incoming, Listener, ReadError, RecvHalf, RecvStream, SendHalf,
+    SendStream, Transport, TransportError,
 };
 use crate::endpoint::{EndpointConfig, EndpointError};
 
@@ -192,15 +192,24 @@ impl Incoming for MockIncoming {
 fn connection_pair() -> (Conn, Conn) {
     let (to_accepted, accepted_incoming) = mpsc::unbounded_channel();
     let (to_dialer, dialer_incoming) = mpsc::unbounded_channel();
+    // One slot per end, each held by both: a close is written into the
+    // *peer's* slot, because what ended a connection is a fact about the end
+    // that did not decide it.
+    let dialer_end = Arc::new(Mutex::new(None));
+    let accepted_end = Arc::new(Mutex::new(None));
     let dialer = Arc::new(MockConnection {
         incoming: tokio::sync::Mutex::new(dialer_incoming),
-        peer: to_accepted,
+        peer: Mutex::new(Some(to_accepted)),
+        ended: Arc::clone(&dialer_end),
+        peer_ended: Arc::clone(&accepted_end),
         next_id: AtomicU64::new(0),
         step: 2,
     });
     let accepted = Arc::new(MockConnection {
         incoming: tokio::sync::Mutex::new(accepted_incoming),
-        peer: to_dialer,
+        peer: Mutex::new(Some(to_dialer)),
+        ended: accepted_end,
+        peer_ended: dialer_end,
         next_id: AtomicU64::new(1),
         step: 2,
     });
@@ -211,7 +220,12 @@ fn connection_pair() -> (Conn, Conn) {
 #[derive(Debug)]
 struct MockConnection {
     incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<(SendHalf, RecvHalf)>>,
-    peer: mpsc::UnboundedSender<(SendHalf, RecvHalf)>,
+    /// `None` once this end has closed: the peer's accept wakes with nothing.
+    peer: Mutex<Option<mpsc::UnboundedSender<(SendHalf, RecvHalf)>>>,
+    /// Why *this* end is over, as the other end's close wrote it.
+    ended: Arc<Mutex<Option<ConnectionEnd>>>,
+    /// The other end's slot, which this end's close writes.
+    peer_ended: Arc<Mutex<Option<ConnectionEnd>>>,
     next_id: AtomicU64,
     step: u64,
 }
@@ -223,7 +237,9 @@ impl Connection for MockConnection {
         // Two pipes: one each way.
         let (out_send, out_recv) = pipe(id);
         let (in_send, in_recv) = pipe(id);
-        self.peer
+        let peer = self.peer.lock().expect("mock connection");
+        peer.as_ref()
+            .ok_or_else(|| TransportError("the peer is gone".to_string()))?
             .send((in_send, out_recv))
             .map_err(|_| TransportError("the peer is gone".to_string()))?;
         Ok((out_send, in_recv))
@@ -236,6 +252,21 @@ impl Connection for MockConnection {
             .recv()
             .await
             .ok_or_else(|| TransportError("the peer is gone".to_string()))
+    }
+
+    fn end_reason(&self) -> Option<ConnectionEnd> {
+        self.ended.lock().expect("mock connection").clone()
+    }
+
+    fn close(&self, code: u64, reason: &str) {
+        *self.peer_ended.lock().expect("mock connection") = Some(ConnectionEnd::PeerClosed {
+            code,
+            reason: reason.to_string(),
+        });
+        *self.ended.lock().expect("mock connection") = Some(ConnectionEnd::Local);
+        // Wakes the peer's accept with nothing, as a closed QUIC connection
+        // wakes every stream waiting on it.
+        self.peer.lock().expect("mock connection").take();
     }
 }
 

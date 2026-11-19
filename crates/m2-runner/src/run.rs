@@ -506,6 +506,14 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     }
     drop(dial_tasks);
 
+    // Read before the teardown, not at report time: what follows ends every
+    // remaining connection, and an end recorded then is the harness closing
+    // up shop rather than anything the node decided (`findings.md` §29).
+    let connection_ends = match &source {
+        ObsSource::Emulator { emu, .. } => emu.connection_ends(),
+        ObsSource::Fabricated { .. } => Vec::new(),
+    };
+
     // A report nobody claimed never went out, and `n3_ce135_inclusion`
     // reports that the same way it reports a node that ignored one it was
     // sent. Only one validator in the cohort may distribute it, so a plan
@@ -556,6 +564,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     builder,
                     nut_preferred_peers: peers_of(&plan.wait_then_connect, &emu_indices),
                     emu_preferred_peers: peers_of(&plan.initiate_now, &emu_indices),
+                    connection_ends,
                 },
             )
             .map_err(internal)?
@@ -1440,8 +1449,8 @@ async fn hold_connection(
         )
         .await
         {
-            Ok(()) => eprintln!(
-                "[connectivity] validator {index}: the connection to the NUT ended; re-dialling"
+            Ok(reason) => eprintln!(
+                "[connectivity] validator {index}: the connection to the NUT ended ({reason}); re-dialling"
             ),
             Err(e) => eprintln!("[connectivity] validator {index}: connection to the NUT: {e}"),
         }
