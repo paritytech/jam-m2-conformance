@@ -375,9 +375,10 @@ not. So:
 - Worth asking upstream whether a published version can be tagged, so a
   revision and a release can be matched without diffing them.
 
-## 7. The harness and the oracle resolved different codec versions
+## 7. The harness and the oracle resolved different codec versions — CLOSED 2026-11-19
 
-**Status:** fixed 2026-11-17, and worth a guard it does not yet have.
+**Status:** CLOSED 2026-11-19. The skew was fixed 2026-11-17; the guard
+that was missing is now in the handshake.
 
 `jam-codec` is the codec both sides of the oracle socket encode and decode
 with. The workspace and `oracle/` are separate cargo trees with separate
@@ -410,7 +411,7 @@ harness.
 
 Both trees are pinned to 0.1.2 now and the lockfiles agree.
 
-**The guard that is still missing.** Nothing checks that they agree. Two
+**The guard, added 2026-11-19.** Nothing checked that they agree. Two
 independently-resolved lockfiles can drift again on the next `cargo update`,
 and the symptom would be a decoder disagreement across the socket with no
 error anywhere -- the same shape as findings §6 and as the two defects the
@@ -419,11 +420,62 @@ sides must compute identically belongs in one place. The codec is exactly
 that, and it cannot live in `m2-oracle-proto` because each tree resolves its
 own copy.
 
-The cheap version: each side's `build.rs` reads the resolved `jam-codec`
-version out of its own `Cargo.lock` -- the oracle's already reads its manifest
-for the polkajam revision -- and the handshake compares them, the way it
-already compares the protocol version. About fifteen lines, and it turns a
-silent divergence into a refusal to start.
+This entry proposed reading the resolved version out of each `Cargo.lock` in
+a `build.rs` and comparing the two strings. What was built instead compares
+the **behaviour**, because the version is a label and the behaviour is the
+thing: `m2_oracle_proto::codec_probe()` encodes ten compact integers at the
+width boundaries and decodes five canaries, and the handshake carries the
+answers. `m2-oracle-proto` is compiled once in each tree against that tree's
+own codec, so one source runs in both places and asks the question that
+matters. It also costs no lockfile parsing and no guess about which lockfile
+governs a crate that two trees compile.
+
+Three of the canaries are the inputs that actually split the two versions,
+measured against the published crates rather than assumed:
+
+| input | 0.1.1 | 0.1.2 |
+|---|---|---|
+| `00` (canonical) | accepts | accepts |
+| `80 00` | **accepts** | refuses |
+| `c0 00 00 00` | **accepts** | refuses |
+| `80 01` | **accepts** | refuses |
+| `fc` (truncated) | refuses | refuses |
+
+The last is there so the probe has a case both versions refuse: a probe whose
+every canary discriminates cannot tell a codec that disagrees from one that
+refuses everything. Encoding is compared too, byte for byte, even though §7
+found it identical across these two -- a guard that only looks where the last
+bug was is a guard for the last bug.
+
+The probe cannot be defeated by the divergence it looks for. Encoding is what
+puts the handshake on the wire, so a side that encoded lengths differently
+would produce a frame the other could not decode at all, which the handshake
+already reports as a malformed reply.
+
+A mismatch names the input and both answers:
+
+```
+the oracle's codec and this build's do not agree -- decoding 8000: this
+build refuses it, the other accepts it. They are separate cargo trees
+asking for `jam-codec` by a caret requirement, so they can resolve
+differently: compare `cargo tree -p jam-codec` here with the same in
+`oracle/`, pin both to one version, and rebuild both.
+```
+
+`PROTOCOL_VERSION` goes to 9, because `PeerInfo` changed shape. That makes
+an oracle binary built before this one unusable, which is the intent -- but
+it cannot report itself as a version mismatch, because reading the version
+is what fails: the old handshake is missing the probe, so it does not decode
+at all. The handshake path says so instead, naming the likely cause and the
+one command that fixes it, and a test drives a hand-encoded protocol-8
+reply to prove it. Anyone pulling this runs `./scripts/prepare-nut.sh` once.
+
+**Seen to fire.** `crates/m2-reference/tests/oracle_handshake_it.rs` stands a
+fake oracle on a unix socket and drives the refusal through `Oracle::connect`,
+with the lax probe set to 0.1.1's *measured* answers rather than an invented
+pattern -- and a control where the codecs agree and the connection is
+accepted, so the guard is not merely refusing everything. The protocol-version
+guard, which had never been driven over a socket either, is tested there too.
 
 ## 8. The node accepts a CE 133 extrinsic message of the wrong size
 
