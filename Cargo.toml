@@ -16,22 +16,23 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/paritytech/jam-m2-conformance"
 
-# Two polkajam crates, as git dependencies pinned to a commit (DESIGN.md §8).
-# Nothing from polkajam is vendored into this repository.
+# Three polkajam crates, as git dependencies pinned to a commit (DESIGN.md
+# §8). Nothing from polkajam is vendored into this repository.
 #
 # `jam-node` is **not** here. The reference engine runs out of process, in
 # `oracle/`, which is outside this workspace and is the only thing that
 # depends on the node crate and its `hazmat` feature -- whose own docs say
 # its interfaces may change at any time. What is left here are the types and
-# the codecs, which the harness needs to read what comes off the wire.
+# the codecs the harness needs to read what comes off the wire, and the dev
+# service's payload types it needs to ask that service to do anything.
 #
-# Not from crates.io, though both are published at 0.1.29 and the pin's
-# workspace version is 0.1.29 too. They are different code: the published
-# `ServiceActivityRecord` has `provided_count: u16` where the pin has `u32`,
-# and that struct derives `Encode`, so the two disagree about bytes in the
-# state the N1 lane diffs. polkajam publishes 0.1.x from a moving trunk, so a
-# version number does not identify a revision. findings.md §6 has the diff
-# and the check to repeat on a re-pin.
+# Not from crates.io, though the first two are published at 0.1.29 and the
+# pin's workspace version is 0.1.29 too. They are different code: the
+# published `ServiceActivityRecord` has `provided_count: u16` where the pin
+# has `u32`, and that struct derives `Encode`, so the two disagree about
+# bytes in the state the N1 lane diffs. polkajam publishes 0.1.x from a
+# moving trunk, so a version number does not identify a revision.
+# findings.md §6 has the diff and the check to repeat on a re-pin.
 #
 # This pin is the single source of the polkajam revision for the workspace;
 # `oracle/Cargo.toml` carries the same one and `scripts/prepare-nut.sh` reads
@@ -39,6 +40,14 @@ repository = "https://github.com/paritytech/jam-m2-conformance"
 # that grades it are the same build. Re-pinning is deliberate -- upstream HEAD
 # has broken this workspace three times in four weeks -- so move it at most
 # once per milestone, in a commit of its own that records what changed.
+#
+# **Every one of these moves together**, and `prepare-nut.sh` refuses to
+# build if they do not. Two of them would fail loudly on a drift, because
+# the harness decodes the node's bytes with them. The third would not:
+# `jam-bootstrap-service-common` is the payload shape the dev service reads,
+# so a drifted copy encodes an instruction the running service misreads, and
+# the harness would be submitting work nobody asked for with every row still
+# green.
 [workspace.dependencies]
 jam-types = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "b1ea8aca42b1078fd89883da66e58a9304ff0d77" }
 jam-std-common = { git = "ssh://git@github.com/paritytech/polkajam.git", rev = "b1ea8aca42b1078fd89883da66e58a9304ff0d77" }

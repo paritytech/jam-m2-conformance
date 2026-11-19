@@ -401,6 +401,16 @@ crates.io at the same 0.1.29 the pin carries, and they are different code: the p
 derives `Encode`. Both stay git dependencies on the pin. findings.md §6 has the diff and the
 check to repeat on a re-pin.
 
+**The workspace carries a third, and it is the quiet one.** `jam-bootstrap-service-common` is the
+payload shape the dev chain spec's bootstrap service reads: a work item that exports or imports
+segments is an encoded `Instructions` addressed to it (`m2-reference::reports`). The other two
+would fail loudly on a drift, because the harness decodes the node's own bytes with them. This one
+would not -- a drifted copy encodes an instruction the running service misreads, and the harness
+would be submitting work nobody asked for with every row still green. So `prepare-nut.sh` checks
+*every* polkajam dependency in the workspace manifest against the oracle's pin, not one crate by
+name: the check it replaced looked for `jam-node` in a manifest that has never had one, and had
+therefore never fired.
+
 `polkajam-fuzz` is no longer a dependency of anything here. The following small changes in
 polkajam remain prerequisites:
 
