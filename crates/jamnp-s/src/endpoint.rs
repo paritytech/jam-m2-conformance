@@ -54,6 +54,31 @@ pub struct Endpoint {
     addr: SocketAddr,
 }
 
+/// How often a connection with nothing to say sends a packet to stay alive.
+///
+/// quinn's defaults are a 30-second idle timeout and **no** keep-alive, so a
+/// link that goes quiet for half a minute is closed by both ends. A real
+/// validator keeps its peers, and this harness holds its connections open for
+/// a whole observation window: `findings.md` §29 is a run where one went
+/// quiet, died, and was never re-established, which cost rows in two lanes
+/// and read on the report as two unrelated node defects.
+///
+/// Well inside the idle timeout, so several keep-alives have to be lost in a
+/// row before a connection is dropped for being idle.
+const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Transport settings shared by both ends of every connection this harness
+/// makes.
+///
+/// Only the keep-alive. The idle timeout stays at quinn's default, because a
+/// connection that has genuinely gone is one the run wants to find out about
+/// rather than wait on.
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(KEEP_ALIVE));
+    Arc::new(transport)
+}
+
 impl Endpoint {
     /// Bind a QUIC listener presenting a self-signed certificate for `secret`.
     ///
@@ -78,10 +103,9 @@ impl Endpoint {
 
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server)
             .map_err(|e| EndpointError::Tls(e.to_string()))?;
-        let quic = quinn::Endpoint::server(
-            quinn::ServerConfig::with_crypto(Arc::new(quic_server)),
-            addr,
-        )?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        server_config.transport_config(transport_config());
+        let quic = quinn::Endpoint::server(server_config, addr)?;
         let addr = quic.local_addr()?;
         Ok(Self { quic, addr })
     }
@@ -111,11 +135,9 @@ impl Endpoint {
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client)
             .map_err(|e| EndpointError::Tls(e.to_string()))?;
         let quic = quinn::Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into())?;
-        let connecting = quic.connect_with(
-            quinn::ClientConfig::new(Arc::new(quic_client)),
-            addr,
-            &server_name,
-        )?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client));
+        client_config.transport_config(transport_config());
+        let connecting = quic.connect_with(client_config, addr, &server_name)?;
         Ok(connecting.await?)
     }
 
