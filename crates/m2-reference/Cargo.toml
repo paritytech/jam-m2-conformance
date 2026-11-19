@@ -8,6 +8,7 @@ description = "Client of the out-of-process polkajam reference oracle: chain sta
 [dependencies]
 m2-oracle-proto = { path = "../m2-oracle-proto" }
 jam-std-common = { workspace = true }
+jam-bootstrap-service-common = { workspace = true }
 jamnp-s = { path = "../../crates/jamnp-s" }
 jam-types = { workspace = true }
 thiserror = { workspace = true }

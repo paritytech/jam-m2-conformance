@@ -819,7 +819,7 @@ once it has guaranteed a package and published a report. The same report and
 the same mid-run plan N4 already waits for (§12). DESIGN is updated to say
 so rather than left to disagree with the code.
 
-## 17. The segment protocols cannot be exercised against a live node
+## 17. The segment protocols cannot be exercised against a live node — CLOSED 2026-11-19
 
 **Status:** open. Found while writing the CE 148 rows, by asking what the
 run would actually ask for. Opened 2026-11-18.
@@ -843,17 +843,32 @@ This is not a defect in the rows. They are held to the bar by
 and real proofs through eight faults across the three protocols. What is
 missing is the *live* half: nothing has ever asked polkajam for a segment.
 
-**What it takes to close.** A work item that exports segments, which means
-the dev bootstrap service actually exporting them during refine —
-`export_count` is a declaration, and a refine that does not produce that many
-fails. So this is not a one-line change to the item; it is a question about
-what the service can be asked to do, and it needs a live run to settle rather
-than a guess. Until then:
+**What it took to close.** The service can be asked, and was not blocked at
+all — only unexplored. The dev bootstrap service reads its payload as an
+encoded `Instructions` and carries an `Export { data }` instruction that
+calls `export_slice` per blob. `jam-bootstrap-service-common` is published
+and host-buildable, and its own description is "useful for interoperating
+and constructing work items".
 
-- a green CE 139/140 or CE 148 row against a live node means "the harness
-  never asked", and the lane's own docs say so;
-- the simulated node is the only thing those rows have been measured
-  against, which is better than nothing and is not the same as a node.
+So the honest submission now exports four segments, and a live run asks for
+them. `a_work_item_asked_to_export_does` holds the service to it, with a
+non-exporting control so a passing count cannot just be the engine echoing
+back what it was handed.
+
+**Measured** (`sessions/n4-exports-3`): CE 139 and CE 140 answer and
+verify against polkajam, five of five on every row. CE 148 is declined,
+which `simple.md:660` allows and the row records as Soft — the first time
+any of the three has been put to a real node.
+
+Opening the door immediately found §26 behind it: the row checking CE 140's
+justifications had been comparing against the wrong tree the whole time,
+and nothing could have noticed while no package exported anything.
+
+**Still waiting on the import half.**
+`n3_ce134_shares_the_submitted_package` needs a package that *imports*
+segments, so a share carries non-empty mappings. The exports exist now, so
+this is reachable: a later package importing the first one's segments. It
+is the last row in N3 or N4 that has never run against anything.
 
 **A fourth row has the same cause**, found 2026-11-18 while proving the CE
 134 receive rows. `n3_ce134_shares_the_submitted_package` grades the

@@ -113,6 +113,85 @@ pub fn work_item_with_payload(payload: Vec<u8>) -> WireItem {
     }
 }
 
+/// Segments the honest submission exports.
+///
+/// Four, to match the most the availability plan will ask for: fewer would
+/// leave the plan asking for slices that do not exist, and more would cost
+/// refine gas for segments nothing fetches.
+const EXPORTS_PER_PACKAGE: u16 = 4;
+
+/// A salt that makes two packages in one run two packages, derived from the
+/// slot they are aimed at.
+///
+/// Derived rather than random, because a run that cannot be repeated cannot
+/// be bisected -- the same reason the ticket faults are chosen by index.
+fn salt_for_slot(slot: u32) -> [u8; 32] {
+    let mut salt = [0u8; 32];
+    salt[..4].copy_from_slice(&slot.to_le_bytes());
+    salt
+}
+
+/// Segment length the engine codes and serves in, which is what an exported
+/// blob is padded to.
+///
+/// Named from the engine rather than repeated: a blob shorter than this is
+/// padded, and a blob longer than this is more than one segment, so the
+/// count a work item declares and the count refine produces only agree
+/// when each blob fits in one.
+const EXPORT_BLOB_LEN: usize = 64;
+
+/// A work item that exports `count` segments during refine.
+///
+/// The dev bootstrap service reads its payload as an encoded `Instructions`
+/// and acts on each one; `Export { data }` makes it call `export_slice` per
+/// blob. So a package that exports anything has to be *asked* to, and
+/// `export_count` is a declaration the refine has to live up to -- declare
+/// more than refine produces and the item fails.
+///
+/// This is what `findings.md` §17 needs. Until it existed, every package
+/// this harness built declared `export_count: 0`, so a run asked nothing
+/// over CE 139, CE 140 or CE 148 and all three reported themselves
+/// unexercised against a live node.
+///
+/// The salt is what makes two otherwise identical items different packages.
+/// Taken from the caller rather than randomised, because a run that cannot
+/// be repeated cannot be bisected.
+pub fn work_item_that_exports(count: u16, salt: [u8; 32]) -> WireItem {
+    let data: Vec<Vec<u8>> = (0..count)
+        .map(|i| vec![(i as u8).wrapping_add(1); EXPORT_BLOB_LEN])
+        .collect();
+    instruction_item(
+        vec![jam_bootstrap_service_common::Instruction::Export { data }],
+        salt,
+        count,
+    )
+}
+
+/// Build a work item whose payload is `instructions`, addressed to the dev
+/// bootstrap service.
+///
+/// One encoder, because the payload's shape is the service's and a second
+/// copy of it would drift from the service the node is running.
+fn instruction_item(
+    instructions: Vec<jam_bootstrap_service_common::Instruction>,
+    salt: [u8; 32],
+    export_count: u16,
+) -> WireItem {
+    let payload = jam_types::Encode::encode(&jam_bootstrap_service_common::Instructions {
+        instructions,
+        salt: jam_bootstrap_service_common::PayloadSalt(salt),
+    });
+    WireItem {
+        service: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+        payload,
+        ref_gas: jam_types::max_refine_gas(),
+        acc_gas: jam_types::max_accumulate_gas(),
+        xts: Vec::new(),
+        imports: Vec::new(),
+        export_count,
+    }
+}
+
 /// Payload that carries a package past the CE 133 initial-message cap.
 ///
 /// The cap is `2 + 200 * 1024` on the whole message; a payload this size
@@ -426,6 +505,22 @@ impl RefChain {
             Some(SubmissionFault::Oversized) => {
                 vec![work_item_with_payload(vec![0x5a; OVERSIZED_PAYLOAD])]
             }
+            // The honest submission exports segments, and it is the only one
+            // that needs to: the availability plan is built from the first
+            // report the node distributes, and the honest submission leads
+            // the run. Without this the report declares `exports_count: 0`,
+            // the plan asks for no segments, and CE 139, CE 140 and CE 148
+            // report themselves unexercised -- truthfully, and in a way that
+            // reads on a green report exactly like a node that answered
+            // (`findings.md` §17).
+            //
+            // The faulty submissions keep the trivial item. Each exists to
+            // pose one defect, and giving them work to do as well would put
+            // a second reason in front of every row they feed.
+            None => vec![work_item_that_exports(
+                EXPORTS_PER_PACKAGE,
+                salt_for_slot(schedule.slot),
+            )],
             _ => vec![trivial_work_item()],
         };
         let work = match schedule.fault {
@@ -897,4 +992,57 @@ fn decode<T: Decode>(encoded: &[u8], what: &str) -> Result<T, ChainError> {
         )));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use crate::oracle::Oracle;
+
+    /// Slots to author before refining: enough to reach the current epoch
+    /// and leave a lookup anchor that is not genesis.
+    const WALK: u32 = 12;
+
+    /// A package asked to export segments exports them, and one that is not
+    /// asked exports nothing.
+    ///
+    /// The whole of `findings.md` §17 rests on the first half. Every package
+    /// this harness built declared `export_count: 0`, so the availability
+    /// plan asked for no segments and CE 139, CE 140 and CE 148 reported
+    /// themselves unexercised against a live node -- truthfully, and in a
+    /// way that reads on a green report exactly like a node that answered.
+    ///
+    /// The second half is the control. Without it a passing assertion could
+    /// mean the engine reports a count it was handed rather than one it
+    /// produced.
+    #[test]
+    fn a_work_item_asked_to_export_does() -> Result<(), ChainError> {
+        let oracle = Oracle::for_tests();
+        let chain = RefChain::tiny(&oracle, 5)?;
+        let from = crate::chain::wall_clock_slot();
+        let authored = (from..from + WALK)
+            .filter(|&slot| matches!(chain.author_block(slot), Ok(Some(_))))
+            .count();
+        assert!(
+            authored > 1,
+            "the chain must reach the current epoch to refine"
+        );
+
+        let exporting = chain.guarantee_work(vec![work_item_that_exports(2, [7u8; 32])], 0)?;
+        assert_eq!(
+            exporting.report.package_spec.exports_count, 2,
+            "a package that asked to export two segments must report two"
+        );
+        assert_ne!(
+            exporting.report.package_spec.exports_root.0, [0u8; 32],
+            "two exported segments must sit under a root"
+        );
+
+        let plain = chain.guarantee_work(vec![work_item_with_payload(b"nothing".to_vec())], 0)?;
+        assert_eq!(
+            plain.report.package_spec.exports_count, 0,
+            "the control must export nothing, or the count above says nothing"
+        );
+        Ok(())
+    }
 }
