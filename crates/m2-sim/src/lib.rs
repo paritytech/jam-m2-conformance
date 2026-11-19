@@ -28,7 +28,7 @@ use jam_std_common::{
     bandersnatch::ring_vrf, Block, Extrinsic, ReportGuarantee, TicketEnvelope, ValSignature,
     WorkReport,
 };
-use jam_types::{Decode, Encode, HeaderHash};
+use jam_types::{Decode, Encode, HeaderHash, WorkPackageHash};
 use jamnp_s::clock;
 use jamnp_s::codec::ce128_129::{
     BlockRequest, BlockResponse, BoundaryNode, Direction, KeyValue, StateRequest, StateResponse,
@@ -226,6 +226,22 @@ pub enum SimFault {
     AcceptsOversizedPackage,
     /// Share a taken package with one co-guarantor instead of both.
     SharesWithOneCoGuarantor,
+    /// Share a package that imports segments with no mappings at all.
+    ///
+    /// The plausible defect: a node that fetched its own import segments
+    /// and never passed the resolution on. The co-guarantor it shared with
+    /// has the bundle and no way to check the segments in it against the
+    /// package they came from (`simple.md:412-415`).
+    SharesNoMapping,
+    /// Map some other package's hash, leaving this import unresolved.
+    SharesForeignMapping,
+    /// Map the right package to the wrong segments-root.
+    ///
+    /// Worse than sending nothing: a co-guarantor that trusts it fetches
+    /// the wrong segments and refines something else. `simple.md:444-446`
+    /// lets it trust them blindly, which is what makes a wrong one a
+    /// defect rather than a nuisance.
+    SharesWrongSegmentsRoot,
     /// Carry an assurance that should have been refused.
     ///
     /// About assurances the node *receives*, where the four above are about
@@ -389,6 +405,16 @@ pub struct SimNode {
     /// which is what every test but the not-a-guarantor one wants: there is
     /// one core in play and every package belongs to it.
     own_core: Mutex<Option<u16>>,
+    /// The segments-root mapping this node puts on a CE 134 share.
+    ///
+    /// A real guarantor derives this: it reads the import list, resolves
+    /// each work-package hash against its own chain state, and shares the
+    /// answer (`simple.md:412-415`). The stand-in has no chain state to
+    /// resolve against, so the test tells it -- the same bargain as
+    /// [`SimNode::refines_to`], and sound for the same reason. The row
+    /// grades whether the share carries the right pair, not how a node
+    /// arrived at it.
+    maps: Mutex<Option<(WorkPackageHash, [u8; 32])>>,
 }
 
 /// What a simulated guarantor distributes, and what it would take to get it
@@ -462,6 +488,7 @@ impl SimNode {
             guarantee: Mutex::new(None),
             own_core: Mutex::new(None),
             refines_to: Mutex::new(None),
+            maps: Mutex::new(None),
         }
     }
 
@@ -480,6 +507,16 @@ impl SimNode {
     /// Say which report hash this node answers a CE 134 share with.
     pub fn refines_to(&self, report_hash: [u8; 32]) {
         *self.refines_to.lock().expect("sim refines to") = Some(report_hash);
+    }
+
+    /// Say which work-package hash this node resolves, and to which
+    /// segments-root, when it shares a package that imports.
+    ///
+    /// Unset -- the default -- is a node that shares no mappings at all,
+    /// which is what every test that submits a package importing nothing
+    /// wants, and is also the honest answer for one.
+    pub fn maps(&self, package: WorkPackageHash, segments_root: [u8; 32]) {
+        *self.maps.lock().expect("sim maps") = Some((package, segments_root));
     }
 
     /// Say which core this node guarantees on, so it can tell a package
@@ -1260,10 +1297,11 @@ impl SimNode {
     /// Open CE 134 to the co-guarantors, as a guarantor does once it has
     /// taken a package (`simple.md:406-458`).
     ///
-    /// The mappings are empty, which is the truthful answer for a package
-    /// that imports no segments: they map the *import* list to the roots it
-    /// comes from. The harness's lane grades the mapping row only where a
-    /// node sent mappings at all, for the same reason.
+    /// The mappings carry whatever [`SimNode::maps`] was told, which is
+    /// nothing unless a test said otherwise: they map the *import* list to
+    /// the roots it comes from, so a package importing nothing correctly
+    /// maps nothing. The two mapping faults move that pair, one in its key
+    /// and one in its value.
     async fn share_package(&self) {
         let mut peers: Vec<u16> = self
             .sharing_peers
@@ -1273,10 +1311,26 @@ impl SimNode {
         if self.fault == SimFault::SharesWithOneCoGuarantor {
             peers.truncate(1);
         }
+        let mappings = match (*self.maps.lock().expect("sim maps"), self.fault) {
+            (_, SimFault::SharesNoMapping) | (None, _) => Vec::new(),
+            // A mapping for some other package: this import is left
+            // unresolved, and a co-guarantor that trusted it would have
+            // nothing to fetch.
+            (Some((_, root)), SimFault::SharesForeignMapping) => {
+                vec![(WorkPackageHash::from([0x9e; 32]), root)]
+            }
+            // The right package under the wrong root, which is worse than
+            // no mapping: a co-guarantor that trusts it fetches the wrong
+            // segments and refines something else.
+            (Some((package, _)), SimFault::SharesWrongSegmentsRoot) => {
+                vec![(package, [0x9f; 32])]
+            }
+            (Some(pair), _) => vec![pair],
+        };
         let context = ce131_136::SharingContext {
             core_index: 0,
             shard_count: jam_types::max_val_count(),
-            mappings: Vec::new(),
+            mappings,
         };
         let first = frame(CE134, &context.encode());
         let second = frame_message(

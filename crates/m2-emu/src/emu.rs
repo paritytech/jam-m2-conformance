@@ -1854,6 +1854,9 @@ mod tests {
             import_proofs: Vec::new(),
             co_guarantors: vec![2, 3],
             fault: None,
+            exports_root: [0u8; 32],
+            exports_count: 0,
+            imports_from: None,
         };
 
         let builder = net

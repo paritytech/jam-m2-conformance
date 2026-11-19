@@ -189,10 +189,10 @@ answers with the report's hash; three faults cost `n3_ce134_answered`,
 `n3_ce134_wrong_shard_count_refused` one row each.
 
 **Where that leaves the lanes.** Every row a node can cause in N3 and N4
-has now been seen to fail, except one that cannot be reached at all:
-`n3_ce134_shares_the_submitted_package` is gated on mappings, which map
-imported segments, and no package this harness builds imports any. §17 now
-lists four rows waiting on that one thing.
+has now been seen to fail. The last one out of reach was the CE 134 mapping
+row, which turned out to be asking for the wrong thing entirely -- the
+mappings name the package imported *from*, not the one being shared (§27).
+It is now `n3_ce134_maps_the_imported_package`, and four faults move it.
 
 So the *coverage* reason for keeping N3 and N4 opt-in is gone. What remains
 is a judgement: the two oversize rows are Hard against the reading §4

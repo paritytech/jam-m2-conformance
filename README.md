@@ -236,12 +236,15 @@ report's hash, and three faults -- refusing a well-formed share, naming the
 wrong hash, and taking a share coded for the wrong validator count -- each
 cost their own row.
 
-**Every row a node can cause in N3 and N4 has now been seen to fail**, with
-one exception that cannot be reached at all:
-`n3_ce134_shares_the_submitted_package` is gated on a share carrying
-mappings, mappings map *imported* segments, and no package this harness
-builds imports any (`findings.md` §17, which now lists four rows waiting on
-the same thing).
+**Every row a node can cause in N3 and N4 has now been seen to fail.** The
+last one that could not be reached was the CE 134 mapping row, and getting
+to it found the row itself was wrong: it asked that the mappings name the
+package being *shared*, when they name the package it *imports from*
+(`findings.md` §27). It is now `n3_ce134_maps_the_imported_package`, the
+run submits a package that imports a segment from an earlier one, and
+`m2-sim/tests/n3_ce134_mappings_sim_it.rs` passes the honest pair and fails
+three ways of getting it wrong -- including no mappings at all, which is the
+case the old gate made unreportable.
 
 So the coverage reason for keeping N3 and N4 out of the default set is
 gone, and what is left is a judgement rather than a gap: `n3_ce133_oversized_reset`

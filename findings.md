@@ -864,25 +864,14 @@ Opening the door immediately found §26 behind it: the row checking CE 140's
 justifications had been comparing against the wrong tree the whole time,
 and nothing could have noticed while no package exported anything.
 
-**Still waiting on the import half.**
-`n3_ce134_shares_the_submitted_package` needs a package that *imports*
-segments, so a share carries non-empty mappings. The exports exist now, so
-this is reachable: a later package importing the first one's segments. It
-is the last row in N3 or N4 that has never run against anything.
+**The import half, closed the same way.** The fourth row waiting on this
+was `n3_ce134_shares_the_submitted_package`, which grades the mappings on a
+share the node *sends*. It needed a package that imports segments, and the
+exports made one possible: the run now submits a last package whose work
+item imports segment 0 of the first one, naming it by work-package hash so
+the node has to resolve the hash to a segments-root and say so.
 
-**A fourth row has the same cause**, found 2026-11-18 while proving the CE
-134 receive rows. `n3_ce134_shares_the_submitted_package` grades the
-mappings on a share the node *sends* and is gated on those mappings being
-non-empty — deliberately, because a package with no imported segments
-correctly has none and a row written as "names it, or there were none"
-could not fail. Mappings map the **import** list to the roots it comes
-from, so the gate opens only for a package that imports segments, and no
-package this harness builds does. The row has therefore never run against
-anything, live or simulated, and is not counted among N3's proven rows.
-
-That makes four rows waiting on the same thing: CE 139, CE 140, CE 148 and
-this one. A work item that exports segments would let an later package
-import them and open all four at once.
+Opening that door found the row was asking for the wrong thing — §27.
 
 Related: §12, which is why the plan is mid-run at all.
 
@@ -1537,3 +1526,86 @@ which `simple.md:660` allows and the row records as Soft.
 Related: §23, also a row that could not pass, also found the first time
 anything reached it. §17, which had to be closed before this could be seen
 at all.
+
+---
+
+## 27. The CE 134 mapping row asked for a mapping no node can send — CLOSED 2026-11-19
+
+**Status:** found and fixed the same day, while building the importing
+package §17 was waiting on. A harness defect, in a row that had never run
+against anything.
+
+`n3_ce134_shares_the_submitted_package` graded the segments-root mappings
+on a share the node sends, and asked that they name **the package being
+shared**:
+
+```rust
+let names_it = share
+    .mappings
+    .iter()
+    .any(|(package, _)| package.0 == submitted.package_hash);
+```
+
+They never can. The mappings are `len++[Work-Package Hash ++
+Segments-Root]` (`simple.md:449`), and `simple.md:412-415` says what they
+are for: a guarantor may share a package only once "all import segments
+have been retrieved. Note that this will involve mapping any WP hashes in
+the import list to segments-roots." The mapping is the **import list's**
+resolution, carried to the co-guarantors so they can fetch the same
+segments and check the bundle against them.
+
+The package being shared cannot appear in it. Its own segments-root does
+not exist yet — producing it is the refining the share is asking for.
+
+polkajam agrees, and says so in one line: `collect_imports` builds the
+lookup from `RootIdentifier::Indirect(wph)` entries of the import list
+(`chain/logistics.rs:51`), and `guarantor.rs:244` puts exactly that
+`sr_lookup` into the sharing context.
+
+**Why nothing caught it.** The row was gated on the mappings being
+non-empty, and mappings are empty for a package that imports nothing,
+which was every package this harness built. The gate never opened, so the
+row never ran — against a live node or a simulated one. It was counted,
+correctly, as unproven (§17), and the unprovenness was read as "waiting
+for an arrangement" rather than "waiting to be found wrong".
+
+The gate also made the most plausible defect unreportable. A node that
+fetched its own import segments and never passed the resolution on sends
+*no* mappings — and a row that only looks at shares with mappings cannot
+fail that node.
+
+**The fix.** `n3_ce134_maps_the_imported_package`, in a check of its own
+(`n3_ce134_mappings`) because it is gated on something no other row needs:
+a submission that imports. The submission carries what it imported from,
+so the row compares against a known pair rather than against a shape:
+
+| | |
+|---|---|
+| the key | the hash of the package imported from |
+| the value | that package's `exports_root`, as the engine computed it |
+
+Both halves, because a node that sends the right key under the wrong root
+has resolved the import *wrongly*, and `simple.md:444-446` lets the
+receiving guarantor trust the mapping blindly — so a wrong one sends it to
+fetch the wrong segments.
+
+**Proven.** `m2-sim/tests/n3_ce134_mappings_sim_it.rs` passes the pair a
+conforming node sends and fails three ways of not sending it: no mappings
+at all, a mapping for some other package, and the right package under the
+wrong root. The positive is in the same arrangement as the negatives,
+because a row that is absent is not a row that passed — which is the whole
+of how this one survived.
+
+**And the run can now ask it.** The last submission of a run imports
+segment 0 of the first, by work-package hash. It is gated on the chain: a
+guarantor resolves that hash out of the packages its chain has seen
+(`state_db.rs:1309`), so until the guarantee for the exporting package is
+in a block the import names nothing — and a node asked too early does not
+refuse the submission, it takes it, fails to fetch, and never shares. That
+would read on the report as a node refusing to share a package it was
+given. So the builder checks first and skips rather than poses a question
+the node cannot answer, and the row says it was not exercised.
+
+Related: §18 and §23, also rows that could not pass a conforming node;
+§26, also found the first time anything reached it. Three of the four were
+invisible for the same reason — nothing had ever asked.

@@ -504,6 +504,12 @@ pub(crate) fn fabricated_run_ctx(
     const FAB_REPORT_HASH: [u8; 32] = [0x77; 32];
     const FAB_INCLUDED_HASH: [u8; 32] = [0x88; 32];
     const FAB_SHARED_HASH: [u8; 32] = [0x6b; 32];
+    // A package the fabricated submission imports a segment from, and the
+    // root its exports sit under. The baseline has to carry one: without an
+    // importing submission the mapping row reports itself unexercised, and
+    // the point of the baseline is that every row it has is graded.
+    const FAB_EXPORTER: [u8; 32] = [0x7e; 32];
+    const FAB_EXPORTS_ROOT: [u8; 32] = [0x7f; 32];
     let n3 = N3Ctx {
         nut_index: FAB_NUT_INDEX,
         // One over each submission protocol. CE 146 is graded by the same
@@ -523,6 +529,10 @@ pub(crate) fn fabricated_run_ctx(
                 reset_code: None,
                 fault: None,
                 co_guarantors: fab_co_guarantors.clone(),
+                imports_from: Some(m2_scenario::scenarios::n3::ImportedFrom {
+                    package_hash: FAB_EXPORTER,
+                    exports_root: FAB_EXPORTS_ROOT,
+                }),
             })
             .collect(),
         shares: fab_co_guarantors
@@ -532,9 +542,14 @@ pub(crate) fn fabricated_run_ctx(
                 peer: *peer,
                 core_index: 0,
                 shard_count: 6,
-                // No imported segments, so no mappings: the mapping row is
-                // absent rather than passing on a condition it cannot fail.
-                mappings: Vec::new(),
+                // The resolution the imported package needed: its hash to
+                // the root its exports sit under (`simple.md:449`). This is
+                // what a conforming node sends, so the baseline passes the
+                // mapping row rather than leaving it unexercised.
+                mappings: vec![(
+                    jam_types::WorkPackageHash::from(FAB_EXPORTER),
+                    FAB_EXPORTS_ROOT,
+                )],
                 bundle: Some(vec![0xab; 32]),
                 at_wall_ms: submitted_at + 200 * (i as u64 + 1),
             })

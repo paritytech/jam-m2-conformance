@@ -154,6 +154,30 @@ pub struct SubmittedPackage {
     /// submitted twice across a rotation boundary has two different answers,
     /// and a single per-run list would grade the second against the first.
     pub co_guarantors: Vec<u16>,
+    /// The earlier package this one imports a segment from, if any, and the
+    /// exports-root that package's report declared.
+    ///
+    /// `None` for a package that imports nothing, which is every submission
+    /// but one. CE 134's mappings map the *import* list to the roots it
+    /// comes from (`simple.md:449`), so this is the pair the node is
+    /// expected to send -- and without it the lane has nothing to compare a
+    /// mapping against.
+    pub imports_from: Option<ImportedFrom>,
+}
+
+/// The package a submission imports a segment from, and the root that
+/// package's report put its exports under.
+///
+/// Two hashes that are easy to swap, so they are named rather than paired.
+/// The lane compares both against what the node mapped: a node that sent
+/// the right key under the wrong root has resolved the import wrongly, and
+/// one that sent the wrong key has not resolved this import at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportedFrom {
+    /// GP hash of the exporting package: the key the mapping is under.
+    pub package_hash: [u8; 32],
+    /// Its `exports_root`, as the engine computed it: the value.
+    pub exports_root: [u8; 32],
 }
 
 /// A CE 134 share the harness opened to the NUT, and the answer it gave.
@@ -411,40 +435,6 @@ fn submission_check(ctx: &N3Ctx, protocol: u16) -> Check {
                             "the NUT never opened CE 134 to validator {co_guarantor}, which \
                              holds core {} with it; it reached {:?}",
                             submitted.core, reached
-                        )
-                    },
-                ));
-            }
-
-            // The share has to be of the package we sent. A node that shares
-            // something else has not failed to share, it has shared the wrong
-            // thing, and the two are different findings.
-            //
-            // Only where the node sent mappings at all. They map the *import*
-            // list's package hashes to segments-roots (`simple.md:449`), so a
-            // package with no imported segments correctly has none -- and a
-            // row written as "names it, or there were none" would be true
-            // whatever the node did, which is a check that cannot fail.
-            for share in answering.iter().filter(|s| !s.mappings.is_empty()) {
-                let names_it = share
-                    .mappings
-                    .iter()
-                    .any(|(package, _)| package.0 == submitted.package_hash);
-                results.push(log::check_detail(
-                    "n3_ce134_shares_the_submitted_package",
-                    names_it,
-                    Severity::Hard,
-                    || {
-                        format!(
-                            "the CE 134 to validator {} maps {:?}, none of which is the \
-                             submitted package {}",
-                            share.peer,
-                            share
-                                .mappings
-                                .iter()
-                                .map(|(p, _)| short(&p.0))
-                                .collect::<Vec<_>>(),
-                            short(&submitted.package_hash)
                         )
                     },
                 ));
@@ -824,11 +814,104 @@ pub fn n3_ce134_receive(ctx: &N3Ctx) -> Check {
     })
 }
 
+/// N3 — CE 134: the segments-root mappings on a share
+/// (`simple.md:412-415`, `simple.md:449`).
+///
+/// A guarantor may share a package only once "all import segments have been
+/// retrieved", and the spec adds that this "will involve mapping any WP
+/// hashes in the import list to segments-roots". Message 1 carries that
+/// mapping to the co-guarantors, who use it to fetch the same segments and
+/// to check the bundle against them.
+///
+/// So the mappings are about the package being *imported from*, not the
+/// package being shared. The package being shared has no exports-root until
+/// somebody refines it, which is the work the share is asking for. This row
+/// read it the other way round for as long as it existed and could not have
+/// passed a conforming node; nothing noticed, because no package the harness
+/// built imported anything, so the row never ran (`findings.md` §27).
+///
+/// A check of its own rather than a row inside the submission check,
+/// because it is gated on something no other row needs: a submission that
+/// imports. Its own control says so when a run has none, instead of the row
+/// quietly not appearing.
+pub fn n3_ce134_mappings(ctx: &N3Ctx) -> Check {
+    let ctx = ctx.clone();
+    check("n3_ce134_mappings", Severity::Hard, move |_obs| {
+        let importing: Vec<&SubmittedPackage> = ctx
+            .submissions
+            .iter()
+            .filter(|s| s.imports_from.is_some() && !s.refused)
+            .collect();
+        let control = Control::new(
+            "n3_ce134_imports_not_exercised",
+            "a package the NUT took that imports a segment from an earlier one",
+            !importing.is_empty(),
+        );
+        if !control.present() {
+            return vec![control.absent("n3_ce134_maps_the_imported_package")];
+        }
+
+        let mut results = Vec::new();
+        for submitted in importing {
+            let from = submitted
+                .imports_from
+                .expect("filtered to the submissions that import");
+            let answering = shares_answering(&ctx, submitted);
+            // A node that shared nothing at all is graded for that by
+            // `shares_with_both_co_guarantors`. Reporting it here too would
+            // count one defect twice -- but a run where the importing
+            // package was never shared has still not put this row to the
+            // node, and saying so is the difference between "no mappings"
+            // and "no question asked".
+            if answering.is_empty() {
+                results.push(
+                    Control::new(
+                        "n3_ce134_imports_not_exercised",
+                        "a CE 134 share of the package that imports",
+                        false,
+                    )
+                    .absent("n3_ce134_maps_the_imported_package"),
+                );
+                continue;
+            }
+            for share in answering {
+                let mapped = share
+                    .mappings
+                    .iter()
+                    .any(|(package, root)| {
+                        package.0 == from.package_hash && *root == from.exports_root
+                    });
+                results.push(log::check_detail(
+                    "n3_ce134_maps_the_imported_package",
+                    mapped,
+                    Severity::Hard,
+                    || {
+                        format!(
+                            "the CE 134 to validator {} maps {:?}, which does not resolve \
+                             the imported package {} to its exports-root {}",
+                            share.peer,
+                            share
+                                .mappings
+                                .iter()
+                                .map(|(p, root)| format!("{} -> {}", short(&p.0), short(root)))
+                                .collect::<Vec<_>>(),
+                            short(&from.package_hash),
+                            short(&from.exports_root)
+                        )
+                    },
+                ));
+            }
+        }
+        results
+    })
+}
+
 /// Every N3 check, in the order the lane reports them.
 pub fn all(ctx: &N3Ctx) -> Vec<Check> {
     vec![
         n3_ce133_submission(ctx),
         n3_ce146_submission(ctx),
+        n3_ce134_mappings(ctx),
         n3_ce134_receive(ctx),
         n3_ce135_distribution(ctx),
         n3_ce135_inclusion(ctx),
@@ -887,6 +970,7 @@ mod tests {
             reset_code: refused.then_some(0x0103),
             fault: None,
             co_guarantors: CO.to_vec(),
+            imports_from: None,
         }
     }
 
@@ -1483,29 +1567,120 @@ mod tests {
         );
     }
 
-    /// Mappings that name a different package are a share of the wrong thing.
+    /// The package a submission imports from, for the mapping rows.
+    const EXPORTER: [u8; 32] = [0x11; 32];
+    const EXPORTS_ROOT: [u8; 32] = [0x22; 32];
+
+    fn importing() -> SubmittedPackage {
+        SubmittedPackage {
+            imports_from: Some(ImportedFrom {
+                package_hash: EXPORTER,
+                exports_root: EXPORTS_ROOT,
+            }),
+            ..submission(false)
+        }
+    }
+
+    /// The honest mapping passes: the hash of the package imported from,
+    /// under the root its exports sit at.
+    ///
+    /// Here because the three negatives below are only worth something
+    /// against a positive that passes. The row grades the mappings of a
+    /// package that *imports*, so the value it wants names the exporting
+    /// package -- not the package being shared, which is what this row used
+    /// to ask for and no conforming node could ever have sent
+    /// (`findings.md` §27).
     #[test]
-    fn mappings_that_do_not_name_the_submitted_package_fail() {
-        let other = WorkPackageHash::from([0x11; 32]);
-        let results = run(&n3_ce133_submission(&ctx(
-            vec![submission(false)],
+    fn the_mapping_a_conforming_node_sends_passes() {
+        let results = run(&n3_ce134_mappings(&ctx(
+            vec![importing()],
             vec![
-                share(CO[0], SENT_AT + 10, vec![(other, [0x22; 32])]),
-                share(CO[1], SENT_AT + 20, Vec::new()),
+                share(
+                    CO[0],
+                    SENT_AT + 10,
+                    vec![(WorkPackageHash::from(EXPORTER), EXPORTS_ROOT)],
+                ),
+                share(
+                    CO[1],
+                    SENT_AT + 20,
+                    vec![(WorkPackageHash::from(EXPORTER), EXPORTS_ROOT)],
+                ),
             ],
+        )));
+        assert!(
+            !failed(
+                &results,
+                "n3_ce134_maps_the_imported_package",
+                Severity::Hard
+            ),
+            "got {:?}",
+            names(&results)
+        );
+        assert!(names(&results).contains(&"n3_ce134_maps_the_imported_package"));
+    }
+
+    /// A mapping keyed on some other package does not resolve this import.
+    #[test]
+    fn mappings_that_do_not_name_the_imported_package_fail() {
+        let results = run(&n3_ce134_mappings(&ctx(
+            vec![importing()],
+            vec![share(
+                CO[0],
+                SENT_AT + 10,
+                vec![(WorkPackageHash::from([0x99; 32]), EXPORTS_ROOT)],
+            )],
         )));
         assert!(failed(
             &results,
-            "n3_ce134_shares_the_submitted_package",
+            "n3_ce134_maps_the_imported_package",
             Severity::Hard
         ));
     }
 
-    /// A package with no imported segments has no mappings, and the row is
-    /// absent rather than passing on a condition it could never fail.
+    /// The right package under the wrong root is a resolution that is
+    /// wrong, not one that is missing -- and the row has to tell them apart,
+    /// because a receiving guarantor that trusts it fetches the wrong
+    /// segments.
     #[test]
-    fn no_mappings_means_the_mapping_row_is_not_reported() {
-        let results = run(&n3_ce133_submission(&ctx(
+    fn mappings_with_the_wrong_segments_root_fail() {
+        let results = run(&n3_ce134_mappings(&ctx(
+            vec![importing()],
+            vec![share(
+                CO[0],
+                SENT_AT + 10,
+                vec![(WorkPackageHash::from(EXPORTER), [0xee; 32])],
+            )],
+        )));
+        assert!(failed(
+            &results,
+            "n3_ce134_maps_the_imported_package",
+            Severity::Hard
+        ));
+    }
+
+    /// A share with no mappings at all fails a package that imports.
+    ///
+    /// The row used to be gated on the mappings being non-empty, which made
+    /// this exact case -- the one a node most plausibly gets wrong -- the
+    /// one case it could not report.
+    #[test]
+    fn no_mappings_at_all_fails_a_package_that_imports() {
+        let results = run(&n3_ce134_mappings(&ctx(
+            vec![importing()],
+            vec![share(CO[0], SENT_AT + 10, Vec::new())],
+        )));
+        assert!(failed(
+            &results,
+            "n3_ce134_maps_the_imported_package",
+            Severity::Hard
+        ));
+    }
+
+    /// A run where nothing imported says so, rather than leaving the row
+    /// out of the report altogether.
+    #[test]
+    fn a_run_with_no_importing_package_reports_the_row_unexercised() {
+        let results = run(&n3_ce134_mappings(&ctx(
             vec![submission(false)],
             vec![
                 share(CO[0], SENT_AT + 10, Vec::new()),
@@ -1513,10 +1688,15 @@ mod tests {
             ],
         )));
         assert!(
-            !names(&results).contains(&"n3_ce134_shares_the_submitted_package"),
+            !names(&results).contains(&"n3_ce134_maps_the_imported_package"),
             "got {:?}",
             names(&results)
         );
+        assert!(failed(
+            &results,
+            "n3_ce134_imports_not_exercised",
+            Severity::Soft
+        ));
     }
 
     /// Neither protocol can answer for the other.
