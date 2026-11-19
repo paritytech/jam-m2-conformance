@@ -82,12 +82,20 @@ fn a_session_runs_over_the_socket() {
             protocol_version: PROTOCOL_VERSION,
             polkajam_revision: String::new(),
             name: "test".into(),
+            codec: m2_oracle_proto::codec_probe(),
         }),
     );
     match reply {
         Message::PeerInfo(info) => {
             assert_eq!(info.protocol_version, PROTOCOL_VERSION);
             assert!(!info.polkajam_revision.is_empty());
+            // The probe crosses the socket intact: this is the oracle
+            // binary's own codec, answering from its own tree, which is the
+            // thing the client compares against (`findings.md` §7).
+            assert_eq!(
+                info.codec.disagreement(&m2_oracle_proto::codec_probe()),
+                None
+            );
         }
         other => panic!("expected PeerInfo, got {other:?}"),
     }

@@ -42,10 +42,14 @@ fn describe_panic(panic: &Box<dyn std::any::Any + Send>) -> String {
 
 fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
     match request {
+        // The probe is run here, in the oracle's own tree, against the
+        // codec this binary resolved -- which is the point of it
+        // (`findings.md` §7). The client compares and refuses.
         Message::PeerInfo(_) => Message::PeerInfo(PeerInfo {
             protocol_version: PROTOCOL_VERSION,
             polkajam_revision: POLKAJAM_REVISION.to_string(),
             name: "m2-oracle".to_string(),
+            codec: m2_oracle_proto::codec_probe(),
         }),
 
         Message::Open {
@@ -560,9 +564,7 @@ fn dispatch(sessions: &mut Sessions, request: Message) -> Message {
             let entries: Vec<_> = bundle_hashes
                 .iter()
                 .zip(segment_roots.iter())
-                .map(|(hash, root)| {
-                    jam_node::hazmat::merkle::pack_erasure_tree_entry(hash, root)
-                })
+                .map(|(hash, root)| jam_node::hazmat::merkle::pack_erasure_tree_entry(hash, root))
                 .collect();
             let (erasure_root, shard_proofs) =
                 jam_node::hazmat::merkle::merkle_proofs(&entries[..], entries.len());
@@ -1141,11 +1143,11 @@ mod tests {
         assert!(matches!(reply, Message::OracleFault(_)), "got {reply:?}");
     }
 
-    /// The handshake states the protocol version and the revision the
-    /// binary was built from, so a client can refuse an oracle that does
-    /// not match its node under test.
+    /// The handshake states the protocol version, the revision the binary
+    /// was built from, and what its own codec does, so a client can refuse
+    /// an oracle that does not match its node under test or its own codec.
     #[test]
-    fn the_handshake_names_its_revision() {
+    fn the_handshake_names_its_revision_and_its_codec() {
         let mut sessions = Sessions::default();
         let reply = answer(
             &mut sessions,
@@ -1153,6 +1155,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 polkajam_revision: String::new(),
                 name: "client".into(),
+                codec: m2_oracle_proto::codec_probe(),
             }),
         );
         match reply {
@@ -1164,6 +1167,16 @@ mod tests {
                     "the build must record a real revision, got {:?}",
                     info.polkajam_revision
                 );
+                // Run in *this* tree, against the codec this binary
+                // resolved. The comparison that matters is against the
+                // harness's build and happens on the client; what this
+                // asserts is that the oracle answers with a real probe
+                // rather than an empty one (`findings.md` §7).
+                assert_eq!(
+                    info.codec.disagreement(&m2_oracle_proto::codec_probe()),
+                    None
+                );
+                assert!(!info.codec.decodes.is_empty() && !info.codec.encodings.is_empty());
             }
             other => panic!("expected PeerInfo, got {other:?}"),
         }

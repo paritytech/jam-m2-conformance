@@ -157,11 +157,26 @@ impl Oracle {
             request_nanos: AtomicU64::new(0),
         });
 
-        let reply = oracle.request(Message::PeerInfo(PeerInfo {
-            protocol_version: PROTOCOL_VERSION,
-            polkajam_revision: String::new(),
-            name: "m2-reference".to_string(),
-        }))?;
+        let ours = m2_oracle_proto::codec_probe();
+        let reply = oracle
+            .request(Message::PeerInfo(PeerInfo {
+                protocol_version: PROTOCOL_VERSION,
+                polkajam_revision: String::new(),
+                name: "m2-reference".to_string(),
+                codec: ours.clone(),
+            }))
+            // A handshake that will not decode is almost always an oracle
+            // binary older than this build: the version check cannot report
+            // it, because reading the version is what failed. Said here
+            // rather than on every request, where a decode failure means
+            // something else entirely.
+            .map_err(|e| {
+                ChainError::Oracle(format!(
+                    "{e}\n\nAn oracle built before protocol {PROTOCOL_VERSION} answers a \
+                     handshake this build cannot read. Rebuild both from one checkout:\n\n    \
+                     ./scripts/prepare-nut.sh\n"
+                ))
+            })?;
         let info = match reply {
             Message::PeerInfo(info) => info,
             other => {
@@ -175,6 +190,20 @@ impl Oracle {
                 "the oracle speaks protocol {} and this build speaks {PROTOCOL_VERSION}. \
                  Rebuild both from one checkout.",
                 info.protocol_version
+            )));
+        }
+        // Two cargo trees, two lockfiles, one caret requirement: they have
+        // resolved differently before, and the symptom was this side
+        // accepting a non-canonical length the node under test rejects, with
+        // no error anywhere (`findings.md` §7). Refusing to start is the
+        // whole point -- a run on disagreeing codecs produces verdicts, and
+        // the verdicts are what would be wrong.
+        if let Some(how) = ours.disagreement(&info.codec) {
+            return Err(ChainError::Oracle(format!(
+                "the oracle's codec and this build's do not agree -- {how}. They are \
+                 separate cargo trees asking for `jam-codec` by a caret requirement, so \
+                 they can resolve differently: compare `cargo tree -p jam-codec` here \
+                 with the same in `oracle/`, pin both to one version, and rebuild both."
             )));
         }
 

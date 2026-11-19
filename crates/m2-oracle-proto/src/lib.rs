@@ -30,7 +30,7 @@ use codec::{Decode, Encode};
 /// Bumped whenever a message changes shape. The client refuses a mismatch
 /// rather than guessing, because a silently misread response is a wrong
 /// conformance verdict rather than an error.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Largest frame either side will read, matching the fuzz protocol's.
 pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
@@ -655,6 +655,146 @@ pub struct PeerInfo {
     /// refuse an oracle that does not match the node under test.
     pub polkajam_revision: String,
     pub name: String,
+    /// What the sender's own codec does with [`PROBE_VALUES`] and
+    /// [`PROBE_CANARIES`], so the two sides can refuse to run on codecs that
+    /// disagree. See [`CodecProbe`].
+    pub codec: CodecProbe,
+}
+
+/// Values each side encodes, to be compared byte for byte.
+///
+/// Compact integers, because that is where the two sides can differ without
+/// differing anywhere else: every length prefix in every message on this
+/// socket is one. The boundaries of each encoding width, and one either
+/// side.
+pub const PROBE_VALUES: [u64; 10] = [
+    0,
+    1,
+    63,
+    64,
+    16_383,
+    16_384,
+    1 << 30,
+    1 << 40,
+    u32::MAX as u64,
+    u64::MAX,
+];
+
+/// Inputs each side decodes, to be compared outcome for outcome.
+///
+/// The first is canonical and every codec takes it. The next three are the
+/// inputs that actually split `jam-codec` 0.1.1 from 0.1.2 (`findings.md`
+/// §7): a compact integer written in more bytes than it needs. 0.1.1 takes
+/// them, 0.1.2 refuses them, and the harness that takes them is laxer than
+/// the node it grades. The last is truncated -- its prefix promises two
+/// more bytes than it carries -- and is here so the probe has a case both
+/// versions refuse: a probe whose every canary discriminates cannot tell a
+/// codec that disagrees from one that refuses everything.
+pub const PROBE_CANARIES: [&[u8]; 5] = [
+    &[0x00],
+    &[0x80, 0x00],
+    &[0xc0, 0x00, 0x00, 0x00],
+    &[0x80, 0x01],
+    &[0xfc],
+];
+
+/// What one build's codec does with [`PROBE_VALUES`] and [`PROBE_CANARIES`].
+///
+/// The harness and the oracle are separate cargo trees with separate
+/// lockfiles, and both ask for `jam-codec` by a caret requirement. They have
+/// already resolved differently once, silently, and the symptom was that
+/// this side accepted a non-canonical length the node under test rejects
+/// (`findings.md` §7).
+///
+/// A version string would be the obvious guard and is the weaker one: it
+/// compares the label rather than the behaviour, and two builds can carry
+/// one number and act differently -- a patched copy, a different feature
+/// set. This crate is compiled once in each tree, against each tree's own
+/// codec, so running the same probe in both asks the question that matters.
+///
+/// The probe cannot be defeated by the divergence it looks for. Encoding is
+/// what puts this message on the wire, and a side that encoded lengths
+/// differently would produce a frame the other could not decode at all --
+/// which the handshake already reports, as a malformed reply.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq, Default)]
+pub struct CodecProbe {
+    /// `Compact` encodings of [`PROBE_VALUES`], in order.
+    pub encodings: Vec<Vec<u8>>,
+    /// Whether each of [`PROBE_CANARIES`] decoded, in order.
+    pub decodes: Vec<bool>,
+}
+
+/// Run the probe against *this* build's codec.
+pub fn codec_probe() -> CodecProbe {
+    CodecProbe {
+        encodings: PROBE_VALUES
+            .iter()
+            .map(|value| codec::Compact(*value).encode())
+            .collect(),
+        decodes: PROBE_CANARIES
+            .iter()
+            .map(|input| codec::Compact::<u64>::decode(&mut &input[..]).is_ok())
+            .collect(),
+    }
+}
+
+impl CodecProbe {
+    /// How this probe differs from `other`, or `None` if they agree.
+    ///
+    /// Names the input rather than reporting a bare mismatch: the two sides
+    /// are different builds in different trees, and "they disagree" sends
+    /// whoever reads it looking for which disagreement.
+    pub fn disagreement(&self, other: &Self) -> Option<String> {
+        for (index, value) in PROBE_VALUES.iter().enumerate() {
+            let (ours, theirs) = (self.encodings.get(index), other.encodings.get(index));
+            if ours != theirs {
+                return Some(format!(
+                    "encoding {value}: this build writes {}, the other writes {}",
+                    opt_hex(ours),
+                    opt_hex(theirs)
+                ));
+            }
+        }
+        for (index, input) in PROBE_CANARIES.iter().enumerate() {
+            let (ours, theirs) = (self.decodes.get(index), other.decodes.get(index));
+            if ours != theirs {
+                return Some(format!(
+                    "decoding {}: this build {}, the other {}",
+                    hex(input),
+                    took(ours),
+                    took(theirs)
+                ));
+            }
+        }
+        // Lengths beyond what the constants cover: one side was built with a
+        // longer probe, which means the two are not the same source.
+        (self.encodings.len() != other.encodings.len() || self.decodes.len() != other.decodes.len())
+            .then(|| {
+                format!(
+                    "probe size: this build ran {}/{}, the other {}/{}",
+                    self.encodings.len(),
+                    self.decodes.len(),
+                    other.encodings.len(),
+                    other.decodes.len()
+                )
+            })
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn opt_hex(bytes: Option<&Vec<u8>>) -> String {
+    bytes.map_or_else(|| "nothing".to_string(), |b| hex(b))
+}
+
+fn took(decoded: Option<&bool>) -> &'static str {
+    match decoded {
+        Some(true) => "accepts it",
+        Some(false) => "refuses it",
+        None => "did not probe it",
+    }
 }
 
 /// Frame a message: `[len: u32 LE] ++ [body]`.
@@ -726,6 +866,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 polkajam_revision: "e3d216c2".into(),
                 name: "m2-oracle".into(),
+                codec: codec_probe(),
             }),
             Message::ImportBlock(vec![0x01; 16]),
             Message::GetState([0x22; 32]),
@@ -981,6 +1122,76 @@ mod tests {
 
     /// The tags the fuzz protocol already defines keep their meaning, so a
     /// reader of one does not mistake a message of the other.
+    /// The probe run against one build agrees with itself, so a matching
+    /// pair starts.
+    #[test]
+    fn a_build_agrees_with_itself() {
+        let probe = codec_probe();
+        assert_eq!(probe.disagreement(&codec_probe()), None);
+    }
+
+    /// What this build's codec actually does, written down.
+    ///
+    /// `jam-codec` 0.1.1 took all three non-canonical canaries and 0.1.2
+    /// refuses them (`findings.md` §7). Pinning the answer here means a
+    /// re-pin that moves it fails this test rather than silently changing
+    /// what the guard compares -- and if the harness is ever the lax one
+    /// again, this is where it shows.
+    #[test]
+    fn the_canaries_are_refused_by_this_builds_codec() {
+        let probe = codec_probe();
+        assert_eq!(
+            probe.decodes,
+            vec![true, false, false, false, false],
+            "canonical taken, the three non-canonical ones refused, the truncated one refused"
+        );
+    }
+
+    /// The case the guard exists for: the other side takes a compact integer
+    /// written in more bytes than it needs, and this one does not.
+    #[test]
+    fn a_laxer_codec_is_named_by_the_input_it_took() {
+        let ours = codec_probe();
+        let mut lax = ours.clone();
+        lax.decodes[1] = true;
+        let how = ours.disagreement(&lax).expect("the probes disagree");
+        assert!(
+            how.contains("8000") && how.contains("refuses it") && how.contains("accepts it"),
+            "the message names the input and both answers: {how}"
+        );
+    }
+
+    /// Encoding was identical across both versions §7 compared, so a
+    /// divergence there is the one nobody has seen. It is still graded,
+    /// because a guard that only looks where the last bug was is a guard
+    /// for the last bug.
+    #[test]
+    fn a_differently_encoding_codec_is_named_by_the_value() {
+        let ours = codec_probe();
+        let mut odd = ours.clone();
+        odd.encodings[4] = vec![0xff];
+        let how = ours.disagreement(&odd).expect("the probes disagree");
+        assert!(
+            how.contains("encoding 16383"),
+            "the message names the value: {how}"
+        );
+    }
+
+    /// A probe from a build with a different canary set is not a probe this
+    /// one can compare, and saying so beats comparing what overlaps.
+    #[test]
+    fn a_shorter_probe_is_reported_rather_than_passed() {
+        let ours = codec_probe();
+        let truncated = CodecProbe {
+            encodings: ours.encodings[..3].to_vec(),
+            decodes: ours.decodes.clone(),
+        };
+        let how = ours
+            .disagreement(&truncated)
+            .expect("a shorter probe disagrees");
+        assert!(how.contains("encoding"), "{how}");
+    }
+
     #[test]
     fn the_fuzz_protocol_tags_are_unchanged() {
         for (message, tag) in [
@@ -989,6 +1200,7 @@ mod tests {
                     protocol_version: 1,
                     polkajam_revision: String::new(),
                     name: String::new(),
+                    codec: CodecProbe::default(),
                 }),
                 0u8,
             ),

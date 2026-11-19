@@ -387,6 +387,15 @@ from one revision, read from `oracle/Cargo.toml`; the oracle reports that revisi
 handshake and `--revision`, and the script refuses to finish if the binary disagrees with the
 pin.
 
+**The same-codec rule.** The two are also separate cargo trees with separate lockfiles, both
+asking for `jam-codec` by a caret requirement, and they have resolved differently once already --
+the harness ending up laxer than the node it grades, with no error anywhere (`findings.md` §7).
+So the handshake carries a probe: each side encodes a fixed set of compact integers and decodes a
+fixed set of canaries *with its own codec*, and the client refuses an oracle whose answers differ.
+Behaviour rather than a version string, because two builds can carry one number and act
+differently, and because `m2-oracle-proto` is compiled once in each tree, which makes one source
+run in both places.
+
 **What the protocol crate is for.** `m2-oracle-proto` holds the messages and, more importantly,
 every rule both sides must compute identically. Two defects found while building this were each
 a second implementation of a rule that already existed on the other side -- a `proxy_index` that

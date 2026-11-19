@@ -228,6 +228,14 @@ grades it are the same build:
 export PATH="$PWD/third_party/bin:$PATH"
 ```
 
+Two trees also mean two lockfiles, and both ask for `jam-codec` -- the codec
+on the socket between them -- by a caret requirement. They resolved
+differently once, and the harness ended up accepting a non-canonical length
+the node under test rejects, with no error anywhere (`findings.md` §7). The
+handshake now carries a probe of what each side's own codec does, and the
+client refuses an oracle whose answers differ, naming the input they
+disagree about.
+
 `third_party/` is gitignored. The harness's own networking (`jamnp-s`) is an
 independent implementation.
 

@@ -304,6 +304,49 @@ not yet written up", is not an N2 defect: the node had closed the
 connection to that peer, so there was nothing there to reach.
 
 
+### After PR #23: the two sides of the oracle socket must agree on a codec, 2026-11-19
+
+**§7 closed.** The harness and the oracle are separate cargo trees with
+separate lockfiles, and both ask for `jam-codec` -- the codec on the socket
+between them -- by a caret requirement. They resolved differently once, and
+the harness ended up accepting a non-canonical compact length that the node
+under test rejects: laxer than the thing it grades, on every length prefix
+on the wire, with no error anywhere. Both are pinned to 0.1.2 now, and until
+this nothing checked that they still agree.
+
+**Behaviour, not a version string.** §7 proposed reading each resolved
+version out of its own `Cargo.lock` in a `build.rs` and comparing the two.
+What was built compares what the codecs *do*: `codec_probe()` encodes ten
+compact integers at the width boundaries and decodes five canaries, and the
+handshake carries the answers. `m2-oracle-proto` is compiled once in each
+tree against that tree's own codec, so one source runs in both places. A
+version is a label, and two builds can carry one number and act differently.
+
+Three canaries are the inputs that actually split 0.1.1 from 0.1.2, measured
+against the published crates rather than assumed; a fourth is canonical and
+a fifth is truncated, so the probe has cases both versions agree on -- a
+probe whose every canary discriminates cannot tell a codec that disagrees
+from one that refuses everything.
+
+**Seen to fire.** `crates/m2-reference/tests/oracle_handshake_it.rs` stands a
+fake oracle on a unix socket and drives the refusal through
+`Oracle::connect`, with the lax probe set to 0.1.1's measured answers, plus a
+control where the codecs agree and the connection is accepted. The
+protocol-version guard, which had also never been driven over a socket, is
+tested there too.
+
+**`PROTOCOL_VERSION` is 9**, because `PeerInfo` changed shape. An oracle
+binary older than that cannot report itself as a version mismatch -- reading
+the version is what fails -- so the handshake names the likely cause and the
+command that fixes it. **Anyone pulling this runs `./scripts/prepare-nut.sh`
+once.**
+
+**Found while there.** The oracle tree is outside the workspace, so
+`cargo fmt --all` and `cargo clippy --workspace` never reached it, and it had
+drifted. Formatted, and §6's reproduction commands now include
+`(cd oracle && cargo test && cargo fmt --check)`.
+
+
 ## Milestone ladder
 
 | Milestone | Lanes | Coverage | Status |
@@ -436,7 +479,7 @@ Result: the node accepts every ticket the emulator offers. `invalid ticket signa
 |---|---|
 | Crates | 6 (`jamnp-s`, `m2-reference`, `m2-emu`, `m2-scenario`, `m2-runner`, `m2-sim`) |
 | Rust | 36.4k lines under `crates/*/src`, 41.3k with the integration tests; 549 test functions |
-| `cargo test --workspace` | **549 passed / 0 failed** |
+| `cargo test --workspace` | **558 passed / 0 failed** (plus 19 in the oracle tree) |
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets` | 3 warnings, all pre-existing |
 | Dry-run baseline | exits 0 — the harness's own expectations are satisfiable |
@@ -1305,9 +1348,12 @@ have been failed for it.
 ./scripts/prepare-nut.sh
 
 # Harness checks.
-cargo test --workspace            # 432 passed / 0 failed
+cargo test --workspace            # 558 passed / 0 failed
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
+
+# The oracle is a separate tree, so none of the above reaches it.
+(cd oracle && cargo test && cargo fmt --check)
 
 # Dry-run baseline: exit 0.
 cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/m2-dry
