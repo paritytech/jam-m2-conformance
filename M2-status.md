@@ -189,15 +189,70 @@ answers with the report's hash; three faults cost `n3_ce134_answered`,
 `n3_ce134_wrong_shard_count_refused` one row each.
 
 **Where that leaves the lanes.** Every row a node can cause in N3 and N4
-has now been seen to fail. The last one out of reach was the CE 134 mapping
-row, which turned out to be asking for the wrong thing entirely -- the
-mappings name the package imported *from*, not the one being shared (§27).
-It is now `n3_ce134_maps_the_imported_package`, and four faults move it.
+has now been seen to fail, except one that cannot be reached at all:
+`n3_ce134_shares_the_submitted_package` is gated on mappings, which map
+imported segments, and no package this harness builds imports any. §17 now
+lists four rows waiting on that one thing.
 
 So the *coverage* reason for keeping N3 and N4 opt-in is gone. What remains
 is a judgement: the two oversize rows are Hard against the reading §4
 records as unsettled, and defaulting these lanes would fail a third-party
 node on a **should**.
+
+### After PR #18: the segment protocols reach a node, 2026-11-19
+
+**§17 closed.** The dev bootstrap service was never the blocker. It reads
+its payload as an encoded `Instructions` and carries an `Export { data }`
+instruction, so the honest submission now exports four segments and a live
+run asks for them. `sessions/n4-exports-3`: CE 139 and CE 140 answer and
+verify five of five, and CE 148 is declined, which `simple.md:660` allows
+and the row records as Soft. All three segment protocols have now been put
+to a real node.
+
+**§26, found the moment that door opened.** `n4_ce140_justifications_verify`
+failed five of five against a node serving correctly, because the check
+compared each proof against the size of the *request* rather than the tree
+it proves against. Which number was right took two live runs: it is the
+exports **plus their import-proof pages**, one per 64, appended before the
+set is erasure-coded. `n4_sim_it` now holds four segments and asks for two,
+and fails all five rows without the fix.
+
+The simulated node could not have found this. It held two segments and
+asked for both, so the two numbers were the same in every arrangement it
+could make — a test that supplies both sides of an equation cannot discover
+the equation is wrong.
+
+**§27, found the same way one step further on.** The last row out of reach
+was the CE 134 mapping row, and reaching it showed the row was wrong:
+`n3_ce134_shares_the_submitted_package` asked that the mappings name the
+package being *shared*, when they name the package it *imports from*. No
+conforming node could have passed it, and nothing noticed because the gate
+— mappings must be non-empty — never opened. That gate also made the
+likeliest defect unreportable: a node that resolves its own imports and
+never passes the resolution on sends no mappings at all.
+
+It is now `n3_ce134_maps_the_imported_package`, in a check of its own with
+its own control, grading both halves of the pair. A run submits a package
+importing segment 0 of the first by work-package hash, gated on the
+guarantee for that package having reached a block.
+`n3_ce134_mappings_sim_it` passes the honest pair and fails three ways of
+not sending it. Live (`sessions/n3-imports-1`): accepted, shared with both
+co-guarantors, both shares carrying the right mapping, HARD PASS twice.
+
+**Where that leaves the lanes.** Every row a node can cause in N3 and N4
+has now been seen to fail, and every one of them has now run against the
+real node. The coverage reason for keeping the lanes opt-in is gone twice
+over; what remains is the §4 judgement, unchanged.
+
+**Two things found while tidying.** `prepare-nut.sh`'s pin-agreement check
+looked for `jam-node` in the workspace manifest, which has never had one,
+so it read an empty string and could not fire; it now checks every
+polkajam dependency against the oracle's revision. And §28: the harness
+reads `simple.md` at a96dc6b (2026-09-02) and upstream is at aa0e2b8
+(2026-10-26), with CE 144 and CE 145 rewritten — which is to say **DESIGN's
+N5 plan specifies a wire format the spec has replaced**, before a line of
+N5 is written.
+
 
 ## Milestone ladder
 
