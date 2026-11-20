@@ -21,7 +21,8 @@ use jamnp_s::{
     codec::up0::{Announcement, Final, Handshake},
     endpoint::{EndpointConfig, EndpointError},
     framing::{
-        frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE134, CE135, CE141, UP,
+        frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE134, CE135, CE141, CE142,
+        UP,
     },
     trace::{mono_ts, wall_ts, Direction as TraceDir, Trace, TraceRecord},
     transport::{
@@ -133,6 +134,11 @@ pub struct Emulator {
     /// lane, which has the anchor and the reported cores to judge against.
     assurances_seen: Arc<Mutex<Vec<crate::avail_io::RawAssurance>>>,
     connection_ends: Arc<Mutex<Vec<ConnectionEnded>>>,
+    solicit_package: Arc<Mutex<Option<[u8; 32]>>>,
+    preimage_solicited: Arc<Mutex<bool>>,
+    preimages_announced: Arc<Mutex<Vec<m2_scenario::scenarios::n6::AnnouncedPreimage>>>,
+    preimage_requests: Arc<Mutex<Vec<m2_scenario::scenarios::n6::PreimageRequested>>>,
+    nut_announced_preimages: m2_scenario::scenarios::n6::HeardAnnouncements,
     sync_probe_pending: Arc<AtomicBool>,
     /// Highest finalized slot the NUT has advertised over UP 0; see
     /// [`EmuShared::nut_final_slot`].
@@ -268,6 +274,14 @@ pub struct EmuShared {
     /// node defects. This is the one record that puts them back together
     /// (`findings.md` §29, §30).
     pub connection_ends: Arc<Mutex<Vec<ConnectionEnded>>>,
+    /// The package carrying N6's `Solicit`, once the builder has composed it.
+    pub solicit_package: Arc<Mutex<Option<[u8; 32]>>>,
+    /// Whether a block was seen to carry that package.
+    pub preimage_solicited: Arc<Mutex<bool>>,
+    pub preimages_announced: Arc<Mutex<Vec<m2_scenario::scenarios::n6::AnnouncedPreimage>>>,
+    pub preimage_requests: Arc<Mutex<Vec<m2_scenario::scenarios::n6::PreimageRequested>>>,
+    /// CE 142 announcements the NUT made, by the peer that heard each one.
+    pub nut_announced_preimages: m2_scenario::scenarios::n6::HeardAnnouncements,
     /// Cleared by whichever connection runs the sync probes, so they run once
     /// per run rather than once per peer.
     pub sync_probe_pending: Arc<AtomicBool>,
@@ -447,6 +461,11 @@ impl Emulator {
             reports_seen: Arc::new(Mutex::new(Vec::new())),
             assurances_seen: Arc::new(Mutex::new(Vec::new())),
             connection_ends: Arc::new(Mutex::new(Vec::new())),
+            solicit_package: Arc::new(Mutex::new(None)),
+            preimage_solicited: Arc::new(Mutex::new(false)),
+            preimages_announced: Arc::new(Mutex::new(Vec::new())),
+            preimage_requests: Arc::new(Mutex::new(Vec::new())),
+            nut_announced_preimages: Arc::new(Mutex::new(Vec::new())),
             sync_probe_pending: Arc::new(AtomicBool::new(true)),
             nut_final_slot: Arc::new(AtomicU32::new(NO_ADVERTISED_FINAL)),
             announce: broadcast::Sender::new(ANNOUNCE_BUFFER),
@@ -632,6 +651,11 @@ impl Emulator {
             reports_seen: Arc::clone(&self.reports_seen),
             assurances_seen: Arc::clone(&self.assurances_seen),
             connection_ends: Arc::clone(&self.connection_ends),
+            solicit_package: Arc::clone(&self.solicit_package),
+            preimage_solicited: Arc::clone(&self.preimage_solicited),
+            preimages_announced: Arc::clone(&self.preimages_announced),
+            preimage_requests: Arc::clone(&self.preimage_requests),
+            nut_announced_preimages: Arc::clone(&self.nut_announced_preimages),
             sync_probe_pending: Arc::clone(&self.sync_probe_pending),
             nut_final_slot: Arc::clone(&self.nut_final_slot),
         }
@@ -1354,6 +1378,18 @@ async fn handle_stream(
                 &shared.assurances_seen,
             );
         }
+        // The NUT gossiping a preimage it obtained to its grid neighbours
+        // (`simple.md:712-713`). Recorded per peer, because the row grades
+        // *which* neighbours heard it and not merely that something was
+        // announced.
+        CE142 => {
+            crate::preimage_io::handle_inbound_announcement(
+                &content,
+                peer_index,
+                obs,
+                &shared.nut_announced_preimages,
+            );
+        }
         // Spec-known kinds outside this subset: reset rather than drop, so the
         // refusal is observable to the NUT (DESIGN.md `:477`).
         _ => refuse(&mut send, &mut reader),
@@ -1705,7 +1741,7 @@ pub(crate) fn trace_record(
 }
 
 /// Lock a shared mutex, recovering from poisoning (emulator code never panics).
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

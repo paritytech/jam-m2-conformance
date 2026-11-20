@@ -30,7 +30,7 @@ implementation state.
 | `m2-reference` | Client of the reference oracle: `RefChain` (tiny 6-validator chain, deterministic authoring of emulated slots), NUT-block import + state diff (`import.rs`/`state.rs`), ticket generation/planning/verification (`tickets.rs`), work packages and guaranteed reports (`reports.rs`), erasure-coded bundles and segment justifications (`availability.rs`). Holds a connection and a session id; the engine itself is in `oracle/`. |
 | `oracle/` | **Outside the workspace.** The reference engine, behind a unix socket: the one crate that depends on polkajam's `jam-node` and its `hazmat` feature. Built by `scripts/prepare-nut.sh` from the same revision as the node under test, which is what makes its answers a standard to grade that node by. |
 | `m2-emu` | Five emulated validators (skeletons — no core logic; all values/decisions injected from `m2-reference`): UP 0 announce, CE 128/129 serve, NUT-block fetch (N1), CE 131/132 ticket send/receive (N2), CE 133/146 submission and CE 134/135 share and report receive (N3), CE 137–140 and CE 148 fetch with CE 141 assurances (N4). |
-| `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `n0.rs` (9 checks), `n1.rs` (6), `n2.rs` (7), `n3.rs` (6), `n4.rs` (6). A check reports one row per thing it graded, so a run's row count is far larger than its check count. |
+| `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `n0.rs` (10 checks), `n1.rs` (6), `n2.rs` (7), `n3.rs` (6), `n4.rs` (6), `n6.rs` (3). A check reports one row per thing it graded, so a run's row count is far larger than its check count. |
 | `m2-runner` | CLI: keygen → spec → NUT launch (docker/polkajam presets) → connectivity → scenario (N0–N4) → `report.md`/`findings.json`/trace → exit code. |
 | `m2-sim` | A simulated node the harness can grade in-process: honest, or broken in one named way, so a check can be shown to fail when it should. |
 
@@ -59,7 +59,8 @@ CLI: `--seed` (run seed), `--validator-index` (default 5 — index 0 is degenera
 preferred-initiator rule), `--base-port`, `--preset` (`polkajam`/`docker`/`mock`),
 `--session-dir`, `--startup-timeout`, `--observe-secs` (observation window),
 `--lanes` (which lanes to grade, default `n0,n1,n2`; a lane left out is neither graded nor
-exercised, and `--lanes n0` skips ticket proving entirely), `--dry-run`.
+exercised, and `--lanes n0` skips ticket proving entirely), `--dry-run`. N3, N4 and N6 are
+opt-in by name: `--lanes n0,n1,n2,n3,n4,n6`.
 
 ## Real-surface results vs polkajam-as-NUT (2026-11)
 
@@ -68,8 +69,8 @@ report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,jso
 `M2-status.md` records the milestone evidence in full, and how to point the suite at a
 third-party node.
 
-Latest run, `sessions/ce134-3`, all five lanes over a 180 s window: **464 rows, three
-hard findings.** None of the three is the harness's:
+Latest run, `sessions/n6-5`, all six lanes over a 300 s window: **592 rows, three hard
+findings.** None of the three is the harness's:
 
 | row | what it is |
 |---|---|
@@ -272,7 +273,7 @@ and pins `PvmBackend::Interpreter`.
 | P0 | `jamnp-s`, runner skeleton, N0 | ✅ implemented |
 | P1 | `m2-reference` (now an oracle client), N1 authoring, N2 tickets | ✅ implemented |
 | P2 | N3 guaranteeing, N4 availability | ✅ implemented — graded by name (`--lanes n0,n1,n2,n3,n4`), not by default; see below |
-| P3 | N5 auditing/disputes, N6 preimages | ⏳ — N5's wire format re-specified 2026-11-20 against the current spec, and the CE 144/145 codecs rewritten with it (`findings.md` §28); no lane yet |
+| P3 | N5 auditing/disputes, N6 preimages | ◑ — **N6 implemented** 2026-11-20 and passing against polkajam. N5's wire format re-specified against the current spec and its codecs rewritten (`findings.md` §28); no N5 lane yet |
 | P4 | N7 adversarial, index rotation, IPv6, web UI | ⏳ |
 
 **Why N3 and N4 are not in the default lane set.** A check nobody has seen

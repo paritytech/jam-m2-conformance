@@ -558,6 +558,94 @@ Two lessons, both in §28:
 is untouched since 2026-03-22, so it is still unanswered at HEAD.
 
 
+### After PR #28: N6 is a running lane, 2026-11-20
+
+**P3's smaller half is implemented and passing** (`sessions/n6-4`, 541 rows
+over 240 s, six lanes). The same three hard findings as before, all node-side.
+
+**The lane's hard part was never the wire.** `simple.md:705-707` makes the
+node's duty conditional -- it follows up an announcement "provided the
+preimage has been requested on chain by the given service" -- and polkajam
+enforces it exactly: `note_preimage` returns `NotRequested` otherwise. So
+the run has to get a `Solicit` accumulated before it says anything. The dev
+bootstrap service takes one, the same way `Export` already serves §17.
+
+**N6 is the only lane that speaks as an ordinary peer.** polkajam's
+`as_val_from_ordinary[PreimageAnnouncement]` is unlimited while
+`as_val_from_non_neighbor[PreimageAnnouncement]` is disallowed, so an
+announcement from a validator the NUT does not neighbour is refused on the
+peer class alone. And the announcer cannot send and leave: CE 142 and CE 143
+run in opposite directions on one connection, so it holds for the ten
+seconds `:708` names and serves whatever the node opens.
+
+**Three live runs, three harness defects, and the node right every time.**
+
+| run | what failed | what it was |
+|---|---|---|
+| `n6-1` | no announcement at all | the solicit package's hash was never recorded: a field declared and nothing written to it |
+| `n6-2` | the node ignored the announcement | the solicit was on its own submission, which is never accumulated (§31). No service had asked for anything, so ignoring it was correct |
+| `n6-3` | inclusion unexercised | the NUT authored no block after the announcement. The control working, not a defect -- `n6-4` authored one and the row passes |
+
+Every one of those reported itself as unexercised or named the node's
+correct behaviour. None invented a node defect, which is what the gating is
+for and what §5 cost two pins for lacking.
+
+**§31 is the constraint `n6-2` found**: only the first package a run submits
+is ever accumulated, because the availability plan assures one report. The
+solicit therefore rides the honest package, which is not where it belongs;
+the comment says why it has to, so the next reader does not tidy it apart.
+
+**N6 completed the same day.** The first cut graded the happy path and
+nothing else: it showed the node asks when it should and nothing showed it
+declining when it should not. Three rows closed that, and two of them had
+been talked out of in DESIGN on reasoning that did not hold:
+
+| row | what it catches |
+|---|---|
+| `n6_unsolicited_not_requested` (Hard) | a node that asks for anything it is told about, ignoring the on-chain condition |
+| `n6_mismatched_preimage_not_included` (Hard) | a node that includes a blob failing its own hash -- Hard where inclusion is Soft, because the preimage extrinsic is keyed on the hash |
+| `n6_gossip_reaches_neighbours` (Soft) | a node that gossips to some peer rather than to its grid neighbours |
+
+**Two justifications in DESIGN were wrong and are recorded as such.** The
+gossip row was skipped because the emulated validators were said not to
+neighbour the NUT in every run -- but the grid is `index / W` and
+`index % W` (`simple.md:188-189`), a function of the index alone, so who
+neighbours whom never varies. And the unsolicited row was skipped because
+its silence was said to be indistinguishable from an unmet precondition --
+but the solicited announcement in the same run is its control, which is how
+every N3 fault row already works. Both were rationalisations of a gap. They
+are quoted in DESIGN beside the correction, because a wrong reason left in
+place is worse than the gap: nobody re-examines it.
+
+`grid_neighbours` is the one implementation, checked against the tiny grid
+§2 names rather than copied from it. Its own test found a bug in it: an
+index outside the set still shared a column with somebody, so neighbouring
+stopped being mutual.
+
+**Two checks earned their keep during verification.** Clippy's `unreachable
+pattern` was a real defect, not a style nit -- `CE142` was not imported in
+`emu.rs`, so the new match arm bound it as a *variable*, swallowing every
+stream kind and making the refusal arm dead. It compiled and the tests
+passed. And the dry-run baseline *failed* its own gossip row, because the
+fabricated node announced to peers 1 and 3 where validator 0's neighbours
+are 1, 2 and 4 -- a baseline that models a conforming node and fails is a
+wrong fabrication, not a wrong node.
+
+Confirmed (`sessions/n6-5`, 592 rows over 300 s): all five N6 rows pass
+against polkajam. The node asks for the solicited preimage, leaves the
+unsolicited one alone, and announces what it obtained to its grid
+neighbours.
+
+**The sim test found a tautology in a row written hours after §5.**
+`n6_ce143_asked_for_what_was_announced` was emitted only for a request that
+had already matched the announcement, then asserted it matched -- true by
+construction. Posing the fault that asks for an unannounced hash made the
+row *vanish* rather than fail. It now grades every request the node made
+against what it was told about, and the test asserts the row **fails**
+rather than merely not passing, which is the distinction that would have
+hidden it.
+
+
 ## Milestone ladder
 
 | Milestone | Lanes | Coverage | Status |

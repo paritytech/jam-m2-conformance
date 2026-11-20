@@ -64,6 +64,7 @@ pub struct LaneSet {
     pub n2: bool,
     pub n3: bool,
     pub n4: bool,
+    pub n6: bool,
 }
 
 impl LaneSet {
@@ -77,6 +78,7 @@ impl LaneSet {
             n2: false,
             n3: false,
             n4: false,
+            n6: false,
         };
         for name in raw.split(',').map(str::trim).filter(|n| !n.is_empty()) {
             match name.to_ascii_lowercase().as_str() {
@@ -85,14 +87,15 @@ impl LaneSet {
                 "n2" => set.n2 = true,
                 "n3" => set.n3 = true,
                 "n4" => set.n4 = true,
+                "n6" => set.n6 = true,
                 other => {
                     return Err(format!(
-                        "unknown lane {other:?}; implemented lanes are n0, n1, n2, n3, n4"
+                        "unknown lane {other:?}; implemented lanes are n0, n1, n2, n3, n4, n6"
                     ))
                 }
             }
         }
-        if !(set.n0 || set.n1 || set.n2 || set.n3 || set.n4) {
+        if !(set.n0 || set.n1 || set.n2 || set.n3 || set.n4 || set.n6) {
             return Err("no lanes selected".to_string());
         }
         Ok(set)
@@ -112,13 +115,24 @@ impl LaneSet {
     /// that submits nothing gives the node nothing to serve. One submission
     /// feeds both.
     pub fn needs_package(&self) -> bool {
-        self.n3 || self.n4
+        self.n3 || self.n4 || self.n6
     }
 
     /// Whether the run drives availability: fetching shards and offering
     /// assurances once the node has published a report of its own.
     pub fn needs_availability(&self) -> bool {
         self.n4
+    }
+
+    /// Whether the run introduces a preimage as a non-validator.
+    ///
+    /// N6 needs a package too, and not for the usual reason: its preimage
+    /// has to be *solicited on chain* before the node will answer an
+    /// announcement, and the only way this harness has to reach the
+    /// service's accumulate is a work package the node guarantees and
+    /// includes (`simple.md:705-707`, `findings.md` §28's successor).
+    pub fn needs_preimage(&self) -> bool {
+        self.n6
     }
 }
 
@@ -263,7 +277,8 @@ mod tests {
                 n1: false,
                 n2: true,
                 n3: false,
-                n4: false
+                n4: false,
+                n6: false
             }
         );
         assert!(

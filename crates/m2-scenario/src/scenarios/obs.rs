@@ -130,3 +130,22 @@ pub const EMU_SENT_146: u8 = 62;
 /// could not tell them apart would read a node that serves only one as
 /// serving both.
 pub const SERVED_SEGMENTS: u8 = 63;
+
+/// The harness announced a preimage over CE 142, as a non-validator peer.
+///
+/// N6's codes start here. The announcement is the only thing in this
+/// harness that speaks as an ordinary peer, so it is worth being able to
+/// find it in the log by code alone.
+pub const EMU_SENT_142: u8 = 64;
+
+/// The NUT opened CE 143 back on the announcing connection.
+pub const NUT_SENT_143: u8 = 65;
+
+/// The harness served the preimage it had announced.
+pub const EMU_SERVED_143: u8 = 66;
+
+/// The NUT announced a preimage it obtained, gossiping to a neighbour.
+pub const NUT_SENT_142: u8 = 67;
+
+/// The NUT sent a CE 142 frame that would not decode.
+pub const NUT_SENT_BAD_142: u8 = 68;
