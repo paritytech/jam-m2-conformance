@@ -303,6 +303,16 @@ self-proxied ticket did not reach one peer, seen in consecutive runs and
 not yet written up", is not an N2 defect: the node had closed the
 connection to that peer, so there was nothing there to reach.
 
+**Both write-ups are drafted** — `ask_dave_rejection.md` for whether the
+escalation is allowed at all, `ask_polkajam_rejection.md` for the
+behaviour — and neither is sent. Tracing the node for them confirmed the
+measurement from the other side: `AssuranceTrackerError::is_misbehaviour`
+is true for one variant, returned from the signature check alone, so three
+of the five faults the harness poses cannot reach the close and two must.
+The measured table is the source read back, not a sample. It also showed
+the escalation is deliberate rather than an oversight, which is why both
+documents ask a question instead of filing a defect.
+
 
 ### After PR #23: the two sides of the oracle socket must agree on a codec, 2026-11-19
 

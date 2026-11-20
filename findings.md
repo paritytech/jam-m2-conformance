@@ -1910,10 +1910,34 @@ gives the stream reset as the way to reject but nowhere forbids closing the
 connection, and hard-failing a node on a rule nobody wrote is the mistake
 §18 and §27 record.
 
-Two write-ups are owed and neither is written yet: whether the escalation
-is allowed at all is the spec author's to answer, and the behaviour itself
-is polkajam's to hear about. If the answer is that a rejection must stay on
-its stream, this row becomes Hard.
+Two write-ups, because the question splits in two. Whether the escalation
+is allowed at all is the spec author's to answer (`ask_dave_rejection.md`),
+and the behaviour itself is polkajam's to hear about
+(`ask_polkajam_rejection.md`). If the answer is that a rejection must stay
+on its stream, this row becomes Hard.
+
+Writing them turned up two things the finding did not have. The measured
+table is the source read back rather than a sample:
+`AssuranceTrackerError::is_misbehaviour` is true for one variant, returned
+from the signature check alone, so a wrong anchor returns `UnknownLeaf` and
+an empty-core claim is never looked at — three of the five faults *cannot*
+reach the close and two must. And the escalation is deliberate, not an
+oversight: `Connection::handle_misbehaviour` adjusts reputation and closes
+the connection in the same two lines, and `Stream::peer_misbehaved`'s own
+comment assumes the connection is already gone. That makes this a policy
+question rather than a bug, which is how both write-ups put it.
+
+The spec reading also came out stronger than "nowhere forbids it". Every
+refusal `simple.md` describes is a stream reset — `:115-120`, and again at
+`:252` and `:336`, the latter for a ticket the node cannot verify because
+finality is behind — not the same as a signature that fails, but the
+closest the document comes to declining something it cannot check. The one
+connection close it prescribes is at the certificate level (`:20`), and the
+one behavioural consequence it puts at connection level (`:82-84`) is about
+builders proving their credentials, not validators, who are instead asked
+to stay connected to one another (`:61-63`). None of that forbids the
+escalation, so the row stays Soft; all of it is why the question is worth
+asking.
 
 `crates/m2-sim/tests/n0_connection_close_sim_it.rs` grades both directions
 against a stand-in that closes on a refusal, with the honest node as the
