@@ -1086,12 +1086,9 @@ pub(crate) fn phase(label: &str, started: std::time::Instant) {
     eprintln!("[phase] {label}: {:?}", started.elapsed());
 }
 
-/// Peer index the CE 133 builder is recorded under.
-///
-/// Outside the validator range on purpose: a builder is not a validator, and
-/// an N0 row keyed on a validator peer could otherwise read the builder's
-/// traffic as its own.
-pub(crate) const BUILDER_PEER: u16 = 0xB0;
+/// Peer index the CE 133 builder is recorded under, defined beside the lane
+/// that prints it so that both sides read the same number.
+pub(crate) use m2_scenario::scenarios::n0::BUILDER_PEER;
 
 /// Slots before the submission at which its package is built.
 ///
@@ -1255,6 +1252,7 @@ async fn submit_one(
         Arc::clone(&shared.trace),
         Arc::clone(&shared.obs),
         Arc::clone(&shared.submissions),
+        Arc::clone(&shared.connection_ends),
         BUILDER_PEER,
     )
     .await;

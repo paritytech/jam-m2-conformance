@@ -1930,6 +1930,7 @@ mod tests {
             Arc::new(Mutex::new(Trace::default())),
             Arc::new(Mutex::new(ObsLog::new())),
             Arc::clone(&submissions),
+            Arc::new(Mutex::new(Vec::new())),
             0xB0,
         ));
 

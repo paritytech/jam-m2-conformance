@@ -150,6 +150,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         emu.trace(),
         emu.obs(),
         emu.submissions(),
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         BUILDER_PEER,
     )
     .await;

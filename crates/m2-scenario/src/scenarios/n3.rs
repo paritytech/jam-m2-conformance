@@ -140,6 +140,16 @@ pub struct SubmittedPackage {
     /// take right now is the difference between the node's defect and the
     /// harness aiming badly.
     pub reset_code: Option<u64>,
+    /// How the connection carrying this submission ended, if it ended
+    /// before the run did.
+    ///
+    /// A stream reset is not the only way a node can say no: it can close
+    /// the whole connection instead, and then the read above fails without
+    /// a reset and the submission looks accepted. Recording the end keeps
+    /// "the node refused, at the connection" apart from "the node said
+    /// nothing", which is the distinction `findings.md` §29 lost for a day
+    /// and §30 was written to stop losing.
+    pub connection_end: Option<jamnp_s::transport::ConnectionEnd>,
     /// What was deliberately wrong with this submission, if anything.
     ///
     /// `None` is the honest one. The lane asks a different question of each
@@ -163,6 +173,41 @@ pub struct SubmittedPackage {
     /// expected to send -- and without it the lane has nothing to compare a
     /// mapping against.
     pub imports_from: Option<ImportedFrom>,
+}
+
+impl SubmittedPackage {
+    /// Did the node refuse this submission, by either route open to it?
+    ///
+    /// A stream reset is the refusal `simple.md:115-120` describes, and for
+    /// a long time it was the only one the harness could see. But a node
+    /// can also refuse by closing the whole connection, and then the read
+    /// waiting for the reset fails with no reset in it -- which the lane
+    /// used to record as no refusal at all, and report as the node having
+    /// *accepted* what it had in fact rejected hardest (`findings.md` §8).
+    ///
+    /// Only a close the peer performed counts. A connection that timed out,
+    /// or that this side hung up, is not the node's verdict on anything.
+    pub fn refused_either_way(&self) -> bool {
+        self.refused
+            || matches!(
+                self.connection_end,
+                Some(jamnp_s::transport::ConnectionEnd::PeerClosed { .. })
+            )
+    }
+
+    /// How the node refused, in its own words, for a row that has to say.
+    pub fn refusal(&self) -> Option<String> {
+        match (&self.refused, &self.connection_end) {
+            (true, _) => Some(match self.reset_code {
+                Some(code) => format!("reset the stream (code {code})"),
+                None => "reset the stream".to_string(),
+            }),
+            (false, Some(jamnp_s::transport::ConnectionEnd::PeerClosed { code, reason })) => Some(
+                format!("closed the whole connection with \"{reason}\" (code {code})"),
+            ),
+            _ => None,
+        }
+    }
 }
 
 /// The package a submission imports a segment from, and the root that
@@ -400,24 +445,25 @@ fn submission_check(ctx: &N3Ctx, protocol: u16) -> Check {
             }
             results.push(log::check_detail(
                 leak(format!("n3_ce{protocol}_accepted")),
-                !submitted.refused,
+                !submitted.refused_either_way(),
                 Severity::Hard,
                 || {
                     format!(
-                        "the NUT reset the CE {protocol} stream for the package {} on \
-                         core {} with code {}",
+                        "the NUT refused the CE {protocol} submission of the package {} \
+                         on core {}: it {}",
                         short(&submitted.package_hash),
                         submitted.core,
                         submitted
-                            .reset_code
-                            .map(|code| format!("{code:#x}"))
-                            .unwrap_or_else(|| "none".into())
+                            .refusal()
+                            .unwrap_or_else(|| "refused by some means".into())
                     )
                 },
             ));
             // A node that refused the package owes no sharing, and grading it
-            // for not sharing would report one defect twice.
-            if submitted.refused {
+            // for not sharing would report one defect twice. However it
+            // refused: a package the node dropped by closing the connection
+            // is no more shared than one it reset.
+            if submitted.refused_either_way() {
                 continue;
             }
 
@@ -657,9 +703,15 @@ fn grade_fault(
         // `simple.md:362-364` asks for the stream to be reset: a guarantor
         // must not be made to download a huge package before it can check
         // the authorization.
+        //
+        // The row asks only whether the node refused. *Where* it put the
+        // refusal is N0's `rejection_keeps_the_connection`, because that is
+        // one question about every protocol rather than one per protocol,
+        // and a row that graded both would report a node that enforced the
+        // cap the hard way as a node that ignored it (`findings.md` §8).
         SubmissionFault::Oversized => vec![log::check_detail(
-            leak(format!("n3_ce{protocol}_oversized_reset")),
-            submitted.refused,
+            leak(format!("n3_ce{protocol}_oversized_refused")),
+            submitted.refused_either_way(),
             Severity::Hard,
             || {
                 // Two caps, because the two protocols put the core index in
@@ -673,19 +725,20 @@ fn grade_fault(
                 };
                 format!(
                     "the NUT accepted a CE {protocol} work-package message over the {cap} \
-                     byte cap instead of resetting the stream"
+                     byte cap: it neither reset the stream nor closed the connection"
                 )
             },
         )],
         // The extrinsic message did not match the lengths the package
         // declares, which the node reads exactly and so must notice.
         SubmissionFault::ExtrinsicSizeMismatch => vec![log::check_detail(
-            leak(format!("n3_ce{protocol}_extrinsic_mismatch_reset")),
-            submitted.refused,
+            leak(format!("n3_ce{protocol}_extrinsic_mismatch_refused")),
+            submitted.refused_either_way(),
             Severity::Hard,
             || {
                 "the NUT accepted an extrinsic message whose size did not equal the sum of \
-                 the lengths its package declared"
+                 the lengths its package declared: it neither reset the stream nor closed \
+                 the connection"
                     .to_string()
             },
         )],
@@ -840,7 +893,7 @@ pub fn n3_ce134_mappings(ctx: &N3Ctx) -> Check {
         let importing: Vec<&SubmittedPackage> = ctx
             .submissions
             .iter()
-            .filter(|s| s.imports_from.is_some() && !s.refused)
+            .filter(|s| s.imports_from.is_some() && !s.refused_either_way())
             .collect();
         let control = Control::new(
             "n3_ce134_imports_not_exercised",
@@ -965,6 +1018,7 @@ mod tests {
             sent_at_wall_ms: SENT_AT,
             refused,
             reset_code: refused.then_some(0x0103),
+            connection_end: None,
             fault: None,
             co_guarantors: CO.to_vec(),
             imports_from: None,
@@ -1363,7 +1417,7 @@ mod tests {
             vec![faulty(SubmissionFault::Oversized, true)],
             Vec::new(),
         )));
-        assert_eq!(names(&results), vec!["n3_ce133_oversized_reset"]);
+        assert_eq!(names(&results), vec!["n3_ce133_oversized_refused"]);
         assert!(
             !names(&results).contains(&"n3_ce133_accepted"),
             "a fault must not be judged against the acceptance row"
@@ -1777,7 +1831,7 @@ mod tests {
             let results = run(&check);
             let row = results
                 .iter()
-                .find(|r| r.name == format!("n3_ce{protocol}_oversized_reset"))
+                .find(|r| r.name == format!("n3_ce{protocol}_oversized_refused"))
                 .unwrap_or_else(|| panic!("CE {protocol} grades its own oversize row"));
             let detail = format!("{:?}", row.detail);
             assert!(

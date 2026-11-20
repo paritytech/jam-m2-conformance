@@ -226,58 +226,79 @@ which closes the sampling gap this entry was left with.
 
 ---
 
-## 4. The node accepts a CE 133 first message over the size cap
+## 4. The node applies the work-package size cap on CE 133 and not on CE 146
 
-**Status:** open, reproduced, and it may be the spec rather than the node.
-Opened 2026-11-15; seen again 2026-11-18 on the `b1ea8aca4` pin
-(`sessions/n3n4-1`), and this time over **CE 146 as well as CE 133** —
-`n3_ce146_oversized_reset` failed against its own 204,800-byte cap in the
-same run. The two protocols cap different messages and the node accepted
-both, which is what the extension below predicted.
+**Status:** open, narrowed, and most of what this finding used to say was
+wrong. Opened 2026-11-15 as "the node accepts a CE 133 first message over
+the size cap". Rewritten 2026-11-20, when §8's investigation showed the
+node had been enforcing that cap all along and the harness could not see
+the refusal.
 
-The CE 133 fault rows put a deliberately oversized first message on the wire:
-**205,076 bytes against the cap of 204,802** (`2 + 200 * 1024`), read off the
-trace rather than inferred. The node accepted it and did not reset the
-stream.
+**What was wrong.** This finding said:
 
-DESIGN §11 N3 reads that as a defect -- its fault column says `first message
-> 2+200*1024 bytes -> reset :362-364`. The spec is softer than DESIGN:
+> polkajam reads its first message with `read_decoded`, which caps at the
+> type's `max_encoded_len`, and a `WorkPackage`'s is far above 200 KiB — so
+> it is enforcing a different limit, not no limit.
 
-> The initial message `Core Index ++ Work-Package` **should be limited** to
-> `2 + (200 * 1024)` bytes. This ensures that Guarantors can not be forced to
-> download huge work packages, before they can check that the Work-Package is
-> actually authorized.
+`WorkPackageWithCore` has a hand-written bound, not a derived one
+(`chain/guarantors/protocol.rs:29-33`):
 
-That is a SHOULD addressed to the builder, with a rationale about protecting
-guarantors. Whether a guarantor **must** reject a larger one is an
-interpretation DESIGN made and the spec does not state. polkajam reads its
-first message with `read_decoded`, which caps at the type's
-`max_encoded_len`, and a `WorkPackage`'s is far above 200 KiB -- so it is
-enforcing a different limit, not no limit.
+```rust
+impl MaxEncodedLen for WorkPackageWithCore {
+    fn max_encoded_len() -> usize {
+        CoreIndex::max_encoded_len() + SANE_MAX_PACKAGE_SIZE
+    }
+}
+```
 
-**Before this is reported as a node defect it needs settling**, and it is a
-question for the conformance group rather than for the harness:
+`SANE_MAX_PACKAGE_SIZE` is `200 * 1024`, so the bound is **204,802** — the
+spec's `2 + (200 * 1024)`, to the byte. The node refuses an over-cap CE 133
+first message, and says so in the words of the rule
+(`sessions/ce133-1`, the node's own `peer-misbehaved` log):
 
-1. Is the cap normative on the receiver, or only on the sender? If only the
-   sender, the row is wrong and should be dropped or made soft.
-2. If normative, what is a guarantor meant to do -- reset, or read and
-   discard? The rationale is about not being *forced to download*, which
-   argues for a reset before the body arrives.
-3. ~~Seen once. It should be reproduced before anything is filed.~~
-   Reproduced 2026-11-18, over both protocols, which leaves 1 and 2 as the
-   open questions.
+```
+Message size 205071 outside expected range 0..=204802
+```
 
-This is the first N3 row that failed for a reason that is not plainly the
-harness's. Every earlier one was ours.
+It refuses by closing the connection, which is what the lane could not read
+and reported as acceptance — §8, in full. **The impl is byte-identical at
+`b1ea8aca4`**, the pin this finding was measured against, so this was a
+misreading when it was written and not a change in the node since.
 
-**CE 146 inherits the same question.** `simple.md:383` says the
-`Work-Package` message **should be limited** to `200 * 1024` bytes, in the
-same SHOULD form and with the same rationale, so `n3_ce146_oversized_reset`
-rests on the same unsettled reading as `n3_ce133_oversized_reset`. Both are
-Hard, which keeps them consistent with each other rather than with any
-answer; whatever settles one settles both, and if the cap turns out to bind
-only the sender then both rows go, not one. Noted here rather than
-rediscovered when the CE 146 row first fails against a live node.
+**What is left, and it is sharper than what it replaces.** The same run
+put 205,069 bytes on CE 146's work-package message against its 204,800-byte
+cap. The node accepted it: no refusal, no misbehaviour logged, nothing. The
+honest CE 146 submission in the same run was taken and shared with both
+co-guarantors, so the protocol works and this is the cap alone.
+
+The two protocols reach the package through different types:
+
+| | first message | read as | bound |
+|---|---|---|---|
+| CE 133 | `Core Index ++ Work-Package` | `WorkPackageWithCore` | `2 + SANE_MAX_PACKAGE_SIZE` = 204,802 |
+| CE 146 | `Work-Package` alone, message 2 | `ImmutableWorkPackage` | the derived bound, far above 200 KiB |
+
+So it is one rule read two ways, because two types carry it — and the type
+that carries the spec's number is the one that was written for this
+protocol. `simple.md:383` states CE 146's cap in the same SHOULD form and
+with the same rationale as `:362-364`.
+
+**The question that survives.** Whether the cap binds the receiver at all
+is still unsettled, and it is still a question for the conformance group
+rather than the harness: `:362-364` and `:383` are both **should**, both
+addressed to the message, and both justified by a protection offered to
+guarantors, which reads more like a licence to refuse than a duty to.
+
+What has changed is that polkajam can no longer be cited as a node that
+takes the permissive reading. It takes the strict one on CE 133. The
+likelier reading of CE 146 is now an oversight rather than a position.
+
+**What this costs the question put to the spec authors.** `ask_dave.md` is
+written around the claim corrected above and must not be sent as it stands.
+
+`n3_ce133_oversized_refused` passes against polkajam as of 2026-11-20.
+`n3_ce146_oversized_refused` fails, and is the only part of this finding
+with a live failure behind it.
 
 ---
 
@@ -477,41 +498,94 @@ pattern -- and a control where the codecs agree and the connection is
 accepted, so the guard is not merely refusing everything. The protocol-version
 guard, which had never been driven over a socket either, is tested there too.
 
-## 8. The node accepts a CE 133 extrinsic message of the wrong size
+## 8. The node accepts a CE 133 extrinsic message of the wrong size — CLOSED 2026-11-20
 
-**Status:** open, reproduced, and it may be a change in the node rather
-than a standing defect. Seen 2026-11-17; seen again 2026-11-18 on the
-`b1ea8aca4` pin (`sessions/n3n4-1`), so it is not a one-run artefact.
+**Status:** CLOSED 2026-11-20. It was a harness defect, and the node was
+right. The finding's title is the thing that was wrong: the node does not accept the
+message, it refuses it — by closing the whole connection, which the lane
+could not see and therefore reported as acceptance.
 
-CE 133's second message carries the extrinsic data, and `simple.md:373` gives
-its size as the sum of the lengths the work-package declares. polkajam itself
-reads it with `read_exact(saturated_extrinsic_size())`, so that equality is
-the rule, and DESIGN §11 N3 lists "extrinsic size mismatch" as a fault the
-node must reset the stream for.
+**What the node does.** CE 133's extrinsic message is read with
+`read_exact(package.saturated_extrinsic_size())`
+(`chain/guarantors/stream_receiver.rs:258`), and `read_exact` is not a byte
+read:
 
-The fault row sends a message whose size does not match the declared sum. The
-node accepted it and did not reset.
+```rust
+pub async fn read_exact(&mut self, size: u32) -> Result<Vec<u8>, StreamErr> {
+    self.read_range(size..=size).await
+}
+```
 
-**What makes this worth a second look rather than a filing.** The same row
-passed at the previous pin (`e3d216c2`) in earlier sessions, and failed on
-the first run after re-pinning to `5ef954fb1`. Twenty-seven commits separate
-them, several touching block import and work-package handling. It is equally
-possible that the row only now ran to completion: the N3 lane was reporting
-every row unexercised before §1 was fixed, so "passed before" may mean
-"passed in an older session under different conditions" rather than "passed
-on this code path yesterday".
+`read_range` reads the message's own 4-byte size and refuses anything
+outside the range (`net/stream.rs:443-447`):
 
-**Before filing anything upstream**, establish:
+```rust
+return Err(StreamErr::Misbehaviour(
+    format!("Message size {size} outside expected range {size_range:?}").into(),
+))
+```
 
-1. Whether it reproduces. One run is not a pattern, and the N3 lane has only
-   just started exercising again.
-2. Whether it reproduces at the *old* pin with the current harness, which
-   separates a node change from a harness change.
-3. Which of polkajam's read paths handles this message now, and whether the
-   `saturated_extrinsic_size` read survived the re-pin range.
+So the equality is enforced exactly as `simple.md:373` states it. But
+`StreamErr::Misbehaviour` is routed by `handle_stream_err`
+(`net/connection.rs:126`) to `handle_misbehaviour`, which is §30's two
+lines: dock reputation, then `quic.close(...)`. The refusal lands on the
+connection.
 
-Related: §4, the oversized first message, which is the same shape — a size
-rule the node does not enforce — and which also failed in this run.
+**What the harness did with that.** `spawn_package_sender` read the node's
+verdict off one thing:
+
+```rust
+if let Err(ReadError::Reset(code)) = recv.read(&mut buf).await { ... refused = true ... }
+```
+
+A connection close fails that read a different way, so `refused` stayed
+false and the row reported "the NUT accepted an extrinsic message whose
+size did not equal the sum of the lengths its package declared". It had
+rejected it as hard as it knows how. **A row that can see only one of the
+two ways to say no will call the other one yes.**
+
+**Measured on both sides**, `sessions/ce133-1`, with the node's own
+misbehaviour log turned up:
+
+| | |
+|---|---|
+| node (`peer-misbehaved`) | `Message size 1 outside expected range 0..=0` |
+| harness (`[submission]`) | `closed by the peer: Message size 1 outside expected range 0..=0 (code 257)` |
+
+The range is `0..=0` because the package in a fault submission declares no
+extrinsics, and the fault is one byte on top of that
+(`bodies.push(0xff)`). One byte over nothing is still a mismatch, and the
+node found it.
+
+**What this answers of the three questions §8 posed.** Question 1, does it
+reproduce: yes, every run — but of the harness, not the node. Question 3,
+which read path handles the message and did `saturated_extrinsic_size`
+survive the re-pin: `read_and_verify_extrinsics`, and yes, it is alive at
+`d92cadd30`. Question 2 — does it reproduce at the old pin — is moot: there
+was never a node defect to date.
+
+**Why it looked like a re-pin regression.** §8 guessed that the row "passed
+before and failed after", with twenty-seven commits in between to blame.
+The real explanation was the one §8 also offered and did not pursue: the
+row only began running to completion after §1 was fixed. Before that it was
+unexercised, and an unexercised row is not a passing one. Two candidate
+explanations, and the finding chased the expensive one.
+
+**The fix.** `SubmittedPackage` now carries the connection's end as well as
+the stream's reset, and `refused_either_way()` counts both — a reset, or a
+close the *peer* performed. A timeout or a hang-up on this side is still
+not a verdict. The rows are renamed from `_reset` to `_refused`, because
+they ask whether the node applied the rule and not where it put the answer.
+Where it put the answer is `rejection_keeps_the_connection` in N0 (§30),
+which now also sees the builder's connection. One row per question.
+
+`n3_sim_it` grades the fix against a stand-in that closes on an over-cap
+package in polkajam's own words, with a node that neither resets nor closes
+as the control — the row must still fail that one, or widening the
+predicate would have made it unfailable.
+
+Related: §4, which had the same defect under it and one real node gap left
+over once this was removed.
 
 ## 9. The hazmat availability export cannot build a justification
 

@@ -55,6 +55,14 @@ CE 146's own 204,800-byte cap in the same run, so the node reads both
 protocols' size caps the same wrong way. All of these remain questions for
 the conformance group rather than filed defects, for the reasons §4 lists.
 
+> **Corrected 2026-11-20.** Two of those three were the harness, not the
+> node. polkajam enforces both size rules and refuses by closing the
+> connection, which the lane could not read and reported as acceptance
+> (§8). `n3_ce133_oversized_*` and `n3_ce133_extrinsic_mismatch_*` pass
+> now, and the sentence above about the node reading "both protocols' size
+> caps the same wrong way" is wrong: it reads CE 133's correctly. Only the
+> CE 146 failure was real. See the section for PR #25 below.
+
 **Harness defects the run found, all three fixed the same day.** This is
 what the run was for, and the ratio is the point — three harness defects to
 zero new node defects:
@@ -144,7 +152,12 @@ failures are down to the known set and nothing else:
 | `n3_ce133_extrinsic_mismatch_reset` | §8 |
 
 All five are node behaviour, three of them questions for the conformance
-group rather than filed defects. Across eight runs the harness produced
+group rather than filed defects.
+
+> **Corrected 2026-11-20.** Two of those five were not node behaviour at
+> all: `n3_ce133_oversized_reset` and `n3_ce133_extrinsic_mismatch_reset`
+> were the harness reading a refusal it could not see as an acceptance
+> (§8). The known-failure set is three. Across eight runs the harness produced
 **seven defects of its own and no new defect in polkajam**, which is the
 fair summary of what a first live outing of two lanes is worth.
 
@@ -355,6 +368,68 @@ once.**
 `cargo fmt --all` and `cargo clippy --workspace` never reached it, and it had
 drifted. Formatted, and §6's reproduction commands now include
 `(cd oracle && cargo test && cargo fmt --check)`.
+
+
+### After PR #25: two hard findings were the harness crediting the node with accepting what it refused, 2026-11-20
+
+**§8 closed, and it was ours.** The title it carried for three days --
+"the node accepts a CE 133 extrinsic message of the wrong size" -- was the
+thing that was wrong. The node refuses it. `read_exact` is not a byte read:
+it is `read_range(n..=n)`, which checks the message's own declared size and
+makes a mismatch a `Misbehaviour`, and a misbehaviour closes the connection.
+The lane read the verdict off `ReadError::Reset` alone, so a refusal
+delivered at the connection left `refused: false` and the row reported the
+node as having accepted what it had rejected hardest.
+
+Measured on both sides in `sessions/ce133-1`, with the node's own
+misbehaviour logging turned up:
+
+| | |
+|---|---|
+| node (`peer-misbehaved`) | `Message size 1 outside expected range 0..=0` |
+| harness (`[submission]`) | `closed by the peer: Message size 1 outside expected range 0..=0 (code 257)` |
+
+**§4 was built on a misreading of the same node.** It said polkajam bounds
+CE 133's first message by a derived `max_encoded_len` "far above 200 KiB".
+`WorkPackageWithCore` has a hand-written bound of
+`CoreIndex::max_encoded_len() + SANE_MAX_PACKAGE_SIZE` = **204,802**, which
+is the spec's `2 + (200 * 1024)` to the byte -- and the impl is
+byte-identical at `b1ea8aca4`, the pin §4 was measured against. It was a
+misreading when written, not a change in the node since.
+
+**What survives is sharper than what it replaces.** The same run put 205,069
+bytes on CE 146's work-package message against its 204,800-byte cap and the
+node took it, with the honest CE 146 submission beside it taken and shared
+normally. CE 133 reads the package as `WorkPackageWithCore`, which carries
+the spec's number; CE 146 reads it as a bare `ImmutableWorkPackage`, which
+carries the derived bound. One rule, two types, two answers.
+
+**`ask_dave.md` was rewritten before being sent**, because the claim
+corrected above was its central piece of evidence. The question survives and
+is better for it: one implementation has taken both readings, one per
+protocol, which is a stronger reason to ask what the wording means than a
+node that simply ignored it.
+
+**The fix.** `SubmittedPackage` carries the connection's end as well as the
+stream's reset; `refused_either_way()` counts a reset or a close the *peer*
+performed, and not a timeout or a hang-up on this side. The rows are renamed
+`_reset` -> `_refused`, because they ask whether the rule was applied and
+not where the answer landed -- that is one question about every protocol, so
+N0's `rejection_keeps_the_connection` grades it once, and now sees the
+builder's connection too. `BUILDER_PEER` moved to the lane that prints it,
+so the row no longer reports the builder as "validator 176".
+
+`n3_sim_it` grades the fix against a stand-in that closes on an over-cap
+package in polkajam's own words, with a node that neither resets nor closes
+as the control. Narrowing the predicate back to `refused` makes the new
+assertion fail, which is how the guard was checked to be one.
+
+**Known hard failures are four, where they were six**
+(`sessions/ce133-2`, 450 rows over 150 s): `ce129_boundary_parent_before_child`
+and `n2_unknown_epoch_reset_observed` (§3), `n3_ce146_oversized_refused`
+(§4) and `n3_ce134_answered` (§5). Both of the two that went were the
+harness's, so this round adds **two more harness defects found by live
+runs and no new defect in polkajam**.
 
 
 ## Milestone ladder

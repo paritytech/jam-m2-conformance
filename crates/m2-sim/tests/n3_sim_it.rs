@@ -171,6 +171,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
             emu.trace(),
             emu.obs(),
             emu.submissions(),
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             BUILDER_PEER,
         )
         .await;
@@ -294,6 +295,7 @@ async fn grade_misaddressed(fault: SimFault) -> Vec<(&'static str, Outcome)> {
             emu.trace(),
             emu.obs(),
             emu.submissions(),
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             BUILDER_PEER,
         )
         .await;
@@ -367,7 +369,7 @@ async fn the_submission_checks_catch_a_guarantor_that_mishandles_a_package() {
             format!("n3_ce{protocol}_accepted"),
             format!("n3_ce{protocol}_shares_with_both_co_guarantors"),
             format!("n3_ce{protocol}_shares_within_the_window"),
-            format!("n3_ce{protocol}_oversized_reset"),
+            format!("n3_ce{protocol}_oversized_refused"),
         ] {
             assert!(
                 passed(&honest, &row),
@@ -393,10 +395,10 @@ async fn the_submission_checks_catch_a_guarantor_that_mishandles_a_package() {
     let oversized = grade(SimFault::AcceptsOversizedPackage).await;
     for protocol in [133, 146] {
         assert!(
-            failed(&oversized, &format!("n3_ce{protocol}_oversized_reset")),
+            failed(&oversized, &format!("n3_ce{protocol}_oversized_refused")),
             "a node that takes an over-cap package must fail CE {protocol}'s oversize row; \
              it reported {:?}",
-            outcomes_of(&oversized, &format!("n3_ce{protocol}_oversized_reset"))
+            outcomes_of(&oversized, &format!("n3_ce{protocol}_oversized_refused"))
         );
         // And it is only that row: the honest package is still taken and
         // still shared, so a reader sees a node with one hole rather than a
@@ -450,4 +452,33 @@ async fn the_submission_checks_catch_a_guarantor_that_mishandles_a_package() {
          row; it reported {:?}",
         outcomes_of(&shared, "n3_ce133_not_a_guarantor_ignored")
     );
+
+    // A node that enforces the cap by closing the connection has enforced
+    // the cap.
+    //
+    // This is `findings.md` §8, and from 2026-11-15 to 2026-11-20 the
+    // lane said the opposite. The refusal was read off one thing only -- a stream reset
+    // -- so a node that answered at the connection failed the read with no
+    // reset in it, and the row reported the node as having *accepted* a
+    // package it had rejected hardest. A row that can only see one of the
+    // two ways to say no will call the other one yes.
+    //
+    // Where the refusal landed is a real question and it is still graded,
+    // by `rejection_keeps_the_connection` in N0 (`findings.md` §30). One
+    // row per question: this one asks only whether the rule was applied.
+    let escalating = grade(SimFault::ClosesOnOversizedPackage).await;
+    for protocol in [133, 146] {
+        let row = format!("n3_ce{protocol}_oversized_refused");
+        assert!(
+            passed(&escalating, &row),
+            "a node that refuses an over-cap package by closing the connection has refused \
+             it, and must pass {row}; it reported {:?}",
+            outcomes_of(&escalating, &row)
+        );
+    }
+
+    // The control the broadened row needs: a node that does neither must
+    // still fail. `oversized` above is exactly that node, and it is already
+    // asserted to fail the row -- so widening the predicate did not make it
+    // unfailable.
 }
