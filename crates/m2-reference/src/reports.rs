@@ -370,6 +370,14 @@ impl SubmissionFault {
 #[derive(Debug, Clone)]
 pub struct ScheduledShare {
     pub slot: u32,
+    /// The node under test, carried so the sender can recompose the bundle
+    /// near the slot without re-deriving which core it holds there.
+    ///
+    /// The same reason [`ScheduledReport`] carries it, and for the same
+    /// defect: a bundle composed when the run is planned is anchored to
+    /// that head, and nine slots later the node has dropped it from its
+    /// recent blocks and refuses the anchor (`findings.md` §5).
+    pub nut: u16,
     pub core: u16,
     pub shard_count: u16,
     pub mappings: Vec<(jam_types::WorkPackageHash, [u8; 32])>,
@@ -425,6 +433,7 @@ impl RefChain {
         };
         Ok(Some(ScheduledShare {
             slot,
+            nut,
             core,
             shard_count,
             // No imported segments, so no mappings. The spec lets a

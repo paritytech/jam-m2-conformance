@@ -55,13 +55,16 @@ CE 146's own 204,800-byte cap in the same run, so the node reads both
 protocols' size caps the same wrong way. All of these remain questions for
 the conformance group rather than filed defects, for the reasons §4 lists.
 
-> **Corrected 2026-11-20.** Two of those three were the harness, not the
-> node. polkajam enforces both size rules and refuses by closing the
-> connection, which the lane could not read and reported as acceptance
-> (§8). `n3_ce133_oversized_*` and `n3_ce133_extrinsic_mismatch_*` pass
-> now, and the sentence above about the node reading "both protocols' size
-> caps the same wrong way" is wrong: it reads CE 133's correctly. Only the
-> CE 146 failure was real. See the section for PR #25 below.
+> **Corrected 2026-11-20.** **All three were the harness, not the node.**
+> polkajam enforces both size rules and refuses by closing the connection,
+> which the lane could not read and reported as acceptance (§8);
+> `n3_ce133_oversized_*` and `n3_ce133_extrinsic_mismatch_*` pass now. The
+> sentence above about the node reading "both protocols' size caps the same
+> wrong way" is wrong: it reads CE 133's correctly, and only the CE 146
+> failure was real. And `n3_ce134_answered` was the harness offering a
+> bundle anchored past the node's eight-block recent window, so refusing it
+> was correct (§5). Nothing in this paragraph was node behaviour. See the
+> sections for PR #25 and PR #26 below.
 
 **Harness defects the run found, all three fixed the same day.** This is
 what the run was for, and the ratio is the point — three harness defects to
@@ -430,6 +433,66 @@ and `n2_unknown_epoch_reset_observed` (§3), `n3_ce146_oversized_refused`
 (§4) and `n3_ce134_answered` (§5). Both of the two that went were the
 harness's, so this round adds **two more harness defects found by live
 runs and no new defect in polkajam**.
+
+
+### After PR #26: the CE 134 share was anchored past the node's recent window, 2026-11-20
+
+**§5 closed, and it was ours too.** The share the harness offered was
+composed when the run was planned and sent nine slots later, by which point
+its anchor had fallen out of the node's recent blocks -- eight of them. The
+node said so once its guarantor logging was turned up
+(`sessions/ce134-1`):
+
+```
+failed to receive WorkPackageSharing(0): guarantee table error:
+  invalid anchor 0xdfa8dd97427288ed...
+```
+
+Refusing it was correct. And the refusal carried `0x100`, `NoError`, which
+§5 read as the node declining without a reason; the node's own source says
+it is the default on an error path with no code attached, in a TODO sitting
+directly above that handler. The *shape* of the refusal was right --
+`simple.md:115-120` gives the acceptor's reset as the way to reject -- so
+there was nothing to report that polkajam has not already written down.
+
+**The harness had fixed this once already, in the sender beside it.**
+`spawn_report_sender`'s own comment records the identical failure for
+CE 135: an anchor that "has aged out by the time it goes out seven to
+eleven slots later". CE 134's sender never got the lead. It has one now,
+the same two slots, for the same reason on both sides.
+
+**The worse half.** Both shares -- the honest one and the one offering a
+wrong shard count -- were being refused for that stale anchor, so
+`n3_ce134_wrong_shard_count_refused` passed across two pins without the
+shard count ever being the reason for anything. A reset carries no reason,
+so the only thing that can attribute a refusal is the honest share beside
+it being answered; that control was failing and the row took the credit.
+It now reports itself unexercised when the control did not succeed.
+
+**The false pass was written down three times and all three agreed**: the
+row, the sim test (a stand-in refusing *every* share was required to leave
+the row passing) and the unit test (the faulty share with no honest share
+beside it, asserted to pass every row). The tests were written from the
+same reading as the code, so they agreed with it rather than checking it.
+All three are inverted now, and each fails if the gate is removed.
+
+**Confirmed** (`sessions/ce134-3`, 464 rows over 180 s): `n3_ce134_answered`
+and `n3_ce134_hash_equals_the_reference` pass, the first for the first time
+since 2026-11-16, and the shard-count row passes for the reason it names:
+`unacceptable shard count 5`, in the node's words.
+
+**Known hard failures are three**, where this session began with six:
+`ce129_boundary_parent_before_child` and `n2_unknown_epoch_reset_observed`
+(§3), and `n3_ce146_oversized_refused` (§4). Every one of the three that
+went was the harness's.
+
+**One fragility exposed and not fixed.** A run between the two above sent no
+share at all and the report said only "not exercised". The share plan is
+claimed by the first connection to reach it and held across the nine slots
+until the share is due, and a node that closes connections every few slots
+(§30) can take it away meanwhile. The sender's two silent returns now say
+which it was and quote the connection's end. Whether it should re-dial is
+open; it has not recurred.
 
 
 ## Milestone ladder

@@ -68,17 +68,18 @@ report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,jso
 `M2-status.md` records the milestone evidence in full, and how to point the suite at a
 third-party node.
 
-Latest run, `sessions/ce133-2`, all five lanes over a 150 s window: **450 rows, four
-hard findings.** None of the four is the harness's:
+Latest run, `sessions/ce134-3`, all five lanes over a 180 s window: **464 rows, three
+hard findings.** None of the three is the harness's:
 
 | row | what it is |
 |---|---|
 | `ce129_boundary_parent_before_child` | a node defect, standing since the first N0 runs |
 | `n2_unknown_epoch_reset_observed` | a node defect: the ticket is rejected, the stream is not reset |
 | `n3_ce146_oversized_refused` | `findings.md` §4 — the node applies the work-package size cap on CE 133 and not on CE 146. Whether the cap binds the receiver at all is unsettled, so this is a question rather than a verdict |
-| `n3_ce134_answered` | `findings.md` §5 — a well-formed share reset with `NoError` |
 
-**Four where earlier runs reported seven, and two of the three that went were ours.**
+**Three where earlier runs reported seven, and every one of the four that went was ours.**
+`n3_ce134_answered` was the harness sharing a bundle anchored to a block the node had
+dropped from its eight-block recent window, so refusing it was correct (`findings.md` §5).
 `n3_ce133_oversized_*` and `n3_ce133_extrinsic_mismatch_*` were the harness crediting the
 node with accepting what it had in fact refused: polkajam enforces both size rules, and
 refuses by closing the connection rather than by resetting the stream, which the lane could
@@ -120,8 +121,11 @@ recent run at 581 rows over 300 s.
   shares each with both co-guarantors over CE 134 with the right segments-root mappings,
   and distributes a correctly-signed report over CE 135 that it then includes. Four
   deliberately-broken CE 133 submissions and one over CE 146 are each graded by their own
-  rule, since two of them ask for a reset and two for silence. Four hard rows fail: §4's
-  two oversize rows, §8's extrinsic mismatch, and §5.
+  rule, since two of them ask for a reset and two for silence. One hard row fails: §4's
+  CE 146 oversize row. The other three that used to fail here were the harness's own —
+  §4's CE 133 row and §8's extrinsic mismatch were refusals delivered at the connection
+  that the lane could not read, and §5 was a bundle anchored past the node's recent
+  window.
 - **N4 availability**: the node serves CE 137, CE 138 and CE 139/140 with justifications
   that verify against the engine, declines CE 148 (which the spec permits, and the row
   records as Soft), and its CE 141 assurances are graded well-formed, correctly aimed, and

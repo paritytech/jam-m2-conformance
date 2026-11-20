@@ -1058,6 +1058,7 @@ fn start_share_to_nut(connection: &Conn, peer: u16, shared: &EmuShared) {
             crate::report_io::spawn_share_sender(
                 connection.clone(),
                 plan,
+                Arc::clone(&shared.ref_chain),
                 Arc::clone(&shared.trace),
                 Arc::clone(&shared.obs),
                 Arc::clone(&shared.shared_to_nut),
