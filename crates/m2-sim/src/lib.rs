@@ -99,6 +99,14 @@ pub enum SimFault {
     /// (`simple.md:115-120`). Every other protocol with that validator goes
     /// with it (`findings.md` §30).
     ClosesOnBadAssurance,
+    /// Refuse an over-cap work-package submission by closing the whole
+    /// connection rather than resetting the stream.
+    ///
+    /// What polkajam does: `read_exact` makes a size mismatch a
+    /// `Misbehaviour`, and a misbehaviour closes the connection
+    /// (`findings.md` §8). The node *is* enforcing the rule, which is why
+    /// the N3 row must read this as a refusal and not as acceptance.
+    ClosesOnOversizedPackage,
     /// Accept a ticket for an epoch past its horizon, instead of resetting
     /// the stream (`simple.md:335-337`).
     AcceptsUnknownEpoch,
@@ -1035,7 +1043,7 @@ impl SimNode {
             CE139 | CE140 => self.serve_segment_shards(&mut send, kind, &content).await,
             CE148 => self.serve_segments(&mut send, &content).await,
             CE133 | CE146 => {
-                self.receive_package(&mut send, kind, &mut reader, &content)
+                self.receive_package(&connection, &mut send, kind, &mut reader, &content)
                     .await
             }
             CE134 => self.receive_share(&mut send, &mut reader, &content).await,
@@ -1061,6 +1069,7 @@ impl SimNode {
     /// node reading either as one value gets both wrong.
     async fn receive_package(
         &self,
+        connection: &Conn,
         send: &mut SendHalf,
         kind: u8,
         reader: &mut StreamReader,
@@ -1089,6 +1098,16 @@ impl SimNode {
         let refuse = self.fault == SimFault::RefusesPackages
             || (over_cap && self.fault != SimFault::AcceptsOversizedPackage);
         if refuse {
+            // The escalating node refuses at the connection, in polkajam's
+            // own words and code, so the row is read against the shape of a
+            // real close rather than an invented one.
+            if over_cap && self.fault == SimFault::ClosesOnOversizedPackage {
+                connection.close(
+                    257,
+                    &format!("Message size {} outside expected range", first.len()),
+                );
+                return;
+            }
             send.reset(NO_DATA_CODE);
             return;
         }

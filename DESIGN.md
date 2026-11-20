@@ -613,13 +613,22 @@ those the assertion is "not included" alone.
 
 | Check | Assertions | Faults |
 |---|---|---|
-| CE 133 `:351-376` (builder → NUT in NUT's rotation) | NUT FINs, opens CE 134 to both co-guarantors within ~3 s | first message > 2+200·1024 bytes → reset `:362-364`; NUT not guarantor of the core → ignore; unauthorized package → no sharing; extrinsic size mismatch → reset |
+| CE 133 `:351-376` (builder → NUT in NUT's rotation) | NUT FINs, opens CE 134 to both co-guarantors within ~3 s | first message > 2+200·1024 bytes → refuse `:362-364`; NUT not guarantor of the core → ignore; unauthorized package → no sharing; extrinsic size mismatch → refuse |
 | CE 146 `:378-404` | as 133, under row names of its own; the cap is on the **work-package message alone**, not on it plus the core index as CE 133's is | package > 200·1024 → reset. *(The bad-import-proof fault is not posed: this run's package imports no segments, so it carries no proof to spoil.)* |
 | CE 134 send `:406-458` | message 1 `Core ++ ShardCount(6) ++ len++[WPHash ++ SegRoot]`; message 2 bundle byte-identical to reference `:421-425`; shard count valid `:433-437` | co-guarantor replies wrong hash → its signature excluded; reset → proceed with the other |
 | CE 134 receive | NUT replies `WRHash ++ sig($jam_guarantee ++ blake(E(report)))`; hash equals reference (NUT refines) | **posed** (`m2-sim/tests/n3_ce134_sim_it.rs`): a share reset instead of answered; a reply naming a hash the bundle does not refine to; a share coded for the wrong validator count taken anyway. Bad mappings are not posed and cannot be: `:443-445` lets a guarantor refuse *or* trust them, so neither answer is wrong |
 | CE 135 send `:460-485` | `Report ++ Slot ++ len++[(Idx,Sig)]`, 2–3 signatures sorted and valid; report equals reference; to all current validators, in the last rotation also to the next set `:469-471`; ~2 s wait for the third `:465-467` | **posed** (`m2-sim/tests/n3_ce135_sim_it.rs`): one signature; signatures descending; a signer that does not hold the core; a well-formed report refined from other items; distribution reaching one validator |
 | CE 135 receive → inclusion | NUT includes reference-signed reports in its next block | **posed** (`m2-sim/tests/n3_ce135_inclusion_sim_it.rs`): a node that pools nothing. The four exclusion faults — one signature, unassigned signer, stale slot, duplicate core — are *harness-side*: they describe distributing a bad guarantee and asserting the node leaves it out, and no row asserts that yet. They are posable when one is written, unlike the assurance equivalent: `note_guarantee` takes a guarantee unchecked but block composition re-checks it (`guarantors/table.rs`, `context.check(guarantee)` → `continue`), so a node that pools a bad one authors a valid block without it rather than refusing to author |
 | CE 148 `:650-673` | **graded in N4, not here** — see below |
+
+**"Refuse" above means the node said no, by either route open to it:** a
+reset of the stream the message arrived on, or a close of the whole
+connection that the peer performed. The N3 rows ask only whether the rule
+was applied. *Where* the refusal landed is one question about every
+protocol rather than one per protocol, so it is graded once, by N0's
+`rejection_keeps_the_connection` (`findings.md` §30). A row that graded
+both at once reported a node enforcing the cap the hard way as a node
+ignoring it, for five days (`findings.md` §8).
 
 CE 148 moved to N4. The grouping above is by *purpose* — CE 148 completes a
 bundle — but what decides which lane can ask the question is the plan. The

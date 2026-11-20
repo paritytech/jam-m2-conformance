@@ -222,6 +222,7 @@ pub async fn spawn_package_sender(
     trace: Arc<std::sync::Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
     submissions: Arc<Mutex<Vec<SubmittedPackage>>>,
+    connection_ends: Arc<Mutex<Vec<m2_scenario::scenarios::n0::ConnectionEnded>>>,
     peer: u16,
 ) {
     sleep_until_slot(plan.slot).await;
@@ -310,6 +311,7 @@ pub async fn spawn_package_sender(
             // Not known until the node answers, below.
             refused: false,
             reset_code: None,
+            connection_end: None,
             fault: lane_fault(plan.fault),
             co_guarantors: plan.co_guarantors.clone(),
             imports_from: plan
@@ -323,17 +325,48 @@ pub async fn spawn_package_sender(
     };
     send.finish();
 
-    // Only a reset counts as a refusal. A connection that died for its own
-    // reasons also fails this read, and recording that as a refusal would
-    // credit the node with a judgement it never made.
+    // The node's verdict, which it can give in either of two ways: a reset
+    // of this stream, or a close of the whole connection. Both are recorded,
+    // and kept apart, because they are not the same answer -- one costs the
+    // submission and the other costs every protocol with this peer.
+    //
+    // What is *not* a verdict is a connection that died for its own reasons.
+    // Only the peer's own close counts, which is why the end is read from
+    // the connection rather than inferred from the read failing: a timeout
+    // and a refusal fail this read identically, and for five days the lane
+    // read the second as the node having accepted what it refused
+    // (`findings.md` §8).
     let mut buf = [0u8; 1024];
-    if let Err(ReadError::Reset(code)) = recv.read(&mut buf).await {
+    let read = recv.read(&mut buf).await;
+    if let Err(ReadError::Reset(code)) = read {
         {
             let mut recorded = crate::emu::lock(&submissions);
             recorded[index].refused = true;
             recorded[index].reset_code = Some(code);
         }
         record(&obs, peer, ObsKind::Other(PACKAGE_REFUSED));
+    } else {
+        // Whether the read failed or simply ended: a connection the peer
+        // closed takes the stream with it, and which of the two a carrier
+        // surfaces is the carrier's business, not the node's verdict. Over
+        // QUIC the read errors; the mock ends it cleanly. Asking the
+        // connection rather than the stream gives one answer on both.
+        let end = connection.end_reason();
+        if let Some(end) = &end {
+            eprintln!(
+                "[submission] the connection carrying the CE {} submission ended: {end}",
+                plan.protocol
+            );
+            // The N0 row grading where a refusal lands reads every end the
+            // run saw, and a builder's connection is one the node can close
+            // for the same reason it closes a validator's.
+            crate::emu::lock(&connection_ends).push(m2_scenario::scenarios::n0::ConnectionEnded {
+                peer,
+                at_wall_ms: wall_ts(),
+                end: end.clone(),
+            });
+        }
+        crate::emu::lock(&submissions)[index].connection_end = end;
     }
 }
 

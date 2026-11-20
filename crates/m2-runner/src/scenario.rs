@@ -527,6 +527,7 @@ pub(crate) fn fabricated_run_ctx(
                 sent_at_wall_ms: submitted_at,
                 refused: false,
                 reset_code: None,
+                connection_end: None,
                 fault: None,
                 co_guarantors: fab_co_guarantors.clone(),
                 imports_from: Some(m2_scenario::scenarios::n3::ImportedFrom {

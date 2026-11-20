@@ -48,6 +48,15 @@ use crate::dsl::{check, log, Check, Control, ObsKind, Severity};
 /// every validator but the NUT's, so it starts at 1 only when the NUT is at 0.
 pub const PEER_1: u16 = 1;
 
+/// The index the work-package builder is recorded under.
+///
+/// Outside the validator range on purpose: CE 133 is builder-to-guarantor,
+/// and a lane that read the builder's traffic as a validator's would grade
+/// a validator that was never there. It lives here, beside the lane that
+/// prints it, rather than in the runner that spawns the builder -- both
+/// sides have to agree on it, so it is defined once.
+pub const BUILDER_PEER: u16 = 0xB0;
+
 pub const CERT_ED25519: u8 = 20;
 pub const CERT_KEY_MATCH: u8 = 21;
 pub const CERT_SAN_OK: u8 = 22;
@@ -366,16 +375,31 @@ pub fn connection_close(ends: Vec<ConnectionEnded>, connected: bool) -> Check {
                     Severity::Soft,
                     || {
                         format!(
-                            "the NUT closed the whole connection to validator {} with \
+                            "the NUT closed the whole connection to {} with \
                              \"{reason}\" (code {code}) at wall {} ms, where rejecting a CE \
                              message is a reset of the stream it arrived on",
-                            end.peer, end.at_wall_ms
+                            peer_name(end.peer),
+                            end.at_wall_ms
                         )
                     },
                 )
             })
             .collect()
     })
+}
+
+/// Name a peer the way the run knows it.
+///
+/// Most ends belong to an emulated validator, whose index is its index. The
+/// builder submits over a connection of its own and sits outside the
+/// validator range on purpose, so printing it as "validator 176" names a
+/// validator that does not exist (`findings.md` §8).
+fn peer_name(peer: u16) -> String {
+    if peer == BUILDER_PEER {
+        "the builder".to_string()
+    } else {
+        format!("validator {peer}")
+    }
 }
 
 /// A connection to the node under test that ended during the run, and why.
