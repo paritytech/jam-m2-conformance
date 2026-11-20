@@ -117,6 +117,14 @@ pub enum SimFault {
     /// opened CE 143" from "the node asked for what it was told about",
     /// which one row each.
     AsksForAnotherPreimage,
+    /// Follow up *every* announcement, including one for a preimage no
+    /// service solicited.
+    ///
+    /// The stand-in has no chain and so asks for everything by default;
+    /// this variant is what the honest one is *not*, and the honest one
+    /// declines an unsolicited announcement so the lane's negative row has
+    /// a node that passes it.
+    AsksForUnsolicitedPreimages,
     /// Accept a ticket for an epoch past its horizon, instead of resetting
     /// the stream (`simple.md:335-337`).
     AcceptsUnknownEpoch,
@@ -1087,6 +1095,16 @@ impl SimNode {
         let Ok(announcement) = PreimageAnnouncement::decode(&mut &content[..]) else {
             return;
         };
+        // The stand-in has no chain, so "solicited" is modelled by the blob
+        // itself: it follows up the one the lane solicits and declines the
+        // one it never does. Crude, and enough -- the row under test is
+        // whether a node *can* decline, and a node that asks for everything
+        // must fail it.
+        let solicited =
+            announcement.hash == jam_std_common::hash_raw(&m2_reference::reports::n6_preimage());
+        if !solicited && self.fault != SimFault::AsksForUnsolicitedPreimages {
+            return;
+        }
         let asked = if self.fault == SimFault::AsksForAnotherPreimage {
             // A hash it was never told about: the row must not credit this
             // as having followed up the announcement.

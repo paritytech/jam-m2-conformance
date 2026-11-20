@@ -477,6 +477,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             preimage_solicited: Arc::clone(&shared.preimage_solicited),
             preimages_announced: Arc::clone(&shared.preimages_announced),
             preimage_requests: Arc::clone(&shared.preimage_requests),
+            nut_announced_preimages: Arc::clone(&shared.nut_announced_preimages),
             ref_chain,
             nut_blocks,
             deliveries,
@@ -1377,7 +1378,7 @@ async fn announce_preimage(
                 builder: false,
             },
             ed25519_consensus::SigningKey::from(seed),
-            expected_san,
+            expected_san.clone(),
             addr,
         )
         .await;
@@ -1388,10 +1389,57 @@ async fn announce_preimage(
             return;
         }
     };
+    let expected_san_for_unsolicited = expected_san.clone();
+    // The solicited one first, served honestly. This is the row that says
+    // the node follows up, and the control for both rows below it.
     m2_emu::preimage_io::announce_and_serve(
         connection.clone(),
         m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
         blob,
+        m2_emu::preimage_io::Solicited::OnChain,
+        m2_emu::preimage_io::ServeAs::Announced,
+        Arc::clone(&shared.trace),
+        Arc::clone(&shared.obs),
+        Arc::clone(&shared.preimages_announced),
+        Arc::clone(&shared.preimage_requests),
+        m2_scenario::scenarios::n6::ORDINARY_PEER,
+    )
+    .await;
+    drop(connection);
+
+    // Then one nobody asked for, on a connection of its own. The node must
+    // not follow up: `simple.md:705-707` makes the follow-up conditional,
+    // and without this the lane would pass a node that asked for everything
+    // it was told about.
+    //
+    // A second connection rather than a second announcement on the first,
+    // because the first has already been held for its ten seconds and a
+    // node is not expected to reopen one it saw close (`:709-710`).
+    let unsolicited = m2_reference::reports::n6_unsolicited_preimage();
+    let mut seed = [0u8; 32];
+    seed[0] = 0x6E;
+    seed[1] = 0x07;
+    let connected = jamnp_s::transport::quic::QuicTransport
+        .connect(
+            jamnp_s::endpoint::EndpointConfig {
+                genesis_hash,
+                builder: false,
+            },
+            ed25519_consensus::SigningKey::from(seed),
+            expected_san_for_unsolicited,
+            addr,
+        )
+        .await;
+    let Ok(connection) = connected else {
+        eprintln!("[preimage] could not connect to announce the unsolicited preimage");
+        return;
+    };
+    m2_emu::preimage_io::announce_and_serve(
+        connection.clone(),
+        m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+        unsolicited,
+        m2_emu::preimage_io::Solicited::Never,
+        m2_emu::preimage_io::ServeAs::Announced,
         Arc::clone(&shared.trace),
         Arc::clone(&shared.obs),
         Arc::clone(&shared.preimages_announced),

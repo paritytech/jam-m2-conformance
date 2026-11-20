@@ -243,6 +243,15 @@ pub fn n6_preimage() -> Vec<u8> {
     b"m2-conformance-n6-preimage".to_vec()
 }
 
+/// A blob no service ever asks for, announced to show that the node reads
+/// the condition rather than asking for whatever it is told about.
+///
+/// Distinct from [`n6_preimage`] by more than a byte, so a node that
+/// confused the two would be asking for a visibly different hash.
+pub fn n6_unsolicited_preimage() -> Vec<u8> {
+    b"m2-conformance-n6-never-solicited".to_vec()
+}
+
 /// A package built earlier in the same run, and the one segment of it a
 /// later package imports.
 ///

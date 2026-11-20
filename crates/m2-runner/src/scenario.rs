@@ -712,23 +712,46 @@ pub(crate) fn fabricated_run_ctx(
     // one unexercised would ship a lane nothing had ever graded.
     let n6_blob = m2_reference::reports::n6_preimage();
     let n6_hash = jam_std_common::hash_raw(&n6_blob);
+    let n6_unsolicited =
+        jam_std_common::hash_raw(&m2_reference::reports::n6_unsolicited_preimage());
     let n6 = n6::N6Ctx {
-        announced: vec![n6::AnnouncedPreimage {
-            peer: n6::ORDINARY_PEER,
-            service_id: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
-            hash: n6_hash,
-            length: n6_blob.len() as u32,
-            at_wall_ms: submitted_at,
-        }],
+        announced: vec![
+            n6::AnnouncedPreimage {
+                solicited: n6::Solicited::OnChain,
+                peer: n6::ORDINARY_PEER,
+                service_id: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+                hash: n6_hash,
+                length: n6_blob.len() as u32,
+                at_wall_ms: submitted_at,
+            },
+            // The one nobody solicited, which a conforming node leaves
+            // alone. Without it the baseline would never grade the row
+            // that says so.
+            n6::AnnouncedPreimage {
+                solicited: n6::Solicited::Never,
+                peer: n6::ORDINARY_PEER,
+                service_id: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+                hash: n6_unsolicited,
+                length: 33,
+                at_wall_ms: submitted_at + 1,
+            },
+        ],
         requests: vec![n6::PreimageRequested {
             peer: n6::ORDINARY_PEER,
             asked: n6_hash,
             matched_announcement: true,
             after_announcement_ms: 400,
             answered: true,
+            served_matches_hash: true,
         }],
         solicited_on_chain: true,
         included: vec![n6_hash],
+        // Validator 0's grid neighbours in the tiny set are 1, 2 and 4;
+        // the fabricated node announces to all of them, as a conforming
+        // one does.
+        nut_announced_to: vec![(1, n6_hash), (2, n6_hash), (4, n6_hash)],
+        nut_index: 0,
+        emulated_peers: vec![1, 2, 3, 4, 5],
         authored_after_announcement: true,
     };
 

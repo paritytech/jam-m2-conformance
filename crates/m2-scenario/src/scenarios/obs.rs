@@ -143,3 +143,9 @@ pub const NUT_SENT_143: u8 = 65;
 
 /// The harness served the preimage it had announced.
 pub const EMU_SERVED_143: u8 = 66;
+
+/// The NUT announced a preimage it obtained, gossiping to a neighbour.
+pub const NUT_SENT_142: u8 = 67;
+
+/// The NUT sent a CE 142 frame that would not decode.
+pub const NUT_SENT_BAD_142: u8 = 68;

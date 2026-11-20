@@ -71,6 +71,8 @@ pub(crate) struct RealRunData {
     pub(crate) preimages_announced: Arc<Mutex<Vec<m2_scenario::scenarios::n6::AnnouncedPreimage>>>,
     /// CE 143 requests the NUT opened back on the announcing connection.
     pub(crate) preimage_requests: Arc<Mutex<Vec<m2_scenario::scenarios::n6::PreimageRequested>>>,
+    /// CE 142 announcements the NUT made, by the peer that heard each.
+    pub(crate) nut_announced_preimages: m2_scenario::scenarios::n6::HeardAnnouncements,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
@@ -256,7 +258,7 @@ pub(crate) fn build_real_run_ctx(
     let t = std::time::Instant::now();
     let n4 = build_n4_ctx(data, &nut_blocks);
     crate::run::phase("ctx.build_n4", t);
-    let n6 = build_n6_ctx(data, &nut_blocks);
+    let n6 = build_n6_ctx(data, &nut_blocks, data.nut_index, &data.emu_indices);
     Ok(RunCtx {
         n0,
         n1: Some(n1),
@@ -276,6 +278,8 @@ pub(crate) fn build_real_run_ctx(
 fn build_n6_ctx(
     data: &RealRunData,
     nut_blocks: &[crate::real::NutBlock],
+    nut_index: usize,
+    emu_indices: &[usize],
 ) -> m2_scenario::scenarios::n6::N6Ctx {
     let announced = data
         .preimages_announced
@@ -287,6 +291,13 @@ fn build_n6_ctx(
         announced,
         requests: data.preimage_requests.lock().expect("the requests").clone(),
         solicited_on_chain: *data.preimage_solicited.lock().expect("the solicit flag"),
+        nut_announced_to: data
+            .nut_announced_preimages
+            .lock()
+            .expect("the gossip")
+            .clone(),
+        nut_index: nut_index as u16,
+        emulated_peers: emu_indices.iter().map(|&i| i as u16).collect(),
         included: nut_blocks
             .iter()
             .flat_map(|n| n.block.extrinsic.preimages.iter())

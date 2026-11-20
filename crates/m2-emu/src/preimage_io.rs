@@ -30,7 +30,9 @@ use jamnp_s::{
 };
 use m2_scenario::dsl::{ObsKind, ObsLog};
 use m2_scenario::scenarios::n6::{AnnouncedPreimage, PreimageRequested};
-use m2_scenario::scenarios::obs::{EMU_SENT_142, EMU_SERVED_143, NUT_SENT_143};
+use m2_scenario::scenarios::obs::{
+    EMU_SENT_142, EMU_SERVED_143, NUT_SENT_142, NUT_SENT_143, NUT_SENT_BAD_142,
+};
 
 use crate::emu::{lock, record, trace_record, StreamReader};
 
@@ -51,6 +53,8 @@ pub async fn announce_and_serve(
     connection: Conn,
     service_id: u32,
     blob: Vec<u8>,
+    solicited: Solicited,
+    serve: ServeAs,
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
     announced: Arc<Mutex<Vec<AnnouncedPreimage>>>,
@@ -84,6 +88,7 @@ pub async fn announce_and_serve(
     let announced_at = wall_ts();
     record(&obs, peer, ObsKind::Other(EMU_SENT_142));
     lock(&announced).push(AnnouncedPreimage {
+        solicited,
         peer,
         service_id,
         hash,
@@ -121,6 +126,7 @@ pub async fn announce_and_serve(
                     recv,
                     &blob,
                     hash,
+                    serve,
                     announced_at,
                     &trace,
                     &obs,
@@ -141,6 +147,7 @@ async fn serve_one(
     recv: RecvHalf,
     blob: &[u8],
     announced_hash: [u8; 32],
+    serve: ServeAs,
     announced_at: u64,
     trace: &Arc<Mutex<Trace>>,
     obs: &Arc<Mutex<ObsLog>>,
@@ -169,6 +176,7 @@ async fn serve_one(
         matched_announcement: asked == Some(announced_hash),
         after_announcement_ms: wall_ts().saturating_sub(announced_at),
         answered: asked == Some(announced_hash),
+        served_matches_hash: serve == ServeAs::Announced,
     });
 
     // Answered only where the hash is the one announced. A node that asked
@@ -185,16 +193,56 @@ async fn serve_one(
         send.reset(STREAM_REFUSED);
         return;
     }
-    let reply = frame_message(
-        &PreimageReply {
-            preimage: blob.to_vec(),
+    // What goes back: the blob, or a blob that does not hash to what was
+    // asked for. The second is the only way to show that the node checks --
+    // a node that took it on our word would include a lookup under a key
+    // its own bytes do not produce.
+    let served = match serve {
+        ServeAs::Announced => blob.to_vec(),
+        ServeAs::Mismatched => {
+            let mut spoiled = blob.to_vec();
+            spoiled.push(0xff);
+            spoiled
         }
-        .encode(),
-    );
+    };
+    let reply = frame_message(&PreimageReply { preimage: served }.encode());
     trace_record(peer, CE143, send.id(), &reply, trace, TraceDir::Rx);
     let _ = send.write_all(&reply).await;
     send.finish();
     record(obs, peer, ObsKind::Other(EMU_SERVED_143));
+}
+
+/// Record a CE 142 announcement the NUT made to an emulated validator.
+///
+/// The gossip half of the protocol: a validator that has obtained a
+/// requested preimage should announce possession to its grid neighbours
+/// (`simple.md:712-713`). Kept per peer, because the row grades which
+/// neighbours heard it -- a node that announced to one arbitrary validator
+/// would pass a row that only counted announcements.
+pub fn handle_inbound_announcement(
+    content: &[u8],
+    peer: u16,
+    obs: &Mutex<ObsLog>,
+    heard: &Mutex<Vec<(u16, [u8; 32])>>,
+) {
+    let Ok(announcement) = PreimageAnnouncement::decode(&mut &content[..]) else {
+        record(obs, peer, ObsKind::Other(NUT_SENT_BAD_142));
+        return;
+    };
+    record(obs, peer, ObsKind::Other(NUT_SENT_142));
+    lock(heard).push((peer, announcement.hash));
+}
+
+/// Whether the preimage being announced was solicited on chain first.
+pub use m2_scenario::scenarios::n6::Solicited;
+
+/// What the announcer sends when the node asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeAs {
+    /// The blob that was announced.
+    Announced,
+    /// A blob that does not hash to the announced value.
+    Mismatched,
 }
 
 /// The code an unserved stream kind is reset with, as the emulator uses

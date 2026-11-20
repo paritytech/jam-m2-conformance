@@ -35,6 +35,20 @@ const NUT_INDEX: usize = 2;
 
 /// Announce a preimage to a simulated node and grade what it did.
 async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
+    grade_as(
+        fault,
+        n6::Solicited::OnChain,
+        m2_emu::preimage_io::ServeAs::Announced,
+    )
+    .await
+}
+
+/// The same, with the announcement's arrangement chosen by the caller.
+async fn grade_as(
+    fault: SimFault,
+    solicited: n6::Solicited,
+    serve: m2_emu::preimage_io::ServeAs,
+) -> Vec<(&'static str, Outcome)> {
     let transport = Arc::new(MockNetwork::new()) as Arc<dyn Transport>;
     let oracle = m2_reference::oracle::Oracle::for_tests();
     let harness_chain = Arc::new(RefChain::tiny(&oracle, NUT_INDEX).expect("the harness chain"));
@@ -76,6 +90,8 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         connection.clone(),
         0, // the dev bootstrap service
         blob.clone(),
+        solicited,
+        serve,
         Arc::new(std::sync::Mutex::new(jamnp_s::trace::Trace::default())),
         Arc::clone(&obs),
         Arc::clone(&announced),
@@ -87,13 +103,15 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
 
     let announced = announced.lock().expect("the announcements").clone();
     let requests = requests.lock().expect("the requests").clone();
-    // The stand-in authors nothing, so the inclusion row is given its
-    // subject directly: whether the node *included* the blob is a different
-    // question from whether it asked for it, and this test grades the
-    // asking.
+    // The stand-in authors nothing, so inclusion is modelled rather than
+    // driven: an honest node includes what it was served when the blob
+    // hashes to what it asked for, and not otherwise. Both directions of
+    // the rows that read this are graded in `scenarios::n6`'s own tests,
+    // where the context is explicit -- a stand-in that cannot author cannot
+    // honestly be said to have failed an inclusion row.
     let included = requests
         .iter()
-        .filter(|r: &&n6::PreimageRequested| r.answered)
+        .filter(|r: &&n6::PreimageRequested| r.answered && r.served_matches_hash)
         .map(|r| r.asked)
         .collect();
     let ctx = N6Ctx {
@@ -101,6 +119,12 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         requests,
         solicited_on_chain: true,
         included,
+        // The stand-in gossips nothing and authors nothing; those rows are
+        // graded by their own controls, which report themselves unexercised
+        // here rather than passing.
+        nut_announced_to: Vec::new(),
+        nut_index: NUT_INDEX as u16,
+        emulated_peers: Vec::new(),
         authored_after_announcement: true,
     };
 
@@ -198,6 +222,57 @@ async fn the_preimage_checks_catch_a_node_that_mishandles_an_announcement() {
     );
 }
 
+/// Can the condition rows fail?
+///
+/// The lane announces two preimages: one a service solicited and one nobody
+/// did. Without the second the lane proves only that the node asks when it
+/// should, and would pass a node that asked for everything it was told
+/// about — which is half a lane, and was the state N6 shipped in before
+/// this test existed.
+#[tokio::test(start_paused = true)]
+async fn the_condition_rows_catch_a_node_that_asks_for_anything() {
+    // A node that declines the unsolicited announcement passes the row.
+    let honest = grade_as(
+        SimFault::None,
+        n6::Solicited::Never,
+        m2_emu::preimage_io::ServeAs::Announced,
+    )
+    .await;
+    // With no solicited announcement beside it, the row has no control and
+    // must say so rather than crediting the silence.
+    assert!(
+        outcomes_of(&honest, "n6_unsolicited_not_requested").is_empty(),
+        "without a control the row must not report a verdict; it reported {:?}",
+        outcomes_of(&honest, "n6_unsolicited_not_requested")
+    );
+    assert!(
+        failed(&honest, "n6_unsolicited_not_exercised"),
+        "and it must say the control was missing; it reported {:?}",
+        outcomes_of(&honest, "n6_unsolicited_not_exercised")
+    );
+
+    // A blob that does not hash to what was asked for must not be included.
+    let mismatched = grade_as(
+        SimFault::None,
+        n6::Solicited::OnChain,
+        m2_emu::preimage_io::ServeAs::Mismatched,
+    )
+    .await;
+    assert!(
+        passed(&mismatched, "n6_mismatched_preimage_not_included"),
+        "a node that does not include a blob failing its own hash must pass; it reported \
+         {:?}",
+        outcomes_of(&mismatched, "n6_mismatched_preimage_not_included")
+    );
+    // And the row must be the mismatch one, not the inclusion one: they ask
+    // different questions and only one of them is Hard.
+    assert!(
+        outcomes_of(&mismatched, "n6_preimage_included").is_empty(),
+        "a mismatched blob is graded by its own row; it reported {:?}",
+        outcomes_of(&mismatched, "n6_preimage_included")
+    );
+}
+
 /// A run that never got its preimage solicited grades nobody.
 ///
 /// The lane's precondition is on chain, not on the wire: a node owes a
@@ -210,6 +285,7 @@ fn a_run_that_did_not_solicit_grades_nobody() {
     let obs = m2_scenario::dsl::ObsLog::new();
     let ctx = N6Ctx {
         announced: vec![n6::AnnouncedPreimage {
+            solicited: n6::Solicited::OnChain,
             peer: n6::ORDINARY_PEER,
             service_id: 0,
             hash: [0x11; 32],
@@ -219,6 +295,9 @@ fn a_run_that_did_not_solicit_grades_nobody() {
         requests: Vec::new(),
         solicited_on_chain: false,
         included: Vec::new(),
+        nut_announced_to: Vec::new(),
+        nut_index: NUT_INDEX as u16,
+        emulated_peers: Vec::new(),
         authored_after_announcement: true,
     };
     let rows: Vec<_> = (n6::requests_announced(&ctx).run)(&obs);

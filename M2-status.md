@@ -595,6 +595,47 @@ is ever accumulated, because the availability plan assures one report. The
 solicit therefore rides the honest package, which is not where it belongs;
 the comment says why it has to, so the next reader does not tidy it apart.
 
+**N6 completed the same day.** The first cut graded the happy path and
+nothing else: it showed the node asks when it should and nothing showed it
+declining when it should not. Three rows closed that, and two of them had
+been talked out of in DESIGN on reasoning that did not hold:
+
+| row | what it catches |
+|---|---|
+| `n6_unsolicited_not_requested` (Hard) | a node that asks for anything it is told about, ignoring the on-chain condition |
+| `n6_mismatched_preimage_not_included` (Hard) | a node that includes a blob failing its own hash -- Hard where inclusion is Soft, because the preimage extrinsic is keyed on the hash |
+| `n6_gossip_reaches_neighbours` (Soft) | a node that gossips to some peer rather than to its grid neighbours |
+
+**Two justifications in DESIGN were wrong and are recorded as such.** The
+gossip row was skipped because the emulated validators were said not to
+neighbour the NUT in every run -- but the grid is `index / W` and
+`index % W` (`simple.md:188-189`), a function of the index alone, so who
+neighbours whom never varies. And the unsolicited row was skipped because
+its silence was said to be indistinguishable from an unmet precondition --
+but the solicited announcement in the same run is its control, which is how
+every N3 fault row already works. Both were rationalisations of a gap. They
+are quoted in DESIGN beside the correction, because a wrong reason left in
+place is worse than the gap: nobody re-examines it.
+
+`grid_neighbours` is the one implementation, checked against the tiny grid
+§2 names rather than copied from it. Its own test found a bug in it: an
+index outside the set still shared a column with somebody, so neighbouring
+stopped being mutual.
+
+**Two checks earned their keep during verification.** Clippy's `unreachable
+pattern` was a real defect, not a style nit -- `CE142` was not imported in
+`emu.rs`, so the new match arm bound it as a *variable*, swallowing every
+stream kind and making the refusal arm dead. It compiled and the tests
+passed. And the dry-run baseline *failed* its own gossip row, because the
+fabricated node announced to peers 1 and 3 where validator 0's neighbours
+are 1, 2 and 4 -- a baseline that models a conforming node and fails is a
+wrong fabrication, not a wrong node.
+
+Confirmed (`sessions/n6-5`, 592 rows over 300 s): all five N6 rows pass
+against polkajam. The node asks for the solicited preimage, leaves the
+unsolicited one alone, and announces what it obtained to its grid
+neighbours.
+
 **The sim test found a tautology in a row written hours after §5.**
 `n6_ce143_asked_for_what_was_announced` was emitted only for a request that
 had already matched the announcement, then asserted it matched -- true by

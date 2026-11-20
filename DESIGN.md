@@ -704,7 +704,7 @@ peer class alone, before the preimage is looked at.
 the preimage has been requested on chain by the given service"
 (`:705-707`), and polkajam enforces it: `note_preimage` returns
 `NotRequested` otherwise. So the run must get a `Solicit` **accumulated**
-before it announces, which means a package the node guarantees, includes,
+before it announces, which means a package the node guarantees, includes
 *and* has assured -- a report that is not available is never accumulated.
 That is why the solicit rides the honest package rather than one of its own
 (`findings.md` §31).
@@ -713,19 +713,44 @@ Until the solicit lands, the correct node behaviour is silence. Every row
 below is gated on it and reports `n6_preimage_not_solicited` rather than
 failing a node for the harness's timing.
 
+**Two announcements, and the second is what makes the lane two-sided.** One
+preimage a service solicited and one nobody did. A lane that announced only
+solicited preimages would pass a node that asked for everything it was told
+about, which is half the sentence at `:705-707`. The unsolicited row is
+reported only where the solicited announcement beside it *did* draw a
+request: that is its control, and without it the node's silence says
+nothing.
+
 | Check | Assertions | Faults |
 |---|---|---|
 | Announce → request `:700-744` | an ordinary peer announces `ServiceID ++ Hash ++ Len` for a preimage solicited on chain and holds the connection 10 s `:705-710`; the NUT opens CE 143 **back on that connection** and asks for the announced hash | **posed** (`m2-sim/tests/n6_sim_it.rs`): a node that reads the announcement and never follows up; one that follows up asking for a hash nobody announced |
+| Unsolicited → silence `:705-707` | a second announcement, for a blob no service asked for, draws no CE 143 | **posed**: a node that asks for everything it is told about |
 | Serve | the harness answers CE 143 with the blob, and only for the hash it announced | a request for another hash → reset, and the row says the node asked for something this run never announced |
-| Inclusion | the preimage reaches a block the NUT authored *after* the announcement | graded Soft: `simple.md` sets no deadline, and a node that asked, was served and has not yet authored is in breach of nothing the harness can cite |
-| Gossip `:712-713` | **not graded.** A validator announces an obtained preimage to its grid neighbours, and the harness's emulated validators are not the NUT's neighbours in every run; a row keyed on it would report itself unexercised more often than not |
+| Inclusion | a preimage the node asked for and was served reaches a block it authored *after* the announcement. Soft: `simple.md` sets no deadline, and a node that asked, was served and has not yet authored is in breach of nothing the harness can cite | a blob that does not hash to what was asked for must **not** be included — Hard, because the preimage extrinsic is keyed on the hash and a node that included it would put a lookup under a key its own bytes do not produce |
+| Gossip `:712-713` | the NUT announces an obtained preimage to **its grid neighbours**, named from `:188-189` rather than accepted as any announcement. Soft: `:712` says *should* | **posed** (`scenarios::n6`): gossip that reaches one of three neighbours, and gossip to a peer that is not a neighbour at all |
 
-**What this lane does not do.** It poses no fault on the announcement
-itself -- a wrong length, an unsolicited hash, a service that does not
-exist. Each would be a row about the node declining, and declining is also
-what a node does when the harness's own precondition has not landed, so the
-two cannot be told apart from outside until the lane can read the chain's
-request set directly.
+**Who neighbours whom is computed, not assumed.** Two validators neighbour
+each other if they share a row (`index / W`) or a column (`index % W`), `W
+= floor(sqrt(V))` (`:188-189`) — a function of the index alone, so it is
+the same in every run with the same validator count.
+`scenarios::n6::grid_neighbours` is the one implementation, checked against
+the tiny grid §2 names rather than copied from it.
+
+> An earlier draft of this section said the gossip row would "report itself
+> unexercised more often than not" because the emulated validators are not
+> the NUT's neighbours in every run, and that an unsolicited announcement
+> "cannot be told apart from outside" from one whose precondition had not
+> landed. **Both were wrong**, and both were rationalisations of a gap
+> rather than constraints: the grid is deterministic, and the solicited
+> announcement in the same run is the control for the unsolicited one. They
+> are recorded here because a wrong justification left in place is worse
+> than the gap — the next reader does not re-examine it.
+
+**What this lane still does not do.** It grades inclusion but not the
+ordering the GP asks of a preimage extrinsic, nor that the lookup is
+updated; and it does not ask the NUT to *serve* a preimage over CE 143,
+which polkajam allows only from a grid neighbour and so wants an emulated
+validator chosen by the same helper above.
 
 ### N7 — adversarial and robustness (cross-cutting)
 
