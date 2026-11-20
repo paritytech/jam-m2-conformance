@@ -272,7 +272,7 @@ and pins `PvmBackend::Interpreter`.
 | P0 | `jamnp-s`, runner skeleton, N0 | ✅ implemented |
 | P1 | `m2-reference` (now an oracle client), N1 authoring, N2 tickets | ✅ implemented |
 | P2 | N3 guaranteeing, N4 availability | ✅ implemented — graded by name (`--lanes n0,n1,n2,n3,n4`), not by default; see below |
-| P3 | N5 auditing/disputes, N6 preimages | ⏳ |
+| P3 | N5 auditing/disputes, N6 preimages | ⏳ — N5's wire format re-specified 2026-11-20 against the current spec, and the CE 144/145 codecs rewritten with it (`findings.md` §28); no lane yet |
 | P4 | N7 adversarial, index rotation, IPv6, web UI | ⏳ |
 
 **Why N3 and N4 are not in the default lane set.** A check nobody has seen
@@ -377,7 +377,7 @@ private).
 References:
 - JAM prize: https://jam.web3.foundation/
 - JAMNP-S spec: https://github.com/zdave-parity/jam-np (`simple.md`). Every `simple.md:NNN`
-  in this repository refers to **a96dc6b** (2026-09-02); upstream has moved since, and
-  `findings.md` §28 says what changed and which of it costs anything.
+  in this repository refers to **aa0e2b8** (2026-10-26), re-pinned from a96dc6b on
+  2026-11-20; `findings.md` §28 says what the four hunks changed and what each cost.
 - Graypaper: https://graypaper.com/
 - M1 conformance (fuzz-proto, reports): https://github.com/davxy/jam-conformance

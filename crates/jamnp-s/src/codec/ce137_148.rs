@@ -40,13 +40,13 @@ pub type SegmentsRootMappings = Vec<([u8; 32], SegmentsRoot)>;
 /// CE 146 work-package cap in bytes (`simple.md:383`).
 pub const WORK_PACKAGE_MAX: usize = 200 * 1024;
 /// CE 139/140 cap: at most `2 * W_M` segment shards per stream, `W_M = 3072`
-/// (`simple.md:632-633`).
+/// (`simple.md:635-636`).
 pub const MAX_SEGMENT_SHARDS_PER_REQUEST: usize = 2 * 3072;
-/// CE 148 cap: at most `W_M = 3072` segments per stream (`simple.md:657-658`).
+/// CE 148 cap: at most `W_M = 3072` segments per stream (`simple.md:660-661`).
 pub const MAX_SEGMENTS_PER_REQUEST: usize = 3072;
 
 /// CE 137/138 justification: the co-path from the erasure-root to a shard
-/// (`simple.md:546`, `simple.md:571`).
+/// (`simple.md:546`, `simple.md:574`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Justification {
     /// `0 ++ Hash`: sibling-only co-path node.
@@ -91,7 +91,7 @@ impl Decode for Justification {
     }
 }
 
-/// CE 139/140 per-shard justification (`simple.md:637`).
+/// CE 139/140 per-shard justification (`simple.md:640`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SegmentJustification {
     /// `0 ++ Hash`.
@@ -166,7 +166,7 @@ pub struct ShardResponse {
     pub justification: Justification,
 }
 
-/// CE 138 response: `Bundle Shard ++ Justification` (`simple.md:577-578`).
+/// CE 138 response: `Bundle Shard ++ Justification` (`simple.md:580-581`).
 ///
 /// The request is the same [`ShardRequest`] as CE 137.
 #[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
@@ -177,14 +177,14 @@ pub struct AuditShardResponse {
     pub justification: Justification,
 }
 
-/// CE 147 request: `Erasure-Root` (`simple.md:591`).
+/// CE 147 request: `Erasure-Root` (`simple.md:594`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Encode, Decode)]
 pub struct BundleRequest {
     /// Erasure root of the requested work-package bundle.
     pub erasure_root: ErasureRoot,
 }
 
-/// CE 147 response: `Work-Package Bundle` (`simple.md:593`).
+/// CE 147 response: `Work-Package Bundle` (`simple.md:596`).
 #[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 pub struct BundleResponse {
     /// The encoded work-package bundle.
@@ -192,7 +192,7 @@ pub struct BundleResponse {
 }
 
 /// CE 139/140 request: `Erasure-Root ++ Shard Index ++ len++[Segment Index]`
-/// (`simple.md:641`; the single-element stream models the inner triple).
+/// (`simple.md:644`; the single-element stream models the inner triple).
 #[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 pub struct SegmentShardRequest {
     /// Erasure root of the work-package bundle.
@@ -210,7 +210,7 @@ impl SegmentShardRequest {
     }
 }
 
-/// CE 139 response: `[Segment Shard]` (`simple.md:643`).
+/// CE 139 response: `[Segment Shard]` (`simple.md:646`).
 #[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 pub struct SegmentShardsResponse {
     /// The requested segment shards.
@@ -218,7 +218,7 @@ pub struct SegmentShardsResponse {
 }
 
 /// CE 140 response: `[Segment Shard]` then one `Justification` per shard
-/// (`simple.md:643-646`).
+/// (`simple.md:646-649`).
 #[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 pub struct ProvenSegmentShardsResponse {
     /// The requested segment shards.
@@ -227,7 +227,7 @@ pub struct ProvenSegmentShardsResponse {
     pub justifications: Vec<SegmentJustification>,
 }
 
-/// CE 148 request: `Segments-Root ++ len++[Segment Index]` (`simple.md:668`;
+/// CE 148 request: `Segments-Root ++ len++[Segment Index]` (`simple.md:671`;
 /// the single-element stream models the inner pair).
 #[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 pub struct SegmentRequest {
@@ -244,7 +244,7 @@ impl SegmentRequest {
     }
 }
 
-/// CE 148 response: `[Segment]` then `[Import-Proof]` (`simple.md:670-671`).
+/// CE 148 response: `[Segment]` then `[Import-Proof]` (`simple.md:673-674`).
 ///
 /// **Two messages, not one value.** Each is a size-implied sequence with no
 /// count of its own, and the frame that carries it is the only thing that
@@ -261,7 +261,7 @@ pub struct SegmentResponse {
 }
 
 impl SegmentResponse {
-    /// Message 1: the segments concatenated (`simple.md:670`).
+    /// Message 1: the segments concatenated (`simple.md:673`).
     ///
     /// Every segment is `SEGMENT_LEN` bytes, so the boundaries follow from
     /// the length -- which is why the wire marks none.
@@ -284,7 +284,7 @@ impl SegmentResponse {
         Ok(input.chunks(segment_len).map(<[u8]>::to_vec).collect())
     }
 
-    /// Message 2: the import proofs concatenated (`simple.md:671`).
+    /// Message 2: the import proofs concatenated (`simple.md:674`).
     ///
     /// `Import-Proof = len++[Hash]`, so each element carries its own count
     /// and the elements run back to back with none of their own.

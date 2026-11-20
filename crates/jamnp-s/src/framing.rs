@@ -35,27 +35,27 @@ pub const CE135: u8 = 135;
 pub const CE136: u8 = 136;
 /// CE 137: Shard distribution (`simple.md:523-556`).
 pub const CE137: u8 = 137;
-/// CE 138: Audit shard request (`simple.md:558-580`).
+/// CE 138: Audit shard request (`simple.md:558-583`).
 pub const CE138: u8 = 138;
-/// CE 139: Segment shard request without justification (`simple.md:597-648`).
+/// CE 139: Segment shard request without justification (`simple.md:600-651`).
 pub const CE139: u8 = 139;
-/// CE 140: Segment shard request with justification (`simple.md:597-648`).
+/// CE 140: Segment shard request with justification (`simple.md:600-651`).
 pub const CE140: u8 = 140;
-/// CE 141: Assurance distribution (`simple.md:675-695`).
+/// CE 141: Assurance distribution (`simple.md:678-698`).
 pub const CE141: u8 = 141;
-/// CE 142: Preimage announcement (`simple.md:697-724`).
+/// CE 142: Preimage announcement (`simple.md:700-727`).
 pub const CE142: u8 = 142;
-/// CE 143: Preimage request (`simple.md:727-741`).
+/// CE 143: Preimage request (`simple.md:730-744`).
 pub const CE143: u8 = 143;
-/// CE 144: Audit announcement (`simple.md:743-793`).
+/// CE 144: Audit announcement (`simple.md:746-785`).
 pub const CE144: u8 = 144;
-/// CE 145: Judgment publication (`simple.md:795-833`).
+/// CE 145: Judgment publication (`simple.md:787-828`).
 pub const CE145: u8 = 145;
 /// CE 146: Work-package bundle submission (`simple.md:378-404`).
 pub const CE146: u8 = 146;
-/// CE 147: Bundle request (`simple.md:582-595`).
+/// CE 147: Bundle request (`simple.md:585-598`).
 pub const CE147: u8 = 147;
-/// CE 148: Segment request (`simple.md:650-673`).
+/// CE 148: Segment request (`simple.md:653-676`).
 pub const CE148: u8 = 148;
 
 /// Maximum accepted message content length in bytes.

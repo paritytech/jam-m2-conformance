@@ -349,7 +349,7 @@ async fn the_n4_availability_checks_catch_a_node_that_serves_wrongly() {
         outcomes_of(&no_segments, "n4_ce148_answered")
             .iter()
             .any(|o| **o == Outcome::Fail(m2_scenario::dsl::Severity::Soft)),
-        "and declining is soft, because `simple.md:660` allows the fallback: {:?}",
+        "and declining is soft, because `simple.md:663` allows the fallback: {:?}",
         outcomes_of(&no_segments, "n4_ce148_answered")
     );
 
@@ -382,7 +382,7 @@ async fn the_n4_availability_checks_catch_a_node_that_serves_wrongly() {
     );
 
     // A late assurance is sound, so only the timing row -- which is Soft,
-    // because `simple.md:679-680` says "roughly" -- may fail.
+    // because `simple.md:682-683` says "roughly" -- may fail.
     let late = grade(SimFault::AssuranceLate).await;
     assert!(
         passed(&late, "n4_ce141_well_formed") && passed(&late, "n4_ce141_bits_have_reports"),

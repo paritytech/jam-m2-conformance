@@ -73,7 +73,7 @@ pub struct ShardServed {
 
 impl ShardServed {
     /// Messages a well-formed reply carries: `simple.md:552-554` for CE 137,
-    /// `simple.md:577-578` for CE 138.
+    /// `simple.md:580-581` for CE 138.
     pub fn messages_owed(protocol: u16) -> usize {
         if protocol == 137 {
             3
@@ -162,7 +162,7 @@ pub struct SegmentsServed {
     pub proofs_unreadable: bool,
     /// How many messages the NUT sent before closing the stream.
     ///
-    /// Two are owed (`simple.md:670-671`) and nothing in either says how
+    /// Two are owed (`simple.md:673-674`) and nothing in either says how
     /// long it is, so a node that stops after one looks exactly like one
     /// that finished.
     pub messages: usize,
@@ -182,7 +182,7 @@ pub struct AssuranceSeen {
     pub fault: Option<String>,
     /// Milliseconds between its arrival and the start of the next slot.
     ///
-    /// `simple.md:679-680` asks for roughly two seconds' lead. The message
+    /// `simple.md:682-683` asks for roughly two seconds' lead. The message
     /// does not say which slot it is for, so what can be measured is how
     /// much of the current slot was left when it arrived: a node that sends
     /// with half a slot to spare is in time, one that sends with a fraction
@@ -281,7 +281,7 @@ pub fn n4_ce137_serve(ctx: &N4Ctx) -> Check {
 }
 
 /// CE 138: the bundle shard alone, with a justification carrying the
-/// segment-shard root (`simple.md:558-580`).
+/// segment-shard root (`simple.md:558-583`).
 pub fn n4_ce138_serve(ctx: &N4Ctx) -> Check {
     let ctx = ctx.clone();
     check("n4_ce138_serve", Severity::Hard, move |_obs| {
@@ -409,7 +409,7 @@ fn grade_served_shard(shard: &ShardServed, prefix: &'static str) -> Vec<crate::d
 }
 
 /// CE 139/140: segment shards for named indices, 140 with justifications
-/// (`simple.md:597-648`).
+/// (`simple.md:600-651`).
 ///
 /// Never yet asked of a live node either, for the reason on
 /// [`n4_ce148_serve`]: the package this harness submits exports no segments,
@@ -531,12 +531,12 @@ pub fn n4_ce139_140_serve(ctx: &N4Ctx) -> Check {
 }
 
 /// CE 148: the NUT serves whole imported segments with their import proofs
-/// (`simple.md:650-673`).
+/// (`simple.md:653-676`).
 ///
 /// The optional counterpart of CE 139/140. A requester that wants a
 /// bundle's imports asks a guarantor for the segments outright rather than
 /// reconstructing them from shards, and falls back to 139/140 if the answer
-/// does not hold up (`simple.md:660`). So a node that refuses is not in
+/// does not hold up (`simple.md:663`). So a node that refuses is not in
 /// breach -- the protocol is a shortcut, not a duty -- which is why the
 /// answered row is Soft while everything about an answer it *did* give is
 /// Hard. Serving the wrong segments is a defect; declining to serve is a
@@ -549,7 +549,7 @@ pub fn n4_ce139_140_serve(ctx: &N4Ctx) -> Check {
 /// to the bar by a simulated node that serves real segments and real proofs,
 /// which is better than nothing and is not the same as a node.
 ///
-/// **The per-stream cap is not graded.** `simple.md:657-658` puts a ceiling
+/// **The per-stream cap is not graded.** `simple.md:660-661` puts a ceiling
 /// of `W_M` segments on a request, and it binds the asker. Posing it would
 /// mean asking for more segments than any package this harness builds
 /// exports, so a node refusing has two reasons to and the row could not say
@@ -575,7 +575,7 @@ pub fn n4_ce148_serve(ctx: &N4Ctx) -> Check {
                 || {
                     format!(
                         "the NUT reset the CE 148 stream for segments root {}; a requester \
-                         must fall back to CE 139/140, which `simple.md:660` allows",
+                         must fall back to CE 139/140, which `simple.md:663` allows",
                         short(&served.segments_root)
                     )
                 },
@@ -698,7 +698,7 @@ pub fn n4_ce148_serve(ctx: &N4Ctx) -> Check {
     })
 }
 
-/// CE 141 send: the NUT broadcasts assurances (`simple.md:675-695`).
+/// CE 141 send: the NUT broadcasts assurances (`simple.md:678-698`).
 pub fn n4_ce141_send(ctx: &N4Ctx) -> Check {
     let ctx = ctx.clone();
     check("n4_ce141_send", Severity::Hard, move |_obs| {
@@ -752,7 +752,7 @@ pub fn n4_ce141_send(ctx: &N4Ctx) -> Check {
                 },
             ));
 
-            // Soft: `simple.md:679-680` says roughly two seconds before the
+            // Soft: `simple.md:682-683` says roughly two seconds before the
             // slot, and "roughly" is not a number a node can be failed on.
             //
             // A floor rather than a window. Assuring *early* is not a
@@ -769,7 +769,7 @@ pub fn n4_ce141_send(ctx: &N4Ctx) -> Check {
                 || {
                     format!(
                         "the assurance for anchor {} arrived with {} ms of its slot left; \
-                         `simple.md:679-680` asks for roughly {ASSURANCE_LEAD_MS} ms",
+                         `simple.md:682-683` asks for roughly {ASSURANCE_LEAD_MS} ms",
                         short(&seen.anchor),
                         seen.lead_ms
                     )
@@ -868,7 +868,7 @@ pub fn n4_ce141_inclusion(ctx: &N4Ctx) -> Check {
     })
 }
 
-/// Lead `simple.md:679-680` asks an assurance to be sent with.
+/// Lead `simple.md:682-683` asks an assurance to be sent with.
 ///
 /// Two seconds, as the text says. The row that reads it is Soft, because
 /// "roughly" is not a number a node can be hard-failed on.
@@ -1365,7 +1365,7 @@ mod tests {
         );
     }
 
-    /// Declining CE 148 is a choice, not a breach: `simple.md:660` has the
+    /// Declining CE 148 is a choice, not a breach: `simple.md:663` has the
     /// requester fall back to CE 139/140.
     #[test]
     fn a_refused_ce148_is_soft() {

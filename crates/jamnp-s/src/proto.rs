@@ -72,13 +72,13 @@ pub enum Message {
     Ce142Announce(ce141_145::PreimageAnnouncement),
     Ce143Request(ce141_145::PreimageRequest),
     Ce143Reply(ce141_145::PreimageReply),
-    Ce144Announce(ce141_145::AuditAnnouncementMsg),
-    Ce145Judgment(ce141_145::Judgment),
+    Ce144Announce(Vec<ce141_145::Announcement>),
+    Ce145Judgment(Vec<ce141_145::Judgment>),
     Ce146Submission(ce137_148::BundleSubmission),
     Ce147Request(ce137_148::BundleRequest),
     Ce147Response(ce137_148::BundleResponse),
     Ce148Request(ce137_148::SegmentRequest),
-    /// CE 148 response, message 1 (`simple.md:670`): the segments, as they
+    /// CE 148 response, message 1 (`simple.md:673`): the segments, as they
     /// came.
     ///
     /// Opaque, because this message carries no boundaries of its own. How
@@ -86,7 +86,7 @@ pub enum Message {
     /// bytes, and a decoder that guessed would be inventing the one thing
     /// the wire does not say.
     Ce148Segments(Vec<u8>),
-    /// CE 148 response, message 2 (`simple.md:671`): one proof per segment.
+    /// CE 148 response, message 2 (`simple.md:674`): one proof per segment.
     Ce148ImportProofs(Vec<ce137_148::ImportProof>),
 }
 
@@ -218,10 +218,8 @@ pub fn from_kind_and_payload(kind: u8, payload: &[u8]) -> Result<Message, ProtoE
             decode_full::<ce141_145::PreimageAnnouncement>(payload).map(Ce142Announce)
         }
         framing::CE143 => decode_pair(payload, Ce143Request, Ce143Reply),
-        framing::CE144 => {
-            decode_full::<ce141_145::AuditAnnouncementMsg>(payload).map(Ce144Announce)
-        }
-        framing::CE145 => decode_full::<ce141_145::Judgment>(payload).map(Ce145Judgment),
+        framing::CE144 => decode_full::<Vec<ce141_145::Announcement>>(payload).map(Ce144Announce),
+        framing::CE145 => decode_full::<Vec<ce141_145::Judgment>>(payload).map(Ce145Judgment),
         framing::CE146 => {
             let mut input: &[u8] = payload;
             ce137_148::BundleSubmission::decode_initial(&mut input)
@@ -334,8 +332,8 @@ mod tests {
             SegmentShardsResponse, ShardRequest, ShardResponse,
         },
         ce141_145::{
-            Announcement as AuditAnnouncement, Assurance, AuditAnnouncementMsg, Judgment,
-            PreimageAnnouncement, PreimageReply, PreimageRequest,
+            Announcement as AuditAnnouncement, Assurance, Intent, Judgment, PreimageAnnouncement,
+            PreimageReply, PreimageRequest, Validity,
         },
         up0::{Announcement as BlockAnnouncement, Final as Up0Final, Handshake as Up0Handshake},
     };
@@ -516,22 +514,19 @@ mod tests {
             Ce143Reply(PreimageReply {
                 preimage: vec![0xde, 0xad, 0xbe, 0xef],
             }),
-            Ce144Announce(AuditAnnouncementMsg {
+            Ce144Announce(vec![AuditAnnouncement {
                 header_hash: HeaderHash::from([0x55; 32]),
-                tranche: 0,
-                announcement: AuditAnnouncement {
-                    entries: vec![],
-                    signature: sig64(),
-                },
-            }),
-            Ce145Judgment(Judgment {
+                validator_index: 0x0005,
+                intent: Intent::Initial,
+                signature: [0x50; 96],
+            }]),
+            Ce145Judgment(vec![Judgment {
                 epoch_index: 7,
                 validator_index: 0x0005,
-                validity: true,
+                validity: Validity::Valid,
                 report_hash: [0xab; 32],
                 signature: sig64(),
-                guarantee: None,
-            }),
+            }]),
             Ce146Submission(BundleSubmission {
                 core_index: 0x0102,
                 mappings: vec![],
@@ -727,25 +722,22 @@ mod tests {
             ),
             (Message::Ce143Reply(PreimageReply { preimage: vec![] }), 143),
             (
-                Message::Ce144Announce(AuditAnnouncementMsg {
+                Message::Ce144Announce(vec![AuditAnnouncement {
                     header_hash: HeaderHash::from([0; 32]),
-                    tranche: 0,
-                    announcement: AuditAnnouncement {
-                        entries: vec![],
-                        signature: [0; 64],
-                    },
-                }),
+                    validator_index: 0,
+                    intent: Intent::Initial,
+                    signature: [0; 96],
+                }]),
                 144,
             ),
             (
-                Message::Ce145Judgment(Judgment {
+                Message::Ce145Judgment(vec![Judgment {
                     epoch_index: 0,
                     validator_index: 0,
-                    validity: true,
+                    validity: Validity::Valid,
                     report_hash: [0; 32],
                     signature: [0; 64],
-                    guarantee: None,
-                }),
+                }]),
                 145,
             ),
             (

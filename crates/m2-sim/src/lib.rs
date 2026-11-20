@@ -202,7 +202,7 @@ pub enum SimFault {
     /// Reset every CE 148 segment request.
     ///
     /// Not a breach on its own: a requester is meant to fall back to CE
-    /// 139/140 (`simple.md:660`), which is why the row that catches this is
+    /// 139/140 (`simple.md:663`), which is why the row that catches this is
     /// Soft. It is here so that the row has been seen to move at all.
     SegmentsRefused,
     /// Serve CE 148 segments one byte short of a whole number of them.
@@ -350,7 +350,7 @@ const LATE_BY_SLOTS: u64 = 2;
 
 /// Milliseconds of slot left when [`SimFault::AssuranceLate`] sends.
 ///
-/// Well under the two seconds `simple.md:679-680` asks for, and well above
+/// Well under the two seconds `simple.md:682-683` asks for, and well above
 /// zero: the assurance is late, not sent into the following slot, so only
 /// the timing row has anything to say about it.
 const LATE_ASSURANCE_MARGIN_MS: u64 = 500;
@@ -1464,7 +1464,7 @@ impl SimNode {
     ///
     /// Three questions, and the lane grades the answers separately because a
     /// node that gets one wrong is not the same node as one that gets
-    /// another wrong (`simple.md:675-695`): is it shaped right and signed by
+    /// another wrong (`simple.md:678-698`): is it shaped right and signed by
     /// the validator it came from, does it name a block this node has, and
     /// does every core it claims carry a report.
     fn assurance_holds(&self, assurance: &Assurance, peer: u16) -> bool {
@@ -1485,7 +1485,7 @@ impl SimNode {
     }
 
     /// Serve CE 148: the whole segments asked for, then one import proof
-    /// each (`simple.md:650-673`).
+    /// each (`simple.md:653-676`).
     ///
     /// Two messages, and neither says how long it is -- the frame does. The
     /// segments go out concatenated because every one is `SEGMENT_LEN`
@@ -1570,7 +1570,7 @@ impl SimNode {
     ///
     /// Three messages for CE 137 and two for CE 138, because nothing in the
     /// reply says how long any of it is -- the frame does
-    /// (`simple.md:552-554`, `simple.md:577-578`).
+    /// (`simple.md:552-554`, `simple.md:580-581`).
     async fn serve_bundle_shard(&self, send: &mut SendHalf, kind: u8, content: &[u8]) {
         if self.fault == SimFault::ShardRefused {
             // A reset, not a clean close: a node with no such root says so
@@ -1646,7 +1646,7 @@ impl SimNode {
     }
 
     /// Serve CE 139 or CE 140: one message of slices, then CE 140's
-    /// justification per requested index (`simple.md:597-648`).
+    /// justification per requested index (`simple.md:600-651`).
     async fn serve_segment_shards(&self, send: &mut SendHalf, kind: u8, content: &[u8]) {
         let Ok(request) = jamnp_s::codec::ce137_148::SegmentShardRequest::decode(&mut &content[..])
         else {
@@ -1730,7 +1730,7 @@ impl SimNode {
         if self.fault == SimFault::AssuranceLate {
             // Held until the slot has nearly run out, so it arrives with a
             // fraction of a second of lead instead of the two seconds
-            // `simple.md:679-680` asks for. Sleeping a whole slot period
+            // `simple.md:682-683` asks for. Sleeping a whole slot period
             // would not do it: that lands at the same phase of the next
             // slot and reads exactly as punctual.
             let now = clock::current().wall_ms();
