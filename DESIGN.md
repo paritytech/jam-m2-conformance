@@ -39,7 +39,7 @@ measurement (M3/M4); testing more than one NUT per run.
 
 | Input | Location | Notes |
 |---|---|---|
-| JAMNP-S spec | `jam-np/simple.md` at **a96dc6b (2026-09-02)**, untagged | Only file in the repo. ALPN protocol version `1`. Every `simple.md:NNN` in this repository refers to that revision. Upstream HEAD is aa0e2b8 (2026-10-26) and four hunks differ; findings.md §28 says which, and which of them cost anything. **Diff, do not re-read, when moving to a newer one.** |
+| JAMNP-S spec | `jam-np/simple.md` at **aa0e2b8 (2026-10-26)**, untagged | Only file in the repo. ALPN protocol version `1`. Every `simple.md:NNN` in this repository refers to that revision. Re-pinned from a96dc6b (2026-09-02) on 2026-11-20; findings.md §28 says what the four hunks changed and what each cost. **Diff, do not re-read, when moving to a newer one** — and renumber the citations mechanically against the old text rather than by eye, because most of them move by a constant that is not the one you would guess. |
 | Graypaper | `graypaper/` v0.8.0 | Off-chain duties: `text/work_packages_and_reports.tex:15` (Honest Behavior), `guaranteeing.tex`, `assurance.tex`, `auditing.tex`, `best_chain.tex`, `safrole.tex`. |
 | Reference engine | `polkajam/crates/node` (`hazmat` feature), reached over a socket from `oracle/` | Authoring engine, STF import, state diff. `polkajam-fuzz` is read for its trace framing and mutation vocabulary (§8), not depended on. |
 | Tiny parameters | `w3f/jamtestvectors` README | V=6, C=2, E=12, Y=10, N=3, rotation R=4, **EC recovery 3 shards**. |
@@ -313,8 +313,8 @@ executes their checks and renders a coverage table (§11 row ↔ scenario module
   but both tiny and full keep 6 s and other implementations hard-code it. The design uses P = 6 s and
   does not try to shrink it. A full lane set takes on the order of 30 minutes per target; parallel
   runs use disjoint port ranges.
-- Intra-slot phases come from jam-np, not the graypaper: assurances ~2 s before the slot (`:679-680`);
-  assurer keyset switch +4 s and author keyset switch −2 s around epoch start (`:680-684`); ticket
+- Intra-slot phases come from jam-np, not the graypaper: assurances ~2 s before the slot (`:682-683`);
+  assurer keyset switch +4 s and author keyset switch −2 s around epoch start (`:683-687`); ticket
   proxy step after `E/60` and direct step after `E/20` slots (`:329-332`); third-guarantor grace 2 s
   (`:465-467`); audit tranche 8 s (GP `auditing.tex:30`). Polkajam's constants match
   (`node/src/util/periodic_event.rs:11-30,159`, `MAX_CLOCK_DRIFT` 250 ms).
@@ -426,7 +426,7 @@ polkajam remain prerequisites:
 1. Make the provisioners `tickets`, `guarantees`, `assurances`, `preimages`, `disputes`, `builder`
    public (`lib.rs:21-31`) and parameterise them on an explicit RNG instead of the global
    `rng_context!`, so a step can say "validator 3 produces its tickets now" deterministically.
-2. `create_harness` (`fuzzer.rs:718`) loads all six `dev_validators_secrets()` (`fuzzer.rs:754`); add
+2. `create_harness` (`fuzzer.rs:721`) loads all six `dev_validators_secrets()` (`fuzzer.rs:754`); add
    a constructor taking a keyset subset (`Keystore::from_secret_keysets` / `insert_keyset`,
    `node/src/keystore/mod.rs:146,207`).
 3. Return signed artefacts instead of submitting them to the pool: `compose_guarantee`,
@@ -619,7 +619,7 @@ those the assertion is "not included" alone.
 | CE 134 receive | NUT replies `WRHash ++ sig($jam_guarantee ++ blake(E(report)))`; hash equals reference (NUT refines) | **posed** (`m2-sim/tests/n3_ce134_sim_it.rs`): a share reset instead of answered; a reply naming a hash the bundle does not refine to; a share coded for the wrong validator count taken anyway. Bad mappings are not posed and cannot be: `:443-445` lets a guarantor refuse *or* trust them, so neither answer is wrong |
 | CE 135 send `:460-485` | `Report ++ Slot ++ len++[(Idx,Sig)]`, 2–3 signatures sorted and valid; report equals reference; to all current validators, in the last rotation also to the next set `:469-471`; ~2 s wait for the third `:465-467` | **posed** (`m2-sim/tests/n3_ce135_sim_it.rs`): one signature; signatures descending; a signer that does not hold the core; a well-formed report refined from other items; distribution reaching one validator |
 | CE 135 receive → inclusion | NUT includes reference-signed reports in its next block | **posed** (`m2-sim/tests/n3_ce135_inclusion_sim_it.rs`): a node that pools nothing. The four exclusion faults — one signature, unassigned signer, stale slot, duplicate core — are *harness-side*: they describe distributing a bad guarantee and asserting the node leaves it out, and no row asserts that yet. They are posable when one is written, unlike the assurance equivalent: `note_guarantee` takes a guarantee unchecked but block composition re-checks it (`guarantors/table.rs`, `context.check(guarantee)` → `continue`), so a node that pools a bad one authors a valid block without it rather than refusing to author |
-| CE 148 `:650-673` | **graded in N4, not here** — see below |
+| CE 148 `:653-676` | **graded in N4, not here** — see below |
 
 **"Refuse" above means the node said no, by either route open to it:** a
 reset of the stream the message arrived on, or a close of the whole
@@ -644,38 +644,58 @@ building it twice.
 |---|---|---|
 | CE 137 serve `:523-556` | `BundleShard ++ [SegShard] ++ Justification` equals reference erasure coding; co-path `T(s,i,H)` `:530-543` | unknown root or index ≥6 → reset |
 | CE 137 fetch | NUT requests only its own index from a guarantor after seeing the report | wrong shard / bad justification → no assurance for that core; tries another guarantor *(soft)* |
-| CE 141 send `:675-695` | `Anchor ++ Bitfield[1] ++ Sig`; bit set iff shard verified; ~2 s before the slot to all possible authors `:679-680`; epoch edge +4 s / −2 s `:680-684` | — |
+| CE 141 send `:678-698` | `Anchor ++ Bitfield[1] ++ Sig`; bit set iff shard verified; ~2 s before the slot to all possible authors `:682-683`; epoch edge +4 s / −2 s `:683-687` | — |
 | CE 141 receive → inclusion | all valid assurances included; report available at ≥5 of 6 | wrong anchor, bad signature, bit set for an empty core → excluded |
-| CE 138 serve `:558-580` | bundle shard + justification with segment-shard root `:566-568` | unknown → reset |
-| CE 139/140 serve `:597-648` | 139 `[SegShard]`; 140 adds justification discriminator 0/1/2 `:637`; ≤2·3072 | over limit → reset |
-| CE 139/140 fetch | NUT reconstructs imports from **3** shards; 139 first, 140 on inconsistency `:625-630` | one corrupt shard → retries via 140 and completes |
-| CE 148 serve `:650-673` | two messages: `[Segment]` then `[Import-Proof]`, one segment per index asked for and one proof each, every proof walking to the segments root | refuse *(soft: `:660` lets a requester fall back to 139/140)*; ragged segments; short reply; a proof that does not verify |
+| CE 138 serve `:558-583` | bundle shard + justification with segment-shard root `:566-568` | unknown → reset |
+| CE 139/140 serve `:600-651` | 139 `[SegShard]`; 140 adds justification discriminator 0/1/2 `:640`; ≤2·3072 | over limit → reset |
+| CE 139/140 fetch | NUT reconstructs imports from **3** shards; 139 first, 140 on inconsistency `:628-633` | one corrupt shard → retries via 140 and completes |
+| CE 148 serve `:653-676` | two messages: `[Segment]` then `[Import-Proof]`, one segment per index asked for and one proof each, every proof walking to the segments root | refuse *(soft: `:663` lets a requester fall back to 139/140)*; ragged segments; short reply; a proof that does not verify |
 
 ### N5 — auditing and disputes, CE 136/144/145/147 (2–3 epochs)
 
-> **Three rows below are written against `simple.md` at a96dc6b and the spec
-> has since replaced those sections.** CE 144's announcement no longer
-> declares a tranche or carries no-show evidence, and CE 145's guarantee
-> moved inside the validity discriminator, so the optional second message
-> does not exist. findings.md §28 has both new shapes. Re-specify from the
-> current spec before building these; a lane built from the table as it
-> stands would frame bytes no conforming node sends.
+Re-specified 2026-11-20 against `simple.md` at aa0e2b8, which rewrote CE 144
+and CE 145 (`findings.md` §28). Three things changed shape, and all three
+are properties a lane must assert rather than infer:
+
+- **The tranche is not on the wire.** An announcement carries an `Intent`
+  byte — 0 for the initial tranche, 1 plus a core index for a later one —
+  and a recipient derives the tranche from the signature's VRF output
+  (`:769-771`). A row that read a tranche field would be reading a field no
+  node sends.
+- **No-show evidence is gone.** A later-tranche announcement names one
+  work-report on one core and proves the requirement with `S(r)` alone. The
+  list of previous-tranche announcements that used to stand for the no-show
+  count does not exist.
+- **Both protocols batch.** CE 144 sends `[Announcement]` and CE 145 sends
+  `[Judgment]`, each a length-prefixed vector, and CE 145 may mix auditors,
+  work-reports and epochs in one message (`:814-815`). A lane that expected
+  one value per message would fail a conforming node on its first batch.
 
 | Check | Assertions | Faults |
 |---|---|---|
-| CE 144 tranche 0 `:743-793` **SUPERSEDED, see findings.md §28** | per block with newly available reports: `HeaderHash ++ 0 ++ len++[(Core,WRHash)] ++ sig`, then `Evidence` s₀ (96 bytes); at tranche start; covers all reports; none announced twice `:757-758`; nothing when nothing to audit `:749-750` | — |
-| CE 147 `:582-595` | requests the bundle from a guarantor first, falls back to 138 `:587`; serves own bundles | corrupt bundle → reconstruct via 138, still judges |
-| CE 145 `:795-833` **SUPERSEDED, see findings.md §28** | `Epoch ++ ValIdx ++ Validity ++ WRHash ++ Sig`; positive within 8 s *(soft)*; Validity=0 followed by the `Guarantee` message `:819-830`; also to the succeeding set | — |
-| Negative judgment | emulated guarantors include an invalid report (two emulated signatures) and serve the real bundle → NUT publishes Validity=0 plus guarantees; forwards received negative judgments to grid neighbours `:813-815`; disputes extrinsic in its next block | emulated negative judgment on a valid report → NUT publishes Validity=1; fault recorded |
+| CE 144 initial tranche `:746-785` | per block with newly available reports: `[Announcement]`, each `HeaderHash ++ ValIdx ++ 0 ++ s₀(96)`; no core declared `:762-764`; **must** broadcast whenever newly required `:750-753`; none announced twice `:755-756`; nothing for reports audited because of a negative judgment `:752-753` | an announcement carrying a tranche byte, or a core on an initial-tranche intent → the node must not act on it |
+| CE 144 later tranche `:765-766` | one work-report per announcement, `1 ++ Core Index` and `S(r)`; the tranche derivable from the signature and matching the one the harness forced | an intent discriminator outside {0,1} → reset |
+| CE 147 `:585-598` | requests the bundle from a guarantor first, falls back to 138 `:590`; serves own bundles | corrupt bundle → reconstruct via 138, still judges |
+| CE 145 `:787-828` | `[Judgment]`, each `Epoch ++ ValIdx ++ Validity ++ WRHash ++ Sig`; positive within 8 s *(soft)*; `Validity = 1` for valid and `0 ++ Guarantee` for invalid, **the guarantee inside the discriminator and so before the report hash** `:820-821`; also to the succeeding set `:796-799` | a judgment with the guarantee appended after the signature → undecodable, and the row says so rather than reporting silence |
+| Negative judgment | emulated guarantors include an invalid report (two emulated signatures) and serve the real bundle → NUT publishes `Validity = 0 ++ Guarantee`; forwards received negative judgments to grid neighbours `:805-807`; disputes extrinsic in its next block | emulated negative judgment on a valid report → NUT publishes `Validity = 1`; fault recorded |
+| Batching | a CE 145 message carrying judgments from two auditors on two reports in two epochs is accepted whole `:814-815`; a CE 144 message carrying two announcements likewise `:773` | a vector whose compact length overstates its contents → reset |
 | CE 136 `:487-504` | serves held reports; on an unknown negatively-judged report requests it from the judging peer `:494-495` | — |
-| Later tranches **SUPERSEDED, see findings.md §28** | two or more emulated auditors no-show → NUT sends a tranche-n announcement 8 s later with `[sₙ(w) ++ len++[No-Show]]` `:769-775` | — |
+
+**What this lane cannot assert yet.** The tranche derivation is a
+Bandersnatch VRF output read against the GP's $C(\mathbf{r})$, and the
+harness has no Bandersnatch verification outside the ticket path. Until it
+does, a later-tranche row can check that the announcement names one core
+and carries a 96-byte signature, and that the node acted on it — not that
+the tranche the signature implies is the one the harness intended. That is
+a real gap and is better written here than discovered when the row is
+built.
 
 ### N6 — preimages, CE 142/143 (1–2 epochs)
 
 | Check | Assertions | Faults |
 |---|---|---|
-| Announce → request `:697-741` | a non-validator peer announces `ServiceID ++ Hash ++ Len` and keeps the connection 10 s `:702-707`; NUT opens CE 143 iff the preimage is requested on chain and not held; verifies hash and length | un-requested hash → no CE 143; wrong preimage → no inclusion, no gossip |
-| Gossip | NUT announces an obtained preimage to grid neighbours `:709-710` | — |
+| Announce → request `:700-744` | a non-validator peer announces `ServiceID ++ Hash ++ Len` and keeps the connection 10 s `:705-710`; NUT opens CE 143 iff the preimage is requested on chain and not held; verifies hash and length | un-requested hash → no CE 143; wrong preimage → no inclusion, no gossip |
+| Gossip | NUT announces an obtained preimage to grid neighbours `:712-713` | — |
 | Serve | returns the bytes, FIN | unknown → reset |
 | Inclusion | in the next NUT block, sorted; lookups updated | no longer requested → excluded |
 

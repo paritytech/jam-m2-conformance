@@ -221,7 +221,7 @@ node on a **should**.
 its payload as an encoded `Instructions` and carries an `Export { data }`
 instruction, so the honest submission now exports four segments and a live
 run asks for them. `sessions/n4-exports-3`: CE 139 and CE 140 answer and
-verify five of five, and CE 148 is declined, which `simple.md:660` allows
+verify five of five, and CE 148 is declined, which `simple.md:663` allows
 and the row records as Soft. All three segment protocols have now been put
 to a real node.
 
@@ -264,10 +264,11 @@ over; what remains is the §4 judgement, unchanged.
 looked for `jam-node` in the workspace manifest, which has never had one,
 so it read an empty string and could not fire; it now checks every
 polkajam dependency against the oracle's revision. And §28: the harness
-reads `simple.md` at a96dc6b (2026-09-02) and upstream is at aa0e2b8
+read `simple.md` at a96dc6b (2026-09-02) while upstream was at aa0e2b8
 (2026-10-26), with CE 144 and CE 145 rewritten — which is to say **DESIGN's
-N5 plan specifies a wire format the spec has replaced**, before a line of
-N5 is written.
+N5 plan specified a wire format the spec had replaced**, before a line of
+N5 was written. Re-pinned and re-specified on 2026-11-20; see the section
+for PR #28 below.
 
 
 ### After PR #22: §29's cause, and a node that closes connections, 2026-11-19
@@ -493,6 +494,68 @@ until the share is due, and a node that closes connections every few slots
 (§30) can take it away meanwhile. The sender's two silent returns now say
 which it was and quote the connection's end. Whether it should re-dial is
 open; it has not recurred.
+
+
+### After PR #27: the spec pin moves to aa0e2b8, and P3's plan is re-specified, 2026-11-20
+
+**§28 closed.** The repository now reads `simple.md` at **aa0e2b8
+(2026-10-26)**, re-pinned from a96dc6b (2026-09-02).
+
+**What §28 got wrong about itself.** It said "Nothing is wrong in the code:
+N5 and N6 do not exist yet." The *lanes* do not. The **codecs did**, and
+they modelled the superseded wire in full: `AuditAnnouncementMsg` with its
+`Tranche` byte, `Evidence` with `Tranche0`/`Subsequent` variants,
+`SubsequentEvidence` with its no-show list, and a `Judgment` whose guarantee
+was an `Option` appended after the signature. Fourteen tests asserted those
+shapes, three of them hand-built byte vectors. §11 and §15 are the same
+defect -- a codec that is a shape model rather than the wire -- and this is
+a third instance, found before a lane was built on it rather than after.
+
+**Three shape changes, now asserted rather than inferred:**
+
+| | was | is |
+|---|---|---|
+| CE 144 tranche | a `Tranche` byte on the wire | an `Intent` byte, 0 or `1 ++ Core Index`; the tranche is derived from the signature's VRF output (`:769-771`) |
+| CE 144 evidence | a second message with per-report no-show lists | gone; a later-tranche announcement proves itself with `S(r)` alone |
+| CE 145 guarantee | an optional trailing message, present iff validity was 0 | inside the validity discriminator, so **before** the work-report hash (`:820-821`) |
+
+Both protocols also batch now: `[Announcement]` and `[Judgment]`, and CE 145
+may mix auditors, work-reports and epochs in one message (`:814-815`). A
+lane expecting one value per message would fail a conforming node on its
+first batch.
+
+The CE 145 change is the one most likely to be got wrong by patching the old
+struct: an `Option<Guarantee>` appended at the end still compiles, still
+round-trips against itself, and is wrong on the wire by the width of a
+guarantee. The codec's test asserts the hash's **position** after the
+guarantee, not merely that both are present.
+
+**The re-pin was not optional.** DESIGN §2 states the invariant: *"Every
+`simple.md:NNN` in this repository refers to that revision."* Re-specifying
+N5 against HEAD while the rest cited a96dc6b would have broken it, and a
+repository carrying two spec revisions without saying which is which is the
+defect class §6 and §7 record.
+
+**How it was done, and what it cost.** Mechanically, against the old text
+rather than by eye: each citation was read at a96dc6b, matched
+byte-for-byte against aa0e2b8, and rewritten only where exactly one
+candidate matched. **93 renumbered across 14 files**, 157 already identical,
+and everything else reported rather than guessed.
+
+Two lessons, both in §28:
+
+- **Most citations moved by +3 and the ones that mattered did not.** CE
+  144/145's moved by −2, −6, −8 or changed outright. A constant-offset
+  renumber would have left the N5 citations plausible and wrong.
+- **Do not run the renumberer over a file already written against the new
+  revision.** Several citations in the rewritten codec were renumbered a
+  second time, because their *old-revision* text happened to match
+  elsewhere at HEAD: `:819` became `:811`, `:825` became `:819`. Caught by
+  reading every citation in that file back against HEAD, which is the check
+  to repeat on any future re-pin.
+
+**What this does not close.** §4's question survives: the size-cap wording
+is untouched since 2026-03-22, so it is still unanswered at HEAD.
 
 
 ## Milestone ladder

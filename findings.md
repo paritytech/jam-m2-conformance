@@ -871,7 +871,7 @@ arrived in. That quantity is positive by construction — it is bounded by
 `(0, slot_period]` — so the row passed on every node, conforming or not,
 and would have gone on passing forever.
 
-`simple.md:679-680` asks for roughly two seconds' lead. The row now asks for
+`simple.md:682-683` asks for roughly two seconds' lead. The row now asks for
 that, as a **floor** rather than a window: assuring *early* is not a defect,
 since a node with nothing left to wait for may send as soon as it has
 verified its shard, so only too little lead is reported. It stays Soft,
@@ -1071,7 +1071,7 @@ back what it was handed.
 
 **Measured** (`sessions/n4-exports-3`): CE 139 and CE 140 answer and
 verify against polkajam, five of five on every row. CE 148 is declined,
-which `simple.md:660` allows and the row records as Soft — the first time
+which `simple.md:663` allows and the row records as Soft — the first time
 any of the three has been put to a real node.
 
 Opening the door immediately found §26 behind it: the row checking CE 140's
@@ -1735,7 +1735,7 @@ on the plan rather than being derived at the point of the check.
 `n4_ce140_justifications_verify` five of five HARD PASS, with CE 139's
 rows passing alongside. All three segment protocols have now been put to a
 real node: CE 139 and CE 140 answer and verify, and CE 148 is declined,
-which `simple.md:660` allows and the row records as Soft.
+which `simple.md:663` allows and the row records as Soft.
 
 Related: §23, also a row that could not pass, also found the first time
 anything reached it. §17, which had to be closed before this could be seen
@@ -1826,75 +1826,92 @@ invisible for the same reason — nothing had ever asked.
 
 ---
 
-## 28. The spec moved under P3's design, and nothing said so
+## 28. The spec moved under P3's design, and nothing said so — CLOSED 2026-11-20
 
-**Status:** open, and it blocks nothing today. Found 2026-11-19 while
-checking §4's citations before putting that question to the spec authors.
+**Status:** CLOSED. The repository is re-pinned to `simple.md` at **aa0e2b8
+(2026-10-26)**, every citation renumbered against the old text, the CE 144
+and CE 145 codecs rewritten, and DESIGN's N5 rows re-specified. Opened
+2026-11-19 while checking §4's citations.
 
-Every `simple.md:NNN` citation in this repository is against **a96dc6b
-(2026-09-02)**, which is the revision `DESIGN.md` §8 names, and all of them
-still land — checked against that revision rather than assumed. The
-harness is internally consistent.
+**What this finding got wrong about itself.** It said:
 
-`jam-np` HEAD is **aa0e2b8 (2026-10-26)**. Four hunks of `simple.md`
-changed in between, and two of them rewrite sections P3 is designed
-against.
+> Nothing is wrong in the code: N5 and N6 do not exist yet.
 
-**What changed, and what it costs:**
+The *lanes* do not exist. The **codecs do**, and they modelled the
+superseded wire in full: `AuditAnnouncementMsg` with its `Tranche` byte,
+`Evidence` with `Tranche0`/`Subsequent` variants, `SubsequentEvidence` with
+its no-show list, and a `Judgment` whose guarantee was an `Option` appended
+after the signature. Fourteen tests asserted those shapes, three of them
+hand-built byte vectors. §11 and §15 are the same defect — a codec that is
+a shape model rather than the wire — and this is a third instance, found
+before a lane was built on it rather than after.
 
-| section | change | cost here |
+**The four hunks, and what each cost:**
+
+| section | change | cost |
 |---|---|---|
-| Shard assignment | $R$ for 6 validators, 2 → 3 | none. §10 had already taken 3 from the engine, before the spec said so |
-| CE 138 | `Auditor -> Assurer` becomes `Node -> Assurer`; non-validators may request, and assurers may throttle them | none. The harness asks as a validator, and no row asserts the requester's class |
-| CE 144 | announcement restructured | **DESIGN.md §11 N5 specifies the superseded wire format** |
-| CE 145 | judgments batched, guarantee moved inside the discriminator | **same** |
+| Shard assignment `:506-521` | $R$ for 6 validators, 2 → 3 | none. §10 had already taken 3 from the engine, before the spec said so. The citation's range is unchanged |
+| CE 138 `:558-583` | `Auditor -> Assurer` becomes `Node -> Assurer`; non-validators may request, assurers may throttle | none behaviourally. The section grew three lines, so its own range and everything after it moved |
+| CE 144 `:746-785` | announcement restructured | the codec, its tests, and DESIGN's N5 rows |
+| CE 145 `:787-828` | judgments batched, guarantee moved inside the discriminator | the same |
 
-**The two that matter.** DESIGN's N5 table says CE 144 is `HeaderHash ++ 0
-++ len++[(Core,WRHash)] ++ sig` followed by an `Evidence` message, and that
-later tranches carry `[sₙ(w) ++ len++[No-Show]]`. The spec now says:
+**The three shape changes, as the lane must now assert them.**
 
-```
-Intent = 0 (Initial tranche) OR 1 ++ Core Index (1 byte discriminator)
-Announcement = Header Hash ++ Validator Index ++ Intent ++ Bandersnatch Signature
---> [Announcement]
-```
+*The tranche is not on the wire.* An announcement carries an `Intent` byte
+— 0 for the initial tranche, `1 ++ Core Index` for a later one — and a
+recipient derives the tranche from the signature's VRF output
+(`:769-771`). The old codec sent a `Tranche` field no conforming node
+reads.
 
-The tranche is no longer declared — recipients derive it from the
-signature's VRF output. The no-show evidence list is gone entirely. The
-cores are not declared for tranche 0. And "should broadcast ... unless they
-do not intend to audit any work-reports" became **must** broadcast whenever
-newly required.
+*No-show evidence is gone.* A later-tranche announcement names one
+work-report on one core and proves the requirement with `S(r)` alone. The
+list of previous-tranche announcements standing for the no-show count does
+not exist.
 
-CE 145 moved the guarantee *inside* the validity discriminator, so the
-optional second message DESIGN describes does not exist:
+*The guarantee moved inside the validity discriminator.* `Validity = 0 ++
+Guarantee (Invalid) OR 1 (Valid)`, so on a negative judgment the guarantee
+sits **before** the work-report hash rather than after the signature. This
+is the change most likely to be got wrong by someone patching the old
+struct, because an `Option<Guarantee>` appended at the end still compiles,
+still round-trips against itself, and is wrong on the wire by the width of
+a guarantee. The codec's test asserts the hash's *position* after the
+guarantee, not merely that both are present.
 
-```
-Validity = 0 ++ Guarantee (Invalid) OR 1 (Valid) (1 byte discriminator)
-Judgment = Epoch Index ++ Validator Index ++ Validity ++ Work-Report Hash ++ Ed25519 Signature
---> [Judgment]
-```
+**Both protocols batch.** CE 144 sends `[Announcement]` and CE 145 sends
+`[Judgment]`, each a length-prefixed vector, and CE 145 may mix auditors,
+work-reports and epochs in one message (`:814-815`). A lane expecting one
+value per message would fail a conforming node on its first batch.
 
-**Why this is worth a finding rather than a fix.** Nothing is wrong in the
-code: N5 and N6 do not exist yet. What is wrong is the *plan*, and a plan
-is exactly the thing that gets followed without being re-checked. A lane
-built from DESIGN's N5 table would frame bytes no conforming node sends and
-fail every one of them — §18, §23 and §27 in advance, before a line is
-written.
+**The re-pin, and why it was not optional.** DESIGN §2 states the
+invariant: *"Every `simple.md:NNN` in this repository refers to that
+revision."* Re-specifying N5 against HEAD while the rest cited a96dc6b
+would have broken it, and a repository carrying two spec revisions without
+saying which is which is the defect class §6 and §7 record. So the pin
+moved and everything moved with it.
 
-The DESIGN rows are marked rather than rewritten. Re-specifying them is
-P3's work and wants the whole section read at once, not a patch applied to
-a table from the outside.
+**How, and what it cost.** Mechanically, against the old text rather than
+by eye. Each `simple.md:NNN` citation was read at a96dc6b, matched
+byte-for-byte against aa0e2b8, and rewritten only where exactly one
+candidate matched: **93 renumbered across 14 files**, 157 already identical,
+and the rest reported rather than guessed. Of those reported, all but four
+were CE 144/145 citations being rewritten anyway.
 
-**What to do on re-reading the spec.** Diff it, do not re-read it:
-`git diff <the revision DESIGN names>..HEAD -- simple.md` is four hunks and
-takes a minute, where re-reading 800 lines takes an hour and misses the
-one-word changes. The `Auditor -> Node` change in CE 138 is one word.
+Two lessons worth keeping:
 
-Related: §4, whose question survives this — the size-cap wording is
-untouched since 2026-03-22, so it is still unanswered at HEAD and not
-something a newer revision has already settled.
+- **Most citations moved by +3, and the ones that mattered did not.** The
+  CE 144/145 citations moved by −2, −6, −8 or changed outright. Renumbering
+  by a constant offset would have left the N5 citations plausible and
+  wrong.
+- **Do not run the renumberer over a file already written against the new
+  revision.** Several citations in the rewritten codec were renumbered a
+  second time, because their *old-revision* text happened to match
+  somewhere else at HEAD — `:819` became `:811`, `:825` became `:819`. They
+  were caught by reading every citation in that file back against HEAD,
+  which is the check this work ends with and the one worth repeating on any
+  future re-pin.
 
----
+**What it does not close.** §4's question survives: the size-cap wording is
+untouched since 2026-03-22, so it is still unanswered at HEAD.
 
 ## 29. A validator connection dies mid-run, and nothing re-dialled it
 

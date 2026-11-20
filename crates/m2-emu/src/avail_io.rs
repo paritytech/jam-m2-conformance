@@ -82,7 +82,7 @@ pub struct RawAssurance {
 
 /// Send one assurance to the NUT over CE 141.
 ///
-/// CE 141 is one message and no reply (`simple.md:688`), so there is nothing
+/// CE 141 is one message and no reply (`simple.md:691`), so there is nothing
 /// to read back; whether the node accepted it shows up later, in whether a
 /// block carries it.
 pub async fn send_assurance(
@@ -109,7 +109,7 @@ pub async fn send_assurance(
 ///
 /// The reply is not one self-describing structure: it is a sequence of whole
 /// messages, `Bundle Shard`, then CE 137's segment shards, then the
-/// justification (`simple.md:552-554`, `simple.md:577-578`). Each carries its
+/// justification (`simple.md:552-554`, `simple.md:580-581`). Each carries its
 /// own length, so nothing here needs to know a shard length in advance -- and
 /// a reply short of its messages is recorded as short rather than read as an
 /// empty one.
@@ -250,7 +250,7 @@ pub async fn request_segment_shards(
 }
 
 /// Ask the NUT for whole imported segments over CE 148
-/// (`simple.md:650-673`).
+/// (`simple.md:653-676`).
 ///
 /// One request message, then two reply messages: the segments concatenated,
 /// then one import proof per segment. Nothing in either says how long it
@@ -486,7 +486,7 @@ pub async fn drive_availability(
 
         if !plan.segment_indices.is_empty() {
             // The whole-segment shortcut first. A requester is meant to try CE
-            // 148 and fall back to CE 139/140 (`simple.md:660`), and asking in
+            // 148 and fall back to CE 139/140 (`simple.md:663`), and asking in
             // that order is also what lets the lane see a node that serves one
             // and not the other.
             if let Some(served) = request_segments(
@@ -667,7 +667,7 @@ fn spoil(
     }
 }
 
-/// Wait until an assurance for `slot` is due: the lead `simple.md:679-680`
+/// Wait until an assurance for `slot` is due: the lead `simple.md:682-683`
 /// asks for, before the slot begins.
 ///
 /// Sent then rather than at the slot's start because that is when the anchor

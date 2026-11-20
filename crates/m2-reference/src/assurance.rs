@@ -22,7 +22,7 @@ use jamnp_s::codec::ce141_145::Assurance;
 /// Why an assurance was refused.
 ///
 /// Kept apart from a bare `false` because the N4 lane grades the reasons
-/// separately: `simple.md:675-695` makes a wrong anchor, a bad signature and
+/// separately: `simple.md:678-698` makes a wrong anchor, a bad signature and
 /// a bit set for an empty core three different faults, and a node that gets
 /// one wrong is not the same node as one that gets another wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub enum AssuranceFault {
     /// The anchor names no block the harness has seen.
     ///
     /// A set rather than one expected hash. Which block a node assures is
-    /// its own choice -- `simple.md:679-680` puts the assurance roughly two
+    /// its own choice -- `simple.md:682-683` puts the assurance roughly two
     /// seconds before a slot, and the head at that instant is not something
     /// the harness can name in advance. What it can say is that the anchor
     /// must be a block that exists, and a node assuring one nobody authored
