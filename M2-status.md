@@ -558,6 +558,53 @@ Two lessons, both in §28:
 is untouched since 2026-03-22, so it is still unanswered at HEAD.
 
 
+### After PR #28: N6 is a running lane, 2026-11-20
+
+**P3's smaller half is implemented and passing** (`sessions/n6-4`, 541 rows
+over 240 s, six lanes). The same three hard findings as before, all node-side.
+
+**The lane's hard part was never the wire.** `simple.md:705-707` makes the
+node's duty conditional -- it follows up an announcement "provided the
+preimage has been requested on chain by the given service" -- and polkajam
+enforces it exactly: `note_preimage` returns `NotRequested` otherwise. So
+the run has to get a `Solicit` accumulated before it says anything. The dev
+bootstrap service takes one, the same way `Export` already serves §17.
+
+**N6 is the only lane that speaks as an ordinary peer.** polkajam's
+`as_val_from_ordinary[PreimageAnnouncement]` is unlimited while
+`as_val_from_non_neighbor[PreimageAnnouncement]` is disallowed, so an
+announcement from a validator the NUT does not neighbour is refused on the
+peer class alone. And the announcer cannot send and leave: CE 142 and CE 143
+run in opposite directions on one connection, so it holds for the ten
+seconds `:708` names and serves whatever the node opens.
+
+**Three live runs, three harness defects, and the node right every time.**
+
+| run | what failed | what it was |
+|---|---|---|
+| `n6-1` | no announcement at all | the solicit package's hash was never recorded: a field declared and nothing written to it |
+| `n6-2` | the node ignored the announcement | the solicit was on its own submission, which is never accumulated (§31). No service had asked for anything, so ignoring it was correct |
+| `n6-3` | inclusion unexercised | the NUT authored no block after the announcement. The control working, not a defect -- `n6-4` authored one and the row passes |
+
+Every one of those reported itself as unexercised or named the node's
+correct behaviour. None invented a node defect, which is what the gating is
+for and what §5 cost two pins for lacking.
+
+**§31 is the constraint `n6-2` found**: only the first package a run submits
+is ever accumulated, because the availability plan assures one report. The
+solicit therefore rides the honest package, which is not where it belongs;
+the comment says why it has to, so the next reader does not tidy it apart.
+
+**The sim test found a tautology in a row written hours after §5.**
+`n6_ce143_asked_for_what_was_announced` was emitted only for a request that
+had already matched the announcement, then asserted it matched -- true by
+construction. Posing the fault that asks for an unannounced hash made the
+row *vanish* rather than fail. It now grades every request the node made
+against what it was told about, and the test asserts the row **fails**
+rather than merely not passing, which is the distinction that would have
+hidden it.
+
+
 ## Milestone ladder
 
 | Milestone | Lanes | Coverage | Status |

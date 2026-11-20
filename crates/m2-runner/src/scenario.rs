@@ -16,10 +16,11 @@ use m2_scenario::dsl::{Check, Obs, ObsKind, ObsLog, Outcome, Scheduler, Severity
 use m2_scenario::scenarios::n0::{Ce128Probe, Ce129Probe};
 use m2_scenario::scenarios::n3::N3Ctx;
 use m2_scenario::scenarios::n4::N4Ctx;
+use m2_scenario::scenarios::n6::N6Ctx;
 use m2_scenario::scenarios::obs::{
     EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, TICKET_REFUSED,
 };
-use m2_scenario::scenarios::{n0, n1, n2, n3, n4};
+use m2_scenario::scenarios::{n0, n1, n2, n3, n4, n6};
 
 use crate::cli::LaneSet;
 use crate::report::{CheckOutcome, Finding};
@@ -31,6 +32,7 @@ pub(crate) struct RunCtx {
     pub n2: Option<N2Ctx>,
     pub n3: Option<N3Ctx>,
     pub n4: Option<N4Ctx>,
+    pub n6: Option<N6Ctx>,
 }
 
 /// The outcome of a run's scenario evaluation.
@@ -85,6 +87,9 @@ pub(crate) fn evaluate(obs: &ObsLog, run_ctx: &RunCtx, selected: LaneSet) -> Eva
     }
     if let (true, Some(ctx)) = (selected.n4, &run_ctx.n4) {
         lanes.push(("N4", n4::all(ctx)));
+    }
+    if let (true, Some(ctx)) = (selected.n6, &run_ctx.n6) {
+        lanes.push(("N6", n6::all(ctx)));
     }
     for (lane, checks) in lanes {
         let (out, finds, hard) = run_lane(lane, &checks, obs);
@@ -702,6 +707,31 @@ pub(crate) fn fabricated_run_ctx(
         assured_by_core: vec![(0, (0..jam_types::max_val_count()).collect())],
     };
 
+    // N6's fabricated context: a preimage solicited, announced, asked for
+    // and included. Every row gets a subject, because a baseline that left
+    // one unexercised would ship a lane nothing had ever graded.
+    let n6_blob = m2_reference::reports::n6_preimage();
+    let n6_hash = jam_std_common::hash_raw(&n6_blob);
+    let n6 = n6::N6Ctx {
+        announced: vec![n6::AnnouncedPreimage {
+            peer: n6::ORDINARY_PEER,
+            service_id: m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+            hash: n6_hash,
+            length: n6_blob.len() as u32,
+            at_wall_ms: submitted_at,
+        }],
+        requests: vec![n6::PreimageRequested {
+            peer: n6::ORDINARY_PEER,
+            asked: n6_hash,
+            matched_announcement: true,
+            after_announcement_ms: 400,
+            answered: true,
+        }],
+        solicited_on_chain: true,
+        included: vec![n6_hash],
+        authored_after_announcement: true,
+    };
+
     Ok(RunCtx {
         // The fabricated log is written for a NUT at index 0, which initiates
         // to every emulated peer and so never needs a fallback dial.
@@ -750,6 +780,7 @@ pub(crate) fn fabricated_run_ctx(
         n2: Some(n2),
         n3: Some(n3),
         n4: Some(n4),
+        n6: Some(n6),
     })
 }
 
@@ -766,6 +797,7 @@ mod tests {
         n2: true,
         n3: true,
         n4: true,
+        n6: true,
     };
 
     #[test]

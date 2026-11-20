@@ -1913,6 +1913,51 @@ Two lessons worth keeping:
 **What it does not close.** §4's question survives: the size-cap wording is
 untouched since 2026-03-22, so it is still unanswered at HEAD.
 
+## 31. Only the first package a run submits is ever accumulated
+
+**Status:** open, and it is a harness limitation rather than a node defect.
+Found 2026-11-20 while building N6, which is the first lane to need
+anything from *accumulate* rather than from the wire.
+
+A work item's `Solicit`, `Transfer`, `Bless` or any other on-chain effect
+takes place in accumulate. A report is accumulated only once it is
+available; available means assured; and the harness assures exactly one
+report per run, because the availability plan is built from the first report
+the node distributes (`m2-runner`'s `plan_package`). So **the first package
+is the only one whose accumulate ever runs.** Every later package is
+guaranteed, included, and then sits there.
+
+**Measured** (`sessions/n6-2`). The solicit was given its own submission one
+slot behind the honest one. The node guaranteed it, included it, and the
+bootstrap service accumulated exactly once -- for the honest package, at
+slot 9907730. The announcement that followed was correctly ignored, because
+no service had asked for anything. Moving the solicit onto the honest
+package made the same run pass (`sessions/n6-3`).
+
+**What it costs today.** N6's `Solicit` rides the honest package rather than
+a submission of its own, which is not where it belongs: the honest package
+is what N3 and N4 grade, and it now has a second job. The comment on
+`work_item_that_exports_and_solicits` says why it has to, so the next reader
+does not "tidy" it apart and spend a run finding out.
+
+**What it would cost a lane that needs two.** Any future row that needs two
+independent on-chain effects -- a solicit and a forget, a transfer and a
+lookup -- cannot have them, because the second package's accumulate will
+never run. That is the shape to watch for, and it is a property of the
+harness's availability plan rather than of the protocol.
+
+**What would fix it.** The availability plan would have to cover every
+report the node distributes rather than the first, which means assuring more
+than one core's worth per run. `findings.md` §12 records why the plan cannot
+be written before the run; this is the other half of the same constraint and
+is worth solving together with it.
+
+**Why this is not a node finding.** Nothing polkajam did here was wrong. A
+report that is not available must not be accumulated, and the node declining
+to act on a preimage no service had requested is the rule working.
+
+---
+
 ## 29. A validator connection dies mid-run, and nothing re-dialled it
 
 **Status:** CLOSED 2026-11-19. The consequence is fixed and measured here;

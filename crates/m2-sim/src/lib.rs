@@ -35,12 +35,12 @@ use jamnp_s::codec::ce128_129::{
 };
 use jamnp_s::codec::ce131_136::{self, GuaranteedWorkReport, Ticket, TicketDistribution};
 use jamnp_s::codec::ce137_148;
-use jamnp_s::codec::ce141_145::Assurance;
+use jamnp_s::codec::ce141_145::{Assurance, PreimageAnnouncement, PreimageRequest};
 use jamnp_s::codec::up0::{Announcement, Final, Handshake};
 use jamnp_s::endpoint::{EndpointConfig, EndpointError};
 use jamnp_s::framing::{
     frame, frame_message, FrameReader, CE128, CE129, CE131, CE132, CE133, CE134, CE135, CE137,
-    CE138, CE139, CE140, CE141, CE146, CE148, UP,
+    CE138, CE139, CE140, CE141, CE142, CE143, CE146, CE148, UP,
 };
 use jamnp_s::transport::{Conn, RecvHalf, SendHalf, Transport};
 use m2_reference::chain::RefChain;
@@ -107,6 +107,16 @@ pub enum SimFault {
     /// (`findings.md` §8). The node *is* enforcing the rule, which is why
     /// the N3 row must read this as a refusal and not as acceptance.
     ClosesOnOversizedPackage,
+    /// Read a CE 142 announcement and never follow it up over CE 143,
+    /// where `simple.md:705-707` expects a node that can use the preimage
+    /// to ask for it.
+    IgnoresPreimageAnnouncement,
+    /// Follow up an announcement by asking for a different hash.
+    ///
+    /// Not a plausible node, and that is the point: it separates "the node
+    /// opened CE 143" from "the node asked for what it was told about",
+    /// which one row each.
+    AsksForAnotherPreimage,
     /// Accept a ticket for an epoch past its horizon, instead of resetting
     /// the stream (`simple.md:335-337`).
     AcceptsUnknownEpoch,
@@ -1049,9 +1059,65 @@ impl SimNode {
             CE134 => self.receive_share(&mut send, &mut reader, &content).await,
             CE135 => self.receive_report(&content).await,
             CE141 => self.receive_assurance(&connection, &content, peer).await,
+            CE142 => {
+                self.receive_preimage_announcement(&connection, &content)
+                    .await
+            }
             // A real node resets an unserved kind; this one is not graded on
             // that, so it drops the stream.
             _ => {}
+        }
+    }
+
+    /// Receive a CE 142 announcement and follow it up over CE 143
+    /// (`simple.md:700-744`).
+    ///
+    /// The follow-up goes back on the *same* connection, which is what makes
+    /// this exchange worth simulating: a node that answered on a fresh
+    /// connection, or not at all, looks identical to one that never read
+    /// the announcement, and only the announcer can tell the difference.
+    ///
+    /// The stand-in has no chain, so it cannot check whether the preimage
+    /// was requested on chain -- it asks for whatever it is told about. The
+    /// lane's own gate covers that condition; this covers the wire.
+    async fn receive_preimage_announcement(&self, connection: &Conn, content: &[u8]) {
+        if self.fault == SimFault::IgnoresPreimageAnnouncement {
+            return;
+        }
+        let Ok(announcement) = PreimageAnnouncement::decode(&mut &content[..]) else {
+            return;
+        };
+        let asked = if self.fault == SimFault::AsksForAnotherPreimage {
+            // A hash it was never told about: the row must not credit this
+            // as having followed up the announcement.
+            [0xab; 32]
+        } else {
+            announcement.hash
+        };
+        let Ok((mut send, recv)) = connection.open_bi().await else {
+            return;
+        };
+        let request = frame(CE143, &PreimageRequest { hash: asked }.encode());
+        if send.write_all(&request).await.is_err() {
+            return;
+        }
+        send.finish();
+        // Read the answer so the exchange completes the way a real one does;
+        // what the node then does with the blob is the inclusion row's
+        // business and this stand-in authors nothing.
+        let mut reader = FrameReader::with_kind(CE143);
+        let mut buf = [0u8; 4096];
+        let mut recv = recv;
+        for _ in 0..4 {
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => {
+                    reader.push(&buf[..n]);
+                    if matches!(reader.next_frame(), Ok(Some(_))) {
+                        break;
+                    }
+                }
+                _ => break,
+            }
         }
     }
 

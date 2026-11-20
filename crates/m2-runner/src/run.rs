@@ -338,7 +338,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             if wait_secs + MIN_SECS_AFTER_SUBMISSION > cli.observe_secs {
                 conn_findings.push(short_window_finding(wait_secs, cli.observe_secs));
             }
-            match plan_package_for_this_run(&ref_chain, nut_index) {
+            match plan_package_for_this_run(&ref_chain, nut_index, cli.lanes.needs_preimage()) {
                 Ok(plan) => {
                     // The honest submission leads the plan; the report is
                     // distributed in its slot.
@@ -425,6 +425,18 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     dial_tasks.push(tokio::spawn(async move {
                         submit_as_builder(nut_addr, san, genesis_hash, shared_for_builder).await;
                     }));
+                    // N6 rides behind the solicit the builder submits: the
+                    // announcement is only answerable once that request is
+                    // on chain, so the announcer waits for the block rather
+                    // than for a clock.
+                    if cli.lanes.needs_preimage() {
+                        let shared_for_preimage = shared.clone();
+                        let san = nut_san.clone();
+                        dial_tasks.push(tokio::spawn(async move {
+                            announce_preimage(nut_addr, san, genesis_hash, shared_for_preimage)
+                                .await;
+                        }));
+                    }
                 }
                 // A run that cannot plan a submission still grades every
                 // other lane; N3 reports the rule as unexercised rather than
@@ -462,6 +474,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             }));
         }
         let real_run = RealRunData {
+            preimage_solicited: Arc::clone(&shared.preimage_solicited),
+            preimages_announced: Arc::clone(&shared.preimages_announced),
+            preimage_requests: Arc::clone(&shared.preimage_requests),
             ref_chain,
             nut_blocks,
             deliveries,
@@ -880,6 +895,7 @@ const SUBMISSION_MARGIN_SLOTS: u32 = 2;
 fn plan_package_for_this_run(
     ref_chain: &RefChain,
     nut_index: usize,
+    solicit_preimage: bool,
 ) -> Result<Vec<m2_reference::reports::SubmissionSchedule>, m2_reference::chain::ChainError> {
     // Into the *next* epoch, not the next slot.
     //
@@ -983,6 +999,11 @@ fn plan_package_for_this_run(
         co_guarantors: plan.co_guarantors.clone(),
         fault: None,
         imports: false,
+        // N6's solicit rides the honest package because only the first
+        // report the node distributes is ever made available, and a report
+        // that is not available is never accumulated -- so no later
+        // package's `Solicit` takes effect. Measured in `sessions/n6-2`.
+        solicits: solicit_preimage,
     }];
     // The CE 133 faults, then CE 146: the same package over the whole-bundle
     // protocol, honest and then over its own size cap.
@@ -1001,14 +1022,19 @@ fn plan_package_for_this_run(
     // the ones a peer mentioned. Six slots behind the package it imports
     // from is room for the node to guarantee it, distribute it and see it
     // included.
-    for (i, (protocol, fault, imports)) in [
-        (jamnp_s::framing::CE133, Some(Oversized), false),
-        (jamnp_s::framing::CE133, Some(Unauthorized), false),
-        (jamnp_s::framing::CE133, Some(ExtrinsicSizeMismatch), false),
-        (jamnp_s::framing::CE133, Some(NotAGuarantor), false),
-        (jamnp_s::framing::CE146, None, false),
-        (jamnp_s::framing::CE146, Some(Oversized), false),
-        (jamnp_s::framing::CE133, None, true),
+    for (i, (protocol, fault, imports, solicits)) in [
+        (jamnp_s::framing::CE133, Some(Oversized), false, false),
+        (jamnp_s::framing::CE133, Some(Unauthorized), false, false),
+        (
+            jamnp_s::framing::CE133,
+            Some(ExtrinsicSizeMismatch),
+            false,
+            false,
+        ),
+        (jamnp_s::framing::CE133, Some(NotAGuarantor), false, false),
+        (jamnp_s::framing::CE146, None, false, false),
+        (jamnp_s::framing::CE146, Some(Oversized), false, false),
+        (jamnp_s::framing::CE133, None, true, false),
     ]
     .into_iter()
     .enumerate()
@@ -1046,6 +1072,7 @@ fn plan_package_for_this_run(
                 .collect(),
             fault,
             imports,
+            solicits,
         });
     }
     Ok(plans)
@@ -1207,6 +1234,18 @@ async fn submit_one(
             hex8(&from.package_hash)
         );
     }
+    // The package carrying N6's solicit, named so the announcer can wait for
+    // a block to carry it. Recorded here because this is where the hash
+    // first exists: the package is composed near its own slot, long after
+    // the run is planned.
+    if schedule.solicits {
+        *m2_emu::emu::lock(&shared.solicit_package) = Some(plan.package_hash);
+        eprintln!(
+            "[builder] slot {} solicits N6's preimage in package {}",
+            schedule.slot,
+            hex8(&plan.package_hash)
+        );
+    }
     // Read before the plan is handed to the sender, which consumes it.
     let produced = (plan.exports_count > 0).then_some(m2_reference::reports::ImportSource {
         package_hash: plan.package_hash,
@@ -1265,6 +1304,113 @@ async fn submit_one(
     .await;
     drop(connection);
     produced
+}
+
+/// Introduce N6's preimage as an ordinary, non-validator peer.
+///
+/// Three things have to be true before the node owes an answer, and only
+/// one of them is about the wire. The preimage must be requested on chain
+/// by the service (`simple.md:705-707`); the node must not already hold it,
+/// which the run arranges by inventing the blob; and the announcer must be
+/// a peer whose announcements the node accepts, which here means one whose
+/// certificate key is not in the validator set -- polkajam refuses CE 142
+/// from a validator it does not neighbour, on the peer class alone.
+///
+/// So this waits for the solicit to reach a block before it says anything.
+/// Announcing earlier would grade the node on a request it had no reason to
+/// make, and the row would fail a conforming node for the harness's timing.
+async fn announce_preimage(
+    addr: SocketAddr,
+    expected_san: String,
+    genesis_hash: [u8; 32],
+    shared: m2_emu::emu::EmuShared,
+) {
+    let blob = m2_reference::reports::n6_preimage();
+
+    // The package that carries the solicit, as the builder recorded it.
+    // Polled rather than passed, because the builder composes it near its
+    // own slot and the hash is not known when the run is planned.
+    let Some(package) = wait_for(SOLICIT_WAIT_SLOTS, || {
+        *m2_emu::emu::lock(&shared.solicit_package)
+    })
+    .await
+    else {
+        eprintln!("[preimage] the solicit submission never went out; N6 has no precondition");
+        return;
+    };
+
+    // And then for a block carrying its guarantee. Accumulation follows
+    // inclusion, so a couple of slots after the block is the earliest the
+    // request can be looked up.
+    let on_chain = wait_for(SOLICIT_WAIT_SLOTS, || {
+        shared
+            .ref_chain
+            .carries_package(&package)
+            .ok()
+            .filter(|c| *c)
+    })
+    .await
+    .is_some();
+    if !on_chain {
+        eprintln!(
+            "[preimage] no block carries the solicit for package {}; not announcing, so N6 \
+             reports itself unexercised rather than failing the node for our timing",
+            hex8(&package)
+        );
+        return;
+    }
+    *m2_emu::emu::lock(&shared.preimage_solicited) = true;
+    sleep_until_slot(m2_reference::chain::wall_clock_slot() + ACCUMULATE_LEAD_SLOTS).await;
+
+    // An ordinary peer: a key outside the validator set, and no builder
+    // suffix. The builder's connection would do on the wire, but asking for
+    // a builder slot is a different claim and this row is about what an
+    // ordinary node may introduce.
+    let mut seed = [0u8; 32];
+    seed[0] = 0x6E;
+    seed[1] = 0x06;
+    use jamnp_s::transport::Transport as _;
+    let connected = jamnp_s::transport::quic::QuicTransport
+        .connect(
+            jamnp_s::endpoint::EndpointConfig {
+                genesis_hash,
+                builder: false,
+            },
+            ed25519_consensus::SigningKey::from(seed),
+            expected_san,
+            addr,
+        )
+        .await;
+    let connection = match connected {
+        Ok(connection) => connection,
+        Err(e) => {
+            eprintln!("[preimage] could not connect as an ordinary peer: {e}");
+            return;
+        }
+    };
+    m2_emu::preimage_io::announce_and_serve(
+        connection.clone(),
+        m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID,
+        blob,
+        Arc::clone(&shared.trace),
+        Arc::clone(&shared.obs),
+        Arc::clone(&shared.preimages_announced),
+        Arc::clone(&shared.preimage_requests),
+        m2_scenario::scenarios::n6::ORDINARY_PEER,
+    )
+    .await;
+    drop(connection);
+}
+
+/// Poll `f` once a slot for up to `slots`, returning its first `Some`.
+async fn wait_for<T>(slots: u32, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    for _ in 0..slots {
+        if let Some(found) = f() {
+            return Some(found);
+        }
+        sleep_until_slot(m2_reference::chain::wall_clock_slot() + 1).await;
+    }
+    f()
 }
 
 /// Watch for a report the NUT guaranteed, and plan this run's availability
@@ -1498,6 +1644,21 @@ async fn sleep_until_slot(slot: u32) {
 /// they never went out and their rows reported themselves unexercised with
 /// nothing to say why.
 const SUBMISSION_SPACING_SLOTS: u32 = 1;
+
+/// Slots the preimage announcer will wait for its precondition.
+///
+/// Generous, because every step it waits on is the node's: guaranteeing the
+/// package, distributing the report, collecting assurances and authoring the
+/// block that carries it. A short wait would turn a slow node into a lane
+/// that reports itself unexercised.
+const SOLICIT_WAIT_SLOTS: u32 = 12;
+
+/// Slots between the block carrying the solicit and the announcement.
+///
+/// Accumulation runs after inclusion, and the request only exists once it
+/// has. Two slots is the same lead the package builder uses, for the same
+/// reason: long enough to be true, short enough not to spend the window.
+const ACCUMULATE_LEAD_SLOTS: u32 = 2;
 
 /// Slots to let an epoch settle before submitting into it.
 ///

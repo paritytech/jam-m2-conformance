@@ -8,4 +8,5 @@ pub mod n1;
 pub mod n2;
 pub mod n3;
 pub mod n4;
+pub mod n6;
 pub mod obs;

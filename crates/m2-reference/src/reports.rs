@@ -172,14 +172,75 @@ const EXPORT_BLOB_LEN: usize = 64;
 /// Taken from the caller rather than randomised, because a run that cannot
 /// be repeated cannot be bisected.
 pub fn work_item_that_exports(count: u16, salt: [u8; 32]) -> WireItem {
+    work_item_that_exports_and_solicits(count, salt, None)
+}
+
+/// The exporting item, optionally also soliciting a preimage on chain.
+///
+/// The two jobs ride one item because only one package in a run can do the
+/// second. A `Solicit` takes effect in *accumulate*, and a report is only
+/// accumulated once it is available -- which means assured, which means the
+/// availability plan covered it. That plan is built from the first report
+/// the node distributes, so the first package is the only one whose
+/// accumulate ever runs. A solicit on any later package is guaranteed,
+/// included, and then sits unaccumulated for the rest of the run.
+///
+/// Measured rather than assumed: `sessions/n6-2` put the solicit on its own
+/// submission a slot behind the honest one, the node guaranteed and
+/// included it, and the bootstrap service accumulated exactly once -- for
+/// the honest package. The announcement that followed was correctly
+/// ignored, because no service had asked for anything.
+pub fn work_item_that_exports_and_solicits(
+    count: u16,
+    salt: [u8; 32],
+    solicit: Option<&[u8]>,
+) -> WireItem {
     let data: Vec<Vec<u8>> = (0..count)
         .map(|i| vec![(i as u8).wrapping_add(1); EXPORT_BLOB_LEN])
         .collect();
+    let mut instructions = vec![jam_bootstrap_service_common::Instruction::Export { data }];
+    if let Some(blob) = solicit {
+        instructions.push(jam_bootstrap_service_common::Instruction::Solicit {
+            hash: jam_types::AnyHash(jam_std_common::hash_raw(blob)),
+            len: blob.len() as u64,
+        });
+    }
+    instruction_item(instructions, salt, count)
+}
+
+/// A work item that asks the service to solicit a preimage on chain.
+///
+/// N6's precondition. `simple.md:705-710` has a node follow up a CE 142
+/// announcement with a CE 143 request **only** if the preimage "has been
+/// requested on chain by the given service", and polkajam enforces exactly
+/// that: `note_preimage` refuses with `NotRequested` unless the chain
+/// carries a request for this service, hash and length.
+///
+/// So the lane cannot announce a preimage of its choosing and expect an
+/// answer -- it has to put the request on chain first, which means a
+/// package the node guarantees, includes and accumulates. The dev bootstrap
+/// service takes `Solicit { hash, len }` for exactly this.
+///
+/// The length is part of the request, not just the hash: a request is keyed
+/// on `(service, hash, len)`, so announcing the right hash with the wrong
+/// length is a different request and is refused.
+pub fn work_item_that_solicits(blob: &[u8], salt: [u8; 32]) -> WireItem {
     instruction_item(
-        vec![jam_bootstrap_service_common::Instruction::Export { data }],
+        vec![jam_bootstrap_service_common::Instruction::Solicit {
+            hash: jam_types::AnyHash(jam_std_common::hash_raw(blob)),
+            len: blob.len() as u64,
+        }],
         salt,
-        count,
+        0,
     )
+}
+
+/// The blob N6 solicits and then announces.
+///
+/// Fixed rather than random, because a run that cannot be repeated cannot
+/// be bisected -- the same reason the ticket faults are chosen by index.
+pub fn n6_preimage() -> Vec<u8> {
+    b"m2-conformance-n6-preimage".to_vec()
 }
 
 /// A package built earlier in the same run, and the one segment of it a
@@ -307,6 +368,13 @@ pub struct SubmissionSchedule {
     /// plan says what the submission is *for*; the builder supplies the
     /// package it turned out to be.
     pub imports: bool,
+    /// Whether this package asks the service to solicit N6's preimage.
+    ///
+    /// Its own submission rather than a second instruction on the honest
+    /// one: the honest package is what N3 and N4 grade, and giving it a
+    /// second job would put a second reason in front of every row that
+    /// reads it.
+    pub solicits: bool,
 }
 
 /// A deliberate defect in a CE 133 submission (DESIGN §11 N3).
@@ -628,13 +696,19 @@ impl RefChain {
                 // package that also exported would give the run a second
                 // root to confuse that with.
                 Some(from) => vec![work_item_that_imports(from, salt_for_slot(schedule.slot))],
-                None => vec![work_item_that_exports(
+                // The honest package exports for N4 and, where the run
+                // asked, solicits for N6. One package because only the
+                // first one's accumulate ever runs; see
+                // `work_item_that_exports_and_solicits`.
+                None => vec![work_item_that_exports_and_solicits(
                     EXPORTS_PER_PACKAGE,
                     salt_for_slot(schedule.slot),
+                    schedule.solicits.then(n6_preimage).as_deref(),
                 )],
             },
             _ => vec![trivial_work_item()],
         };
+
         let work = match schedule.fault {
             Some(SubmissionFault::Unauthorized) => {
                 let built = self.build_unauthorized_package(items)?;

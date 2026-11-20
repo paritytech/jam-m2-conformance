@@ -692,12 +692,40 @@ built.
 
 ### N6 — preimages, CE 142/143 (1–2 epochs)
 
+Implemented 2026-11-20. The only lane that speaks as an **ordinary,
+non-validator peer**: `simple.md:702-703` writes CE 142 as the way
+non-validator nodes introduce preimages, and polkajam reads it the same way
+-- `as_val_from_ordinary[PreimageAnnouncement]` is unlimited while
+`as_val_from_non_neighbor[PreimageAnnouncement]` is disallowed, so an
+announcement from a validator the NUT does not neighbour is refused on the
+peer class alone, before the preimage is looked at.
+
+**The precondition is on chain, not on the wire.** A node follows up "provided
+the preimage has been requested on chain by the given service"
+(`:705-707`), and polkajam enforces it: `note_preimage` returns
+`NotRequested` otherwise. So the run must get a `Solicit` **accumulated**
+before it announces, which means a package the node guarantees, includes,
+*and* has assured -- a report that is not available is never accumulated.
+That is why the solicit rides the honest package rather than one of its own
+(`findings.md` §31).
+
+Until the solicit lands, the correct node behaviour is silence. Every row
+below is gated on it and reports `n6_preimage_not_solicited` rather than
+failing a node for the harness's timing.
+
 | Check | Assertions | Faults |
 |---|---|---|
-| Announce → request `:700-744` | a non-validator peer announces `ServiceID ++ Hash ++ Len` and keeps the connection 10 s `:705-710`; NUT opens CE 143 iff the preimage is requested on chain and not held; verifies hash and length | un-requested hash → no CE 143; wrong preimage → no inclusion, no gossip |
-| Gossip | NUT announces an obtained preimage to grid neighbours `:712-713` | — |
-| Serve | returns the bytes, FIN | unknown → reset |
-| Inclusion | in the next NUT block, sorted; lookups updated | no longer requested → excluded |
+| Announce → request `:700-744` | an ordinary peer announces `ServiceID ++ Hash ++ Len` for a preimage solicited on chain and holds the connection 10 s `:705-710`; the NUT opens CE 143 **back on that connection** and asks for the announced hash | **posed** (`m2-sim/tests/n6_sim_it.rs`): a node that reads the announcement and never follows up; one that follows up asking for a hash nobody announced |
+| Serve | the harness answers CE 143 with the blob, and only for the hash it announced | a request for another hash → reset, and the row says the node asked for something this run never announced |
+| Inclusion | the preimage reaches a block the NUT authored *after* the announcement | graded Soft: `simple.md` sets no deadline, and a node that asked, was served and has not yet authored is in breach of nothing the harness can cite |
+| Gossip `:712-713` | **not graded.** A validator announces an obtained preimage to its grid neighbours, and the harness's emulated validators are not the NUT's neighbours in every run; a row keyed on it would report itself unexercised more often than not |
+
+**What this lane does not do.** It poses no fault on the announcement
+itself -- a wrong length, an unsolicited hash, a service that does not
+exist. Each would be a row about the node declining, and declining is also
+what a node does when the harness's own precondition has not landed, so the
+two cannot be told apart from outside until the lane can read the chain's
+request set directly.
 
 ### N7 — adversarial and robustness (cross-cutting)
 

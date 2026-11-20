@@ -65,6 +65,12 @@ pub(crate) struct RealRunData {
     /// Shard count the availability plan was built for, or `None` where no
     /// plan was ever set.
     pub(crate) avail_shard_count: Arc<Mutex<Option<u16>>>,
+    /// Whether a block was seen carrying N6's solicit.
+    pub(crate) preimage_solicited: Arc<Mutex<bool>>,
+    /// Preimages the harness announced over CE 142.
+    pub(crate) preimages_announced: Arc<Mutex<Vec<m2_scenario::scenarios::n6::AnnouncedPreimage>>>,
+    /// CE 143 requests the NUT opened back on the announcing connection.
+    pub(crate) preimage_requests: Arc<Mutex<Vec<m2_scenario::scenarios::n6::PreimageRequested>>>,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
@@ -250,13 +256,65 @@ pub(crate) fn build_real_run_ctx(
     let t = std::time::Instant::now();
     let n4 = build_n4_ctx(data, &nut_blocks);
     crate::run::phase("ctx.build_n4", t);
+    let n6 = build_n6_ctx(data, &nut_blocks);
     Ok(RunCtx {
         n0,
         n1: Some(n1),
         n2: Some(n2),
         n3: Some(n3),
         n4: Some(n4),
+        n6: Some(n6),
     })
+}
+
+/// Build the N6 context from what the preimage announcer recorded.
+///
+/// `included` is read from the NUT's own blocks rather than from the
+/// reference's: the question is whether *this node* put the preimage it
+/// obtained into a block it authored, and a reference block carrying it
+/// would say nothing about that.
+fn build_n6_ctx(
+    data: &RealRunData,
+    nut_blocks: &[crate::real::NutBlock],
+) -> m2_scenario::scenarios::n6::N6Ctx {
+    let announced = data
+        .preimages_announced
+        .lock()
+        .expect("the announcements")
+        .clone();
+    let first_announcement = announced.iter().map(|a| a.at_wall_ms).min();
+    m2_scenario::scenarios::n6::N6Ctx {
+        announced,
+        requests: data.preimage_requests.lock().expect("the requests").clone(),
+        solicited_on_chain: *data.preimage_solicited.lock().expect("the solicit flag"),
+        included: nut_blocks
+            .iter()
+            .flat_map(|n| n.block.extrinsic.preimages.iter())
+            .map(|p| jam_std_common::hash_raw(p.blob()))
+            .collect(),
+        // Only blocks authored *after* the announcement can carry it, and a
+        // run where the node authored none is a run where "not included" is
+        // a fact about the lottery.
+        authored_after_announcement: {
+            if let Some(at) = first_announcement {
+                eprintln!(
+                    "[preimage] announced at wall {at} ms (slot {}); the NUT authored {} \
+                     block(s), {} of them after",
+                    m2_reference::chain::slot_of_ms(at),
+                    nut_blocks.len(),
+                    nut_blocks
+                        .iter()
+                        .filter(|n| m2_reference::chain::slot_start_ms(n.block.header.slot) > at)
+                        .count()
+                );
+            }
+            first_announcement.is_some_and(|at| {
+                nut_blocks
+                    .iter()
+                    .any(|n| m2_reference::chain::slot_start_ms(n.block.header.slot) > at)
+            })
+        },
+    }
 }
 
 /// Build the N4 context from what the availability driver recorded.
