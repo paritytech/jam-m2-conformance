@@ -302,39 +302,111 @@ with a live failure behind it.
 
 ---
 
-## 5. The node resets a well-formed CE 134 share with `NoError`
+## 5. The node resets a well-formed CE 134 share with `NoError` — CLOSED 2026-11-20
 
-**Status:** open, and now reproduced. Opened 2026-11-16, seen again
-2026-11-18 on the `b1ea8aca4` pin (`sessions/n3n4-1`) with the same message
-to the byte, down to the core and the code. Point 3 below is answered: it
-is not a one-off.
+**Status:** CLOSED. A harness defect, and the node was right. The share the
+harness offered was anchored to a block the node had dropped from its recent
+blocks, so refusing it was correct. Both of this finding's open questions
+are answered, and neither answer was the one it expected.
 
-The CE 134 receive row shares a bundle *with* the node, on a core the node
-holds at that slot, offering the active validator count as the shard count.
-The node reset the stream rather than answering:
+**Question 1: is `NoError` polkajam's way of declining a share it does not
+want?** No, and the node says so itself. Immediately above the CE 134
+receive path (`chain/guarantors/stream_receiver.rs:511-512`):
+
+```rust
+// TODO @dave: For many errors here we will just close the stream with
+// NetErrorCode::NoError. It may be helpful to add some more error codes.
+```
+
+The mechanism matches the comment. When `receive_other_work_package`
+returns `Err`, the `BiStream` is dropped, and `Drop for Stream`
+(`net/stream.rs:276-285`) kills it with `code.unwrap_or(ErrorCode::NoError)`.
+So `NoError` is the default on an error path with no code attached, not a
+decision — the node is refusing and cannot say why.
+
+Unlike §30, the *shape* of the refusal is right: `simple.md:115-120` gives
+the acceptor's stream reset as the way to reject, and that is what this is.
+Only the code is empty. It is already known upstream, so there is nothing
+here to report that is not already written down in the node.
+
+**Question 2: should the harness be sharing at that slot at all?** Not with
+that bundle. The node's own log, once its guarantor target was turned up
+(`sessions/ce134-1`):
 
 ```
-the NUT reset a well-formed share on core 1 with code 0x100
+failed to receive WorkPackageSharing(0): guarantee table error:
+  invalid anchor 0xdfa8dd97427288ed...
 ```
 
-`0x100` is `NoError` in polkajam's own table -- "No error", from RFC 9114 --
-not one of the JAMNP refusal codes (`Unwanted`, `TooBusy`, `TooMany`). So
-the node is not saying the share was bad; it is closing the stream without a
-reason.
+`check_anchor` (`chain/guarantors/table.rs:1077-1085`) requires the bundle's
+anchor to be in the node's recent-block ring, and `recent_block_count` is
+**8**. The share was composed during `plan_package` and sent at
+`honest_slot + 9`, so its anchor was one or two blocks past the window every
+time. The node could not have accepted it.
 
-The same run's unacceptable-shard-count share *was* correctly refused, so the
-path works and the node does distinguish the two cases.
+**The harness had already fixed this once, in the sender beside it.**
+`spawn_report_sender`'s own comment records the identical failure for
+CE 135:
 
-Worth establishing before this is called a defect:
+> Composed when the run is planned, the report's refine-context anchor has
+> aged out by the time it goes out seven to eleven slots later:
+> `Invalid guarantee: anchor is not recent`.
 
-1. Whether `NoError` on a reset is polkajam's way of declining a share it
-   does not want -- for example because it is already refining that core, or
-   has seen the package -- rather than an error at all.
-2. Whether the harness should be sharing at that slot at all. The share goes
-   out one slot after a run's own submissions, so the node may still be busy
-   with one of those.
-3. ~~Seen once. Reproduce before filing.~~ Reproduced 2026-11-18, two pins
-   and two days apart, which leaves 1 and 2 as the open questions.
+CE 134's sender was the one that never got the lead. It has one now,
+`SHARE_COMPOSE_LEAD_SLOTS`, the same two slots and for the same reason on
+both sides: long enough that the anchor is still recent when the share
+arrives, short enough that the bundle does not name a head the reference has
+reached and the node has not. A fix applied to one of two senders is a fix
+for one of two senders.
+
+**The worse half: the sibling row was passing for the wrong reason.** The
+lane shares twice, once honestly and once offering a shard count that is not
+the active validator count. *Both* were being refused for the stale anchor,
+so `n3_ce134_wrong_shard_count_refused` reported a pass across two pins
+without the shard count ever being the reason for anything.
+
+A reset carries no reason, so this lane cannot read *why* a share was
+refused. The only thing that can attribute it is the honest share beside it
+— identical but for the count — being answered. That control was failing,
+and the row took the credit anyway. It now reports
+`n3_ce134_wrong_shard_count_not_exercised` when the honest share was not
+answered: **a row that cannot fail for the reason it names is not grading
+that reason.**
+
+**The false pass was written down in three places, and all three agreed.**
+The row took a refusal as a verdict. The sim test asserted
+`ShareRefused must leave n3_ce134_wrong_shard_count_refused passing`, so a
+stand-in that refused *every* share was credited with refusing the faulty
+one for its shard count. And the unit test offered the faulty share with no
+honest share beside it at all and asserted every row passed — a context in
+which the question cannot be asked, answered in the affirmative.
+
+That is what makes this kind of defect expensive: the tests were written
+from the same reading as the code, so they agreed with it rather than
+checking it. All three are inverted now, and each fails if the gate is
+removed. The unit test grades the three cases that exist — control
+answered and fault refused, control answered and fault answered, control
+refused — where before it graded one, the one that could not distinguish
+anything.
+
+**Confirmed against the node** (`sessions/ce134-3`): `n3_ce134_answered` and
+`n3_ce134_hash_equals_the_reference` pass, where the first had failed since
+2026-11-16; and `n3_ce134_wrong_shard_count_refused` passes for the reason
+it names, in the node's own words:
+
+```
+failed to receive WorkPackageSharing(0): unacceptable shard count 5
+```
+
+**One fragility this exposed and did not fix.** A run between the two above
+(`sessions/ce134-2`) sent no share at all and the report said only
+"not exercised". `start_share_to_nut` claims the whole share plan for the
+first connection to reach it and holds that one connection across the nine
+slots until the share is due, and a node that closes connections every few
+slots (§30) can take it away in the meantime. The two silent returns in the
+sender now say which it was and quote the connection's end, so the next
+occurrence names itself rather than being read as the node staying quiet.
+Whether the sender should re-dial instead is open; it has not recurred.
 
 ## 6. crates.io 0.1.29 is not the pinned 0.1.29, and the difference is on the wire
 

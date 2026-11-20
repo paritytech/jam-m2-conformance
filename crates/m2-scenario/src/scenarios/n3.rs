@@ -799,12 +799,45 @@ pub fn n3_ce134_receive(ctx: &N3Ctx) -> Check {
             return vec![control.absent("n3_ce134_receive_not_exercised")];
         }
 
+        // Whether the honest share was answered, which is this lane's only
+        // way to read *why* a faulty share was refused.
+        //
+        // A refusal is a stream reset and a reset carries no reason -- and
+        // polkajam's carries `NoError`, which is the default on an error
+        // path rather than a decision (`findings.md` §5). So a share refused
+        // for its shard count and a share refused for anything else look
+        // identical here. What tells them apart is the honest share beside
+        // it, identical but for the count: if that was answered, the
+        // difference is the count.
+        //
+        // Without it the row is unexercised, not passing. It spent two pins
+        // reported as a pass while both shares were being refused for a
+        // stale anchor the harness sent -- a row that cannot fail for the
+        // reason it names is not grading that reason.
+        let control_answered = ctx
+            .shared_to_nut
+            .iter()
+            .any(|share| share.fault.is_none() && share.reply.is_some());
+
         let mut results = Vec::new();
         for share in &ctx.shared_to_nut {
             match share.fault {
                 // `simple.md:432-436`: acceptable means matching the active
                 // validator count. With a static set that is one number, so
                 // anything else must be refused.
+                Some(ShareFault::WrongShardCount) if !control_answered => {
+                    results.push(log::check_detail(
+                        "n3_ce134_wrong_shard_count_not_exercised",
+                        false,
+                        Severity::Hard,
+                        || {
+                            "the NUT refused a share offering the wrong shard count, but it \
+                             refused the honest share beside it too, so the refusal says \
+                             nothing about the shard count"
+                                .to_string()
+                        },
+                    ));
+                }
                 Some(ShareFault::WrongShardCount) => results.push(log::check_detail(
                     "n3_ce134_wrong_shard_count_refused",
                     share.reply.is_none(),
@@ -1382,22 +1415,66 @@ mod tests {
         );
     }
 
-    /// An unacceptable shard count must not be answered.
+    /// An unacceptable shard count must not be answered -- but only where
+    /// the honest share beside it *was*.
+    ///
+    /// A reset carries no reason, so a refusal on its own says nothing
+    /// about the shard count. The honest share is what attributes it, and
+    /// without that this row grades nothing (`findings.md` §5).
     #[test]
     fn an_unacceptable_shard_count_must_be_refused() {
-        let refused = run(&n3_ce134_receive(&share_ctx(vec![SharedToNut {
+        let faulty = || SharedToNut {
             shard_count: 5,
             ..shared(None, true, Some(ShareFault::WrongShardCount))
-        }])));
-        assert!(refused.iter().all(|r| r.outcome == Outcome::Pass));
+        };
+        let honest_answered = || shared(Some(SHARED), false, None);
 
-        let answered = run(&n3_ce134_receive(&share_ctx(vec![SharedToNut {
-            shard_count: 5,
-            ..shared(Some(SHARED), false, Some(ShareFault::WrongShardCount))
-        }])));
+        // Refused, with the control answered: the difference between the
+        // two shares is the count, so the refusal is attributable.
+        let refused = run(&n3_ce134_receive(&share_ctx(vec![
+            honest_answered(),
+            faulty(),
+        ])));
+        assert!(
+            refused
+                .iter()
+                .any(|r| r.name == "n3_ce134_wrong_shard_count_refused"
+                    && r.outcome == Outcome::Pass),
+            "with its control answered the row grades the count: {:?}",
+            names(&refused)
+        );
+
+        // Answered, with the control answered: a node that takes a share it
+        // must refuse.
+        let answered = run(&n3_ce134_receive(&share_ctx(vec![
+            honest_answered(),
+            SharedToNut {
+                shard_count: 5,
+                ..shared(Some(SHARED), false, Some(ShareFault::WrongShardCount))
+            },
+        ])));
         assert!(failed(
             &answered,
             "n3_ce134_wrong_shard_count_refused",
+            Severity::Hard
+        ));
+
+        // Refused, with the control refused too. This is what two pins of
+        // live runs actually looked like: both shares turned away for a
+        // stale anchor the harness sent, and the row reporting a pass.
+        let no_control = run(&n3_ce134_receive(&share_ctx(vec![
+            shared(None, true, None),
+            faulty(),
+        ])));
+        assert!(
+            !names(&no_control).contains(&"n3_ce134_wrong_shard_count_refused"),
+            "with its control refused the row grades nothing, so it must not report a \
+             verdict: {:?}",
+            names(&no_control)
+        );
+        assert!(failed(
+            &no_control,
+            "n3_ce134_wrong_shard_count_not_exercised",
             Severity::Hard
         ));
     }

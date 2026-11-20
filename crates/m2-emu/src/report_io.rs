@@ -470,15 +470,54 @@ pub async fn spawn_report_sender(
 /// it -- or resets, which is its way of refusing to refine at all.
 pub async fn spawn_share_sender(
     connection: Conn,
-    plan: m2_reference::reports::ScheduledShare,
+    planned: m2_reference::reports::ScheduledShare,
+    ref_chain: Arc<m2_reference::chain::RefChain>,
     trace: Arc<Mutex<Trace>>,
     obs: Arc<Mutex<ObsLog>>,
     shared_to_nut: Arc<Mutex<Vec<SharedToNut>>>,
     peer: u16,
 ) {
+    // Composed a short lead before the slot it is shared in, not when the
+    // run was planned. A bundle's refine context names an anchor, and a
+    // guarantor refuses one that has fallen out of its recent blocks --
+    // eight of them. The share goes out nine or ten slots after planning,
+    // so a bundle composed then is always too old, and the node answers by
+    // resetting the stream. CE 135's report had the same defect and the
+    // same fix; this is the sender that was missed (`findings.md` §5).
+    sleep_until_slot(planned.slot.saturating_sub(SHARE_COMPOSE_LEAD_SLOTS)).await;
+    let plan = match ref_chain.share_to_nut(planned.nut, planned.slot, planned.fault) {
+        Ok(Some(plan)) => plan,
+        // Said rather than returned silently: a share that was never
+        // composed and a share the node ignored both leave the CE 134
+        // receive rows unexercised, and those are different facts.
+        Ok(None) => {
+            eprintln!(
+                "[sharer] no share to send in slot {}: the NUT holds no core there",
+                planned.slot
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("[sharer] could not compose the share: {e}");
+            return;
+        }
+    };
+
     sleep_until_slot(plan.slot).await;
 
+    // Both failures below are said rather than returned silently. A share
+    // that never left the harness and a share the node ignored both leave
+    // the CE 134 receive rows unexercised, and a reader has no way to tell
+    // those apart from the report.
     let Ok((mut send, mut recv)) = connection.open_bi().await else {
+        eprintln!(
+            "[sharer] could not open a stream to share the bundle in slot {}: {}",
+            plan.slot,
+            match connection.end_reason() {
+                Some(end) => format!("the connection had ended: {end}"),
+                None => "the connection is up but would not open a stream".to_string(),
+            }
+        );
         return;
     };
     let context = SharingContext {
@@ -496,6 +535,14 @@ pub async fn spawn_share_sender(
     crate::emu::trace_record(peer, CE134, send.id(), &first, &trace, TraceDir::Rx);
     record(&obs, peer, ObsKind::Other(EMU_SENT_134));
     if send.write_all(&first).await.is_err() || send.write_all(&second).await.is_err() {
+        eprintln!(
+            "[sharer] could not write the share for slot {}: {}",
+            plan.slot,
+            match connection.end_reason() {
+                Some(end) => format!("the connection had ended: {end}"),
+                None => "the connection is up but the write failed".to_string(),
+            }
+        );
         return;
     }
     send.finish();
@@ -578,6 +625,14 @@ fn lane_fault(
 
 /// Slots before its distribution at which the report is composed.
 const REPORT_COMPOSE_LEAD_SLOTS: u32 = 2;
+
+/// Slots before a CE 134 share at which its bundle is composed.
+///
+/// The same two as the report above, and for the same reason on both sides:
+/// long enough that the anchor is still in the node's recent blocks when the
+/// share arrives, short enough that the bundle does not name a head the
+/// reference has reached and the node has not.
+const SHARE_COMPOSE_LEAD_SLOTS: u32 = 2;
 
 /// Wait until `slot` begins.
 async fn sleep_until_slot(slot: u32) {

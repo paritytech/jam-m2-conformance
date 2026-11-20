@@ -388,6 +388,13 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
                     .enumerate()
                     {
                         let slot = share_base + SUBMISSION_SPACING_SLOTS * i as u32;
+                        // Planned here and *composed* near its own slot, the
+                        // way CE 135's report is. A bundle composed now is
+                        // anchored to this head, and the share goes out nine
+                        // or ten slots later -- past the node's eight-block
+                        // recent window, so it refuses the anchor and the
+                        // row reads as a node refusing a well-formed share
+                        // (`findings.md` §5).
                         match ref_chain.share_to_nut(nut_index as u16, slot, fault) {
                             Ok(Some(share)) => shares.push(share),
                             // Said rather than dropped, the same as the

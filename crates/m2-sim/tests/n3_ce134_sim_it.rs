@@ -134,6 +134,7 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
         m2_emu::report_io::spawn_share_sender(
             connection.clone(),
             share,
+            Arc::clone(&harness_chain),
             emu.trace(),
             emu.obs(),
             emu.shared_to_nut(),
@@ -249,6 +250,29 @@ async fn the_receive_checks_catch_a_guarantor_that_mishandles_a_share() {
                     outcomes_of(&rows, other).is_empty(),
                     "a refused share has no hash to grade; it reported {:?}",
                     outcomes_of(&rows, other)
+                );
+                continue;
+            }
+            // A node that refuses *every* share refuses the faulty one too,
+            // and a reset carries no reason -- so that refusal says nothing
+            // about the shard count. The row must report itself unexercised
+            // rather than take the credit.
+            //
+            // This assertion used to read the other way, and that is the
+            // defect in miniature: against a live node both shares were
+            // being refused for a stale anchor the harness sent, and the
+            // row was reported as a pass for two pins (`findings.md` §5).
+            if fault == SimFault::ShareRefused && other == "n3_ce134_wrong_shard_count_refused" {
+                assert!(
+                    outcomes_of(&rows, other).is_empty(),
+                    "a node that refuses every share must not be credited with refusing the \
+                     faulty one for its shard count; it reported {:?}",
+                    outcomes_of(&rows, other)
+                );
+                assert!(
+                    failed(&rows, "n3_ce134_wrong_shard_count_not_exercised"),
+                    "and it must say so; it reported {:?}",
+                    outcomes_of(&rows, "n3_ce134_wrong_shard_count_not_exercised")
                 );
                 continue;
             }
