@@ -726,7 +726,7 @@ ordinary run, and #1404, an STF divergence fix. Neither moved a verdict:
 the live run on the new pin (`sessions/repin-1`) reports the same hard
 failures as the run before it.
 
-## 10. DESIGN had the erasure recovery threshold wrong
+## 10. DESIGN had the erasure recovery threshold wrong — CLOSED 2026-11-17
 
 **Status:** fixed in DESIGN 2026-11-17.
 
@@ -1878,9 +1878,17 @@ a guarantee. The codec's test asserts the hash's *position* after the
 guarantee, not merely that both are present.
 
 **Both protocols batch.** CE 144 sends `[Announcement]` and CE 145 sends
-`[Judgment]`, each a length-prefixed vector, and CE 145 may mix auditors,
-work-reports and epochs in one message (`:814-815`). A lane expecting one
-value per message would fail a conforming node on its first batch.
+`[Judgment]`, and CE 145 may mix auditors, work-reports and epochs in one
+message (`:814-815`). A lane expecting one value per message would fail a
+conforming node on its first batch.
+
+*Corrected 2026-11-20:* this paragraph originally called each of those a
+"length-prefixed vector". They are not. `:148-152` says a sequence not
+preceded by `len++` takes its length from context, and "in the case of a
+message consisting of a single sequence, the length of the sequence is
+implied by the message size in bytes". So `[Announcement]` and `[Judgment]`
+are the items concatenated with no count in front, and a reader decodes
+until the message runs out. §33 records what that error cost.
 
 **The re-pin, and why it was not optional.** DESIGN §2 states the
 invariant: *"Every `simple.md:NNN` in this repository refers to that
@@ -1913,52 +1921,7 @@ Two lessons worth keeping:
 **What it does not close.** §4's question survives: the size-cap wording is
 untouched since 2026-03-22, so it is still unanswered at HEAD.
 
-## 31. Only the first package a run submits is ever accumulated
-
-**Status:** open, and it is a harness limitation rather than a node defect.
-Found 2026-11-20 while building N6, which is the first lane to need
-anything from *accumulate* rather than from the wire.
-
-A work item's `Solicit`, `Transfer`, `Bless` or any other on-chain effect
-takes place in accumulate. A report is accumulated only once it is
-available; available means assured; and the harness assures exactly one
-report per run, because the availability plan is built from the first report
-the node distributes (`m2-runner`'s `plan_package`). So **the first package
-is the only one whose accumulate ever runs.** Every later package is
-guaranteed, included, and then sits there.
-
-**Measured** (`sessions/n6-2`). The solicit was given its own submission one
-slot behind the honest one. The node guaranteed it, included it, and the
-bootstrap service accumulated exactly once -- for the honest package, at
-slot 9907730. The announcement that followed was correctly ignored, because
-no service had asked for anything. Moving the solicit onto the honest
-package made the same run pass (`sessions/n6-3`).
-
-**What it costs today.** N6's `Solicit` rides the honest package rather than
-a submission of its own, which is not where it belongs: the honest package
-is what N3 and N4 grade, and it now has a second job. The comment on
-`work_item_that_exports_and_solicits` says why it has to, so the next reader
-does not "tidy" it apart and spend a run finding out.
-
-**What it would cost a lane that needs two.** Any future row that needs two
-independent on-chain effects -- a solicit and a forget, a transfer and a
-lookup -- cannot have them, because the second package's accumulate will
-never run. That is the shape to watch for, and it is a property of the
-harness's availability plan rather than of the protocol.
-
-**What would fix it.** The availability plan would have to cover every
-report the node distributes rather than the first, which means assuring more
-than one core's worth per run. `findings.md` §12 records why the plan cannot
-be written before the run; this is the other half of the same constraint and
-is worth solving together with it.
-
-**Why this is not a node finding.** Nothing polkajam did here was wrong. A
-report that is not available must not be accumulated, and the node declining
-to act on a preimage no service had requested is the rule working.
-
----
-
-## 29. A validator connection dies mid-run, and nothing re-dialled it
+## 29. A validator connection dies mid-run, and nothing re-dialled it — CLOSED 2026-11-19
 
 **Status:** CLOSED 2026-11-19. The consequence is fixed and measured here;
 the cause turned out to be a node defect and is §30.
@@ -2166,6 +2129,327 @@ its code and reason kept apart from an idle timeout and from this side
 hanging up — and the emulator records every one, on the connections it
 dials and the ones it accepts. The accepted half had never been logged at
 all, which is why validator 1 went unnoticed through five sessions.
+
+---
+
+## 31. Only the first package a run submits is ever accumulated
+
+**Status:** open, and it is a harness limitation rather than a node defect.
+Found 2026-11-20 while building N6, which is the first lane to need
+anything from *accumulate* rather than from the wire.
+
+A work item's `Solicit`, `Transfer`, `Bless` or any other on-chain effect
+takes place in accumulate. A report is accumulated only once it is
+available; available means assured; and the harness assures exactly one
+report per run, because the availability plan is built from the first report
+the node distributes (`m2-runner`'s `plan_package`). So **the first package
+is the only one whose accumulate ever runs.** Every later package is
+guaranteed, included, and then sits there.
+
+**Measured** (`sessions/n6-2`). The solicit was given its own submission one
+slot behind the honest one. The node guaranteed it, included it, and the
+bootstrap service accumulated exactly once -- for the honest package, at
+slot 9907730. The announcement that followed was correctly ignored, because
+no service had asked for anything. Moving the solicit onto the honest
+package made the same run pass (`sessions/n6-3`).
+
+**What it costs today.** N6's `Solicit` rides the honest package rather than
+a submission of its own, which is not where it belongs: the honest package
+is what N3 and N4 grade, and it now has a second job. The comment on
+`work_item_that_exports_and_solicits` says why it has to, so the next reader
+does not "tidy" it apart and spend a run finding out.
+
+**What it would cost a lane that needs two.** Any future row that needs two
+independent on-chain effects -- a solicit and a forget, a transfer and a
+lookup -- cannot have them, because the second package's accumulate will
+never run. That is the shape to watch for, and it is a property of the
+harness's availability plan rather than of the protocol.
+
+**What would fix it.** The availability plan would have to cover every
+report the node distributes rather than the first, which means assuring more
+than one core's worth per run. `findings.md` §12 records why the plan cannot
+be written before the run; this is the other half of the same constraint and
+is worth solving together with it.
+
+**Why this is not a node finding.** Nothing polkajam did here was wrong. A
+report that is not available must not be accumulated, and the node declining
+to act on a preimage no service had requested is the rule working.
+
+---
+
+## 32. The node implements the superseded CE 144/145 wire format
+
+**Status:** open, but **not** the node finding it first looked like.
+Found 2026-11-20 while starting N5, and corrected the same day: the fix is
+already written upstream, on a branch that has not reached `main`. What is
+left is an integration-timing finding, which is a different thing to report
+and a different thing to ask. See "Who has already fixed it" below, which
+was written after the rest of this section and overrides its framing.
+
+`jam-np` rewrote CE 144 and CE 145 at **aa0e2b8 (2026-10-26)**, which §28
+records and which this repository is now pinned to. polkajam at
+`d92cadd30` (HEAD 2026-11-18) still sends the shape that revision replaced.
+
+**Measured, from the node's own traffic** (`sessions/n6-5`, five CE 144
+streams and five CE 145 streams opened by the NUT):
+
+```
+CE 144, 132 bytes:
+  74e5b68d…6dad  header hash (32)
+  00             tranche
+  01             compact length, one entry
+  0100           core index 1
+  8a897398…b214  work-report hash (32)
+  44342640…5e0e  Ed25519 signature (64)
+```
+
+That is `Header Hash ++ Tranche ++ len++[Core ++ WRHash] ++ Ed25519`, the
+pre-aa0e2b8 shape, to the byte. The current spec asks for
+`Header Hash ++ Validator Index ++ Intent ++ Bandersnatch Signature`
+(`simple.md:778`), where the tranche is *not* sent — recipients derive it
+from the signature's VRF output (`:769-771`) — and the signature is 96
+bytes rather than 64.
+
+Confirmed in source rather than inferred from the bytes:
+`auditing/mod.rs:202-213` is
+
+```rust
+pub struct AnnouncementMessage {
+    pub initiator: HeaderHash,
+    pub tranche_index: TrancheIndex,
+    pub announcement: AnnouncementData,   // cores + ed25519::Signature
+}
+```
+
+**CE 145 is the same story**, and subtler — subtler than this section
+first claimed. Its 103 bytes are
+`Epoch(4) ++ ValIdx(2) ++ 01 ++ WRHash(32) ++ Ed25519(64)`, and since
+`[Judgment]` carries no length prefix (`:148-152`) and `Validity = 1` is
+one byte in both revisions, **a single positive judgment is byte-identical
+between them**. The node's CE 145 message above is already exactly what
+`aa0e2b8` asks for. The divergence is entirely in batching and in the
+negative form, where `aa0e2b8` inlines `Validity = 0 ++ Guarantee` and
+`a96dc6b` sent the guarantee as a separate second message. A harness that
+only ever saw single positive judgments could not tell the two apart at
+all.
+
+**The dates.** `auditing/mod.rs` was last changed by #1319 on 2026-10-09,
+seventeen days before the spec revision. Nothing has touched it since, and
+HEAD is three weeks past the change.
+
+**What it costs N5.** A lane built against the current spec — which is what
+§28 re-specified and what conformance means — fails polkajam on every
+CE 144/145 row, for one reason, every run. That is true but not useful
+feedback, and a lane whose every row fails for a known cause stops being
+read. The plan was that N5 would grade the *behaviour* an auditor owes
+(does it announce when newly required, does it publish a judgment for what
+it announced, does it announce the same report twice) from whichever shape
+arrives, and name the wire divergence in one row of its own.
+
+**N5 is parked instead — decided 2026-11-23.** Reading both shapes means
+re-adding the decoder §28 deleted, to grade a wire format expected to stop
+existing within weeks, producing rows about a node nobody will run again.
+The project gets nothing from grading something that is about to change.
+So N5 waits for `feat/tranche-redesign` to reach `main`, and the harness
+spends the interval on a lane the redesign cannot invalidate.
+
+Two things to carry forward when it is picked up, because both are easy to
+forget by then:
+
+- **The redesign makes N5 harder, not easier.** The old format declares
+  the tranche and the cores; `aa0e2b8` declares neither, deriving both from
+  the Bandersnatch VRF output. The harness has `ring_vrf` for tickets but
+  no audit VRF and no core selection, and `ce141_145.rs:139` holds the
+  signature as an opaque `[u8; 96]` it never verifies. Grading a
+  conformant announcement means implementing the GP's core selection and
+  tranche derivation — **from the GP, not from `block_tracker.rs`**, or
+  the lane checks only that polkajam agrees with polkajam, which is §18's
+  rule and the reason this note exists.
+- **The two formats are separable by length**, if a tolerant reader is
+  ever wanted after all. Old CE 144 messages are `98 + 34n` bytes; new ones
+  are sums of 131 and 133. Enumerated to twelve batched announcements, the
+  sets first meet at 1050 bytes (eight announcements against a 28-core old
+  one) and nothing sends either. An earlier draft of the polkajam document
+  claimed a size check could not separate them; that was asserted, not
+  computed, and it was wrong.
+
+**What it is not.** Not a reading the spec leaves open, unlike §4. The
+revision is unambiguous and current, and the harness is pinned to it.
+
+### Who has already fixed it
+
+Checked 2026-11-20, before writing any patch, by looking for prior art on
+the remote rather than assuming there was none. There is:
+`origin/feat/tranche-redesign` implements `aa0e2b8` in full, and was last
+pushed to on **2026-11-20**, the same day as this finding.
+
+- `crates/node/src/auditing/np.rs` on that branch is a new file holding
+  exactly the current shapes: `AnnouncementMessage { initiator,
+  validator_index, intent, signature: vrf::Signature }` with
+  `AnnouncementIntent::{Initial, Later(CoreIndex)}`, and
+  `JudgementMessage` with `Validity::{Invalid(Slot, GuaranteeSignatures),
+  Valid}`. The Bandersnatch signature is 96 bytes
+  (`PREOUT_SERIALIZED_SIZE + PROOF_SERIALIZED_SIZE`).
+- `communication.rs` sends and reads both as vectors —
+  `write_encoded_seq` / `read_decoded_bounded_seq` — one message per
+  stream, so `--> [Announcement]` and `--> [Judgment]` are right too.
+- The tranche is derived rather than declared:
+  `block_tracker.rs:1092` calls
+  `later_tranche_from_entropy(announcement.signature.vrf_output(), …)`,
+  and `:1070` calls `select_cores_to_audit(announcement.signature
+  .vrf_output())` for the initial case. That was the part this finding
+  flagged as the hard one, and it is done.
+- It arrived as two reviewed PRs inside the branch: **#1359** "Auditing:
+  align with CE 144/145 updates from NP" and **#1370** "Small refactorings
+  after the NP's CE-144/145 re-implementation".
+
+**Why it has not landed.** `feat/tranche-redesign` is 46 ahead of `main`
+and 22 behind it (`git rev-list --left-right --count
+origin/main...origin/feat/tranche-redesign`, re-measured 2026-11-22; an
+earlier draft of this section had the two figures the wrong way round).
+The branch is still being developed rather than landed — its newest commit
+is #1411, 2026-11-21 — and the wire format is not separable from the rest.
+The
+current CE 144 cannot be cherry-picked onto `main`, because an
+initial-tranche announcement declares no cores and a later-tranche
+announcement declares no tranche, so a receiver needs
+`select_cores_to_audit` and `later_tranche_from_entropy` to read either
+one — and neither exists on `main` (`git grep` on `origin/main` under
+`crates/node/src/auditing/` returns nothing for them or for
+`ApprovalEntry`). The format rides on the tranche redesign; it is one
+change, not two.
+
+**So the finding is not "polkajam is behind".** It is that `main` — the
+branch everything builds from, the one this harness pins, and the one a
+conformance run will reach for — ships a wire format `jam-np` replaced on
+2026-10-26, while the replacement sits on a long-running branch. That is a
+release question, and it belongs to whoever owns the redesign's landing
+plan.
+
+### The branch against `simple.md`, line by line
+
+Tracked 2026-11-22 against `origin/feat/tranche-redesign` at `ed60548c3`
+and `simple.md` at `aa0e2b8`. Read, not run: every row below is a source
+reading, and the byte counts are arithmetic over the spec's common types
+(`:163-171`: `Validator Index = Core Index = u16`, `Slot = Epoch Index =
+u32`, `Hash = [u8; 32]`, `Ed25519 Signature = [u8; 64]`).
+
+| `simple.md` | Branch | Verdict |
+| --- | --- | --- |
+| `Announcement = Header Hash ++ Validator Index ++ Intent ++ Bandersnatch Signature` (`:778`) | `AnnouncementMessage { initiator, validator_index, intent, signature }`, `np.rs:52-64` | matches, field for field and in order |
+| `Intent = 0 (Initial) OR 1 ++ Core Index` (`:777`) | `AnnouncementIntent::{Initial, Later(CoreIndex)}` at `#[codec(index = 0/1)]`, `np.rs:35-43` | matches |
+| `Bandersnatch Signature = [u8; 96]` (`:776`) | `vrf::Signature`, `PREOUT_SERIALIZED_SIZE + PROOF_SERIALIZED_SIZE` | matches |
+| `--> [Announcement]` — bare sequence (`:782`, notation `:148-152`) | `write_encoded_seq` / `read_decoded_bounded_seq`, `communication.rs:184`, `:224` | matches — no length prefix |
+| `Judgment = Epoch Index ++ Validator Index ++ Validity ++ Work-Report Hash ++ Ed25519 Signature` (`:818`) | `JudgementMessage { signer: ValKey, validity, report_hash, signature }`, `np.rs:80-86`; `ValKey = (EpochIndex, ValIndex)` | matches — the pair encodes as the spec's first two fields |
+| `Validity = 0 ++ Guarantee OR 1` (`:817`) | `Validity::{Invalid(Slot, GuaranteeSignatures), Valid}` at codec index 0/1 | matches |
+| `Guarantee = Slot ++ len++[GuaranteeSignature]` (`:816`) | `Invalid(Slot, BoundedVec<ValSignature, ConstU32<3>>)` | matches — `len++` is the `BoundedVec` prefix |
+| `GuaranteeSignature = Validator Index ++ Ed25519 Signature` (`:815`) | `ValSignature { val_index, signature }`, `extrinsic.rs:313-317` | matches |
+| "at most 3 elements", "2 or 3 elements only" (`:812`, `:816`) | bound is `VALS_PER_CORE = 3`; `TryFrom` rejects `< GUARANTEE_MIN_SIGNATURES = 2`, `np.rs:95-97` | matches, both ends |
+| "recipients derive [the cores] from the signature" (`:762`) | `select_cores_to_audit(announcement.signature.vrf_output())`, `block_tracker.rs:1070` | matches |
+| "derive the tranche from its VRF output" (`:770`) | `later_tranche_from_entropy(announcement.signature.vrf_output(), max_tranche)`, `:1092` | matches |
+| "recipients should verify the signature" (`:769`) | `vrf_verify` against `AuditInitial`/`AuditSubsequent` before either derivation, `:1064`, `:1085` | matches — verify precedes derive |
+| "never announce … in more than one tranche" (`:757`) | `ApprovalEntry::announced`, set on queueing in `mark_reports_announced`, gating `assigned_report_if_due`, `:1303-1319` | matches |
+| "reports audited as a result of … a negative judgment are not announced" (`:754`) | the negative path builds a judgement directly (`own_judgement_for_disputed_report`, `controller.rs:1519`) with no announce step | matches |
+| "obtain the work-report using CE 136" on a negative judgment (`:799`) | `request_audit_check_if_required` → CE 136 fetch, `controller.rs:780-800` | matches |
+| "broadcast to the validator set(s) succeeding the relevant auditor set(s)" (`:794`) | `select_unique_broadcast_recipients` sends to epoch *and* epoch+1, `controller.rs:2412-2446` | superset — sends to the auditor set too |
+| "forwarded to all other known auditors that are neighbours in the grid" (`:801`) | broadcast to the whole set, not the grid neighbourhood | superset — more recipients than asked, not fewer |
+| "For positive judgments, this broadcasting may optionally be deferred" (`:796`) | not deferred; positives go out immediately | conformant — the option is not taken |
+| "Multiple announcements may be sent in a single message" (`:773`); "Judgments … may be batched together" (`:814-815`) | **was** `ConstU32<1>` on both receive caps | **the one gap** — see below |
+
+**The one conformance gap in the new code**, offered rather than claimed,
+since it was a deliberate and documented choice: `np.rs` capped both
+messages at one entry (`MaxAnnouncementsPerMessage = ConstU32<1>`,
+`MaxJudgementsPerMessage = ConstU32<1>`), commented "The NP does not yet
+specify a maximum… The current implementation relies on broadcast, so only
+1 message." Sending one is fine; refusing to *receive* more than one is the
+part that does not follow, and it does not fail gracefully —
+`read_decoded_bounded_seq` reads at most `cap × max_encoded_len` bytes, so
+a two-item message overruns the read before the item count is ever
+checked, and a failed read on these streams routes through
+`peer_misbehaved`, which closes the connection. The asymmetry is the sharp
+edge: an implementation that batches is dropped by one that does not, while
+the reverse works, so the incompatibility is invisible from the batching
+side.
+
+Raised as a PR against the branch (`jv-ce144-145-recv-caps`, pushed
+2026-11-22), lifting both to `MaxValCount` — one per validator, which
+covers everything one auditor can say about a block, since `MaxValCount` is
+three times the core count. A full batch is 136 KB on CE 144 and 313 KB on
+CE 145, pinned by a test. The send side is unchanged.
+
+**A residual difference the PR does not close**, and cannot: the NP
+specifies *no* maximum for either message, so any finite cap is local
+policy rather than spec. `MaxValCount` is a generous bound, not a derived
+one — a single auditor batching judgments across more than three blocks'
+worth of cores would still be refused. The honest fix is for the NP to
+state a bound; until it does, every implementation picks its own and they
+will not agree. That is the open question the PR ends on.
+
+**What this cost, and the rule it earns.** A patch was nearly written
+against `main` before the remote was checked. It would have duplicated
+#1359 and #1370, conflicted with 22 commits of redesign, and had to
+reinvent the tranche derivation to work at all. The rule: *before writing
+a fix for someone else's repository, look for the branch where they have
+already written it.* `git branch -r` filtered on the subject would have
+answered this in one command, and did.
+
+---
+
+## 33. The harness put a length prefix on every CE 144 and CE 145 message
+
+**Status:** CLOSED 2026-11-20, same day. A harness defect, introduced by
+§28's re-spec and found before N5 shipped — but only by accident, which is
+the part worth recording.
+
+**What was wrong.** `proto.rs` held CE 144 as `Vec<Announcement>` and CE 145
+as `Vec<Judgment>`, encoded with `m.encode()` and decoded with
+`decode_full::<Vec<_>>`. `Vec`'s derived codec writes a compact length in
+front of the items. The spec does not:
+
+> `len++` preceding a sequence indicates that the sequence should be
+> explicitly prefixed by its length. If a sequence is not preceded by
+> `len++`, the length is either fixed or implied by context. In the case of
+> a message consisting of a single sequence, the length of the sequence is
+> implied by the message size in bytes. (`simple.md:148-152`)
+
+CE 144 is written `--> [Announcement]` (`:782`) and CE 145 `--> [Judgment]`
+(`:825`), neither with `len++`. So every message the harness would have
+sent carried one byte no conforming node expects, and every message it read
+would have taken the first announcement's header hash to start one byte
+late. N5's whole CE 144/145 half would have graded wrongly, in the
+direction that fails a correct node.
+
+**Why the tests did not catch it.** The protocol round-trip test encodes and
+decodes with the same codec, so a spurious prefix survives the trip
+perfectly and the test passes. This is §18's rule in its purest form: *a
+test that supplies both sides of an equation cannot discover the equation
+is wrong.* The fix adds `ce144_and_ce145_messages_are_bare_sequences`, which
+counts bytes against the field widths the spec lists — 131 for an initial
+announcement, 133 for a later one, 103 for a positive judgment — rather than
+against what the harness itself produces. Reverting the codec makes it fail
+with `left: 265, right: 264`, the one byte.
+
+**How it was actually found**, which is the uncomfortable part. Not by
+reading the spec, and not by any check in this repository. It surfaced while
+reading polkajam's `feat/tranche-redesign` for §32: their
+`read_decoded_bounded_seq` decodes items until the input is empty rather
+than reading a count, and the question "why would they not use the length?"
+led to `:148-152`. The spec had said so plainly the whole time, in the
+notation section, which §28 never re-read when it re-pinned.
+
+**What it corrects elsewhere.** §28 described both protocols as sending "a
+length-prefixed vector" and §32 repeated it; both are fixed in place. §32's
+CE 145 conclusion gets *stronger*: with no prefix, a single positive
+judgment is byte-identical between a96dc6b and aa0e2b8, so polkajam `main`'s
+CE 145 message is already exactly conformant, and the divergence is confined
+to batching and the negative form.
+
+**The rule.** §28's own policy was "diff, do not re-read, when moving to a
+newer one", and it was right about the protocol sections. But a diff shows
+what changed, not what you misread in what did not change — the notation
+section was identical across the re-pin and wrong in the harness's head both
+times. *When a re-spec introduces a new message shape, read the notation
+that governs it, not only the lines that moved.*
 
 ---
 
