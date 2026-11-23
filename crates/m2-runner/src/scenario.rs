@@ -885,6 +885,7 @@ mod tests {
                 },
             ],
             alive_after: Some(true),
+            restart: None,
         });
         let log = fabricated_obs_log(3);
         let eval = evaluate(&log, &run_ctx, ALL_LANES);

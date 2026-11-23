@@ -354,6 +354,13 @@ pub enum SimFault {
     /// learns the request is over. This one never answers and never ends,
     /// which is the outcome N7 grades as a hang.
     HangsOnUnknownKind,
+    /// Never reclaim a stream that was opened and then went silent.
+    ///
+    /// The slow-loris defect. By default this stand-in gives up on a stream
+    /// whose first message never arrives, which is what a node with a
+    /// protocol timeout does; with this fault it waits for one forever, so
+    /// a peer can hold streams open for nothing.
+    HoldsIdleStreams,
 }
 
 /// Application error code the node resets a refused ticket stream with.
@@ -362,6 +369,14 @@ const TICKET_REFUSED_CODE: u32 = 1;
 /// Application error code for an availability request naming a root this
 /// node does not hold.
 const NO_DATA_CODE: u32 = 2;
+
+/// How long this stand-in waits for a stream's first message before
+/// reclaiming it.
+///
+/// Generous: every lane's emulator sends its opening frame immediately, so
+/// nothing legitimate comes near this, and a bound short enough to be
+/// convenient would start failing lanes for scheduling noise.
+const IDLE_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Byte to flip to break a proof without moving the ticket.
 ///
@@ -1063,7 +1078,24 @@ impl SimNode {
         peer: Option<u16>,
     ) {
         let mut reader = StreamReader::new(recv);
-        let Some((kind, content)) = reader.next().await else {
+        // A stream whose first message never arrives. A real node has a
+        // protocol timeout for this; without one, a peer that opens streams
+        // and goes silent costs the node a stream apiece for as long as it
+        // likes (N7's slow-loris row). The bound is only on the *first*
+        // message, so nothing mid-protocol is cut short, and every lane
+        // here sends its first frame immediately.
+        let first = tokio::time::timeout(IDLE_STREAM_TIMEOUT, reader.next()).await;
+        let first = match first {
+            Ok(first) => first,
+            Err(_) => {
+                if self.fault == SimFault::HoldsIdleStreams {
+                    std::future::pending::<()>().await;
+                }
+                send.reset(NO_DATA_CODE);
+                return;
+            }
+        };
+        let Some((kind, content)) = first else {
             // No complete message arrived. A stream opened with a kind this
             // node does not serve is the N7 provocation and never carries
             // one: there is no message to send on a protocol nobody

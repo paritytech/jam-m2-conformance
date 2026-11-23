@@ -149,6 +149,22 @@ impl LaneSet {
     pub fn needs_provocation(&self) -> bool {
         self.n7
     }
+
+    /// Whether the run kills and restarts the node under test.
+    ///
+    /// N7 only, **and only when N7 is the lane being graded**. Killing the
+    /// node mid-window destroys every other lane's subject: N1 loses the
+    /// blocks it was grading, N2's tickets go unanswered, N3's submission
+    /// has nobody to submit to. A combined run would report those as node
+    /// defects when they are the harness having shot the node.
+    ///
+    /// The malformed-stream provocations are safe to mix -- they go out on
+    /// connections of their own, which `sessions/n0-control` against
+    /// `sessions/n7-3-combined` confirms. This one is not, and no
+    /// connection-level care can make it so.
+    pub fn restarts_the_node(&self) -> bool {
+        self.n7 && !(self.n0 || self.n1 || self.n2 || self.n3 || self.n4 || self.n6)
+    }
 }
 
 /// NUT launch preset (§7).

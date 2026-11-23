@@ -2293,3 +2293,74 @@ graceful about *how*.
 defects were in code with passing tests, and both were obvious in the first
 line of output from a live run. A fixture that differs from production in
 one field is a fixture that cannot see bugs in that field.
+
+---
+
+## 36. The node has a protocol timeout and survives a restart
+
+**Status:** open only as a record; both results are the node behaving
+correctly. Measured 2026-11-23 against polkajam `main` at `d92cadd30`,
+`sessions/n7-4` through `n7-6`. The second and third N7 rows from DESIGN
+§11's table.
+
+**Slow-loris.** A CE 128 stream opened, named, and then held silent for 30
+seconds with the stream never finished: the node **reset the stream and the
+connection stayed usable**. So polkajam does have a protocol timeout for a
+stream whose first message never arrives, and it reclaims rather than
+accumulating held streams. This is the second row polkajam passes outright,
+and it is the same graceful path §35 found for an unassigned kind inside
+the CE span.
+
+**Kill and restart.** The node was killed mid-run and relaunched on the
+same data directory. It came back on its port, answered an ordinary CE 128
+request on a fresh connection (hard pass), and authored again — slot
+9954365 in `n7-4`, 9954469 in `n7-6`.
+
+So N7 now covers four of nine rows, and polkajam passes two of the five
+provocations outright: an unassigned kind in range, and the slow-loris. The
+three it does not are the three §35 records, all of which close the
+connection.
+
+### Two limits of the restart row, both worth knowing before trusting it
+
+**The harness cannot always say when the node was next due to author.**
+There is no "who authors slot `s`" oracle here: the reference chain authors
+for every validator *but* the node, so the node's turns are the gaps, and
+under Safrole those come from tickets rather than a rotation the harness
+can infer. `next_due_slot` therefore infers a stride from the node's
+earlier blocks and returns `None` unless that stride is regular — which, on
+a ticketed chain, it usually is not.
+
+The first version gated the whole authoring row on that inference and so
+reported itself unexercised against a node that had visibly just authored
+(`sessions/n7-4`). The row now passes on the authoring itself, which needs
+no schedule — a block after the restart is evidence regardless — and uses
+the due-slot control only for the ambiguous case, where the node authored
+nothing and the question is whether it was broken or merely not called on.
+
+**The recovery window is a probability, not a bound.** `n7-5` waited four
+slots and the node never got a turn, so the row reported itself
+unexercised; the window is now eight slots, which made it conclusive in
+`n7-6`. Six validators means a turn roughly every six slots, but "roughly"
+is doing real work there — a run can still legitimately end with nothing to
+grade, and the row says so rather than inventing a verdict.
+
+### What neither row can be tested against
+
+Both are graded by unit tests over `RestartFacts` and by live runs, and by
+nothing in between: `SimNode` runs inside the test process, so there is no
+process to kill and no stand-in that can pose "came back but will not
+serve". The same is true of `n7_node_alive_after`. Three of N7's rows
+therefore have no fault-injection coverage, which is a real gap in §18's
+terms — the rows have been seen passing against a live node and failing
+against fabricated facts, but never failing against a *node* that is wrong.
+
+**Why the restart is gated to N7-only runs.** Killing the node mid-window
+destroys every other lane's subject — N1 loses the blocks it grades, N2's
+tickets go unanswered, N3 has nobody to submit to — and a combined run
+would report all of that as node defects. `LaneSet::restarts_the_node()`
+requires N7 and nothing else. The malformed-stream provocations need no
+such gate, because they go out on connections of their own; that is
+measured, not assumed (`sessions/n0-control` against
+`sessions/n7-3-combined`: 24 hard passes, 3 soft, and the same single known
+failure either way).

@@ -35,8 +35,22 @@ use m2_sim::{SimFault, SimNode};
 const NUT_INDEX: usize = 2;
 const PEER: u16 = 1;
 
-/// Open an unknown-kind stream against a simulated node and grade it.
+/// Which provocation a test sends.
+#[derive(Clone, Copy)]
+enum Provoke {
+    UnknownKind,
+    SlowLoris,
+}
+
+/// Provoke a simulated node and grade what came back.
 async fn provoke(fault: SimFault) -> (n7::Provocation, Vec<(&'static str, Outcome)>) {
+    provoke_with(fault, Provoke::UnknownKind).await
+}
+
+async fn provoke_with(
+    fault: SimFault,
+    which: Provoke,
+) -> (n7::Provocation, Vec<(&'static str, Outcome)>) {
     let transport = Arc::new(MockNetwork::new()) as Arc<dyn Transport>;
     let oracle = m2_reference::oracle::Oracle::for_tests();
     let node_chain = Arc::new(RefChain::tiny_for(&oracle, NUT_INDEX).expect("the node's chain"));
@@ -66,13 +80,28 @@ async fn provoke(fault: SimFault) -> (n7::Provocation, Vec<(&'static str, Outcom
         .expect("the peer connects");
 
     let trace = Mutex::new(Trace::default());
-    let provocation =
-        robustness::unknown_kind(&connection, PEER, UNASSIGNED_IN_RANGE, &trace).await;
+    let provocation = match which {
+        Provoke::UnknownKind => {
+            robustness::unknown_kind(&connection, PEER, UNASSIGNED_IN_RANGE, &trace).await
+        }
+        Provoke::SlowLoris => {
+            robustness::slow_loris(
+                &connection,
+                PEER,
+                jamnp_s::framing::CE128,
+                std::time::Duration::from_secs(30),
+                &trace,
+            )
+            .await
+        }
+    };
 
     let ctx = N7Ctx {
         provocations: vec![provocation.clone()],
         // Not measured here; the module note says why.
         alive_after: Some(true),
+        // No process to kill: SimNode runs in this test's own process.
+        restart: None,
     };
     let obs = m2_scenario::dsl::ObsLog::new();
     let rows = n7::all(&ctx)
@@ -191,4 +220,56 @@ async fn an_unmeasured_connection_is_not_reported_as_broken() {
     let unmeasured = outcomes_of(&rows, "n7_connection_reuse_not_attempted");
     assert_eq!(unmeasured.len(), 1, "it must say so instead");
     assert!(unmeasured[0] != &Outcome::Pass);
+}
+
+/// A node that reclaims an idle stream passes; one that holds it forever
+/// does not.
+///
+/// The fault here is the absence of a timeout, which is invisible in every
+/// other way: nothing is malformed, no connection dies, and the node is
+/// still serving everyone else. Only the held stream shows it, and only if
+/// the harness waits long enough to be sure the node was not merely slow.
+#[tokio::test(start_paused = true)]
+async fn the_slow_loris_row_catches_a_node_that_never_reclaims_a_stream() {
+    // The control: a stand-in with a protocol timeout gives the stream up.
+    let (reclaimed, rows) = provoke_with(SimFault::None, Provoke::SlowLoris).await;
+    assert!(
+        matches!(reclaimed.outcome, StreamOutcome::Reset),
+        "a node with an idle timeout reclaims the stream; it {}",
+        reclaimed.outcome.describe()
+    );
+    assert_eq!(
+        outcomes_of(&rows, "n7_malformed_stream_contained"),
+        [&Outcome::Pass]
+    );
+
+    // The fault: it waits for a message that will never come, for as long
+    // as we are willing to hold the connection open.
+    let (held, rows) = provoke_with(SimFault::HoldsIdleStreams, Provoke::SlowLoris).await;
+    assert!(
+        matches!(held.outcome, StreamOutcome::TimedOut { .. }),
+        "a node without one holds it; it {}",
+        held.outcome.describe()
+    );
+    assert_eq!(
+        outcomes_of(&rows, "n7_malformed_stream_contained"),
+        [&Outcome::Fail(Severity::Soft)],
+        "and that must fail the row rather than pass quietly"
+    );
+    // The row has to say what was held and for how long, or a reader cannot
+    // tell this from any other containment failure.
+    let obs = m2_scenario::dsl::ObsLog::new();
+    let ctx = N7Ctx {
+        provocations: vec![held.clone()],
+        alive_after: Some(true),
+        restart: None,
+    };
+    let detail = (n7::malformed_stream_contained(&ctx).run)(&obs)[0]
+        .detail
+        .clone()
+        .expect("a failure carries detail");
+    assert!(
+        detail.contains("held silent for 30 s"),
+        "the row must name the fault; it said: {detail}"
+    );
 }

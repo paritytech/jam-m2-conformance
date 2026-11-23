@@ -73,6 +73,34 @@ async fn provoke(
     finish: bool,
     trace: &Mutex<Trace>,
 ) -> StreamOutcome {
+    provoke_waiting(
+        connection,
+        peer,
+        kind,
+        bytes,
+        finish,
+        VERDICT_TIMEOUT,
+        trace,
+    )
+    .await
+}
+
+/// As [`provoke`], with the wait for the node's verdict given explicitly.
+///
+/// Slow-loris needs a wait longer than every other fault here, because the
+/// fault *is* the wait: the question is whether the node reclaims a stream
+/// nobody is feeding, and asking for five seconds would report every node
+/// with a sane-but-slower timeout as holding it forever.
+#[allow(clippy::too_many_arguments)]
+async fn provoke_waiting(
+    connection: &Conn,
+    peer: u16,
+    kind: u8,
+    bytes: &[u8],
+    finish: bool,
+    wait: Duration,
+    trace: &Mutex<Trace>,
+) -> StreamOutcome {
     let opened = connection.open_bi().await;
     let (mut send, mut recv) = match opened {
         Ok(halves) => halves,
@@ -99,7 +127,7 @@ async fn provoke(
     let started = clock::current().mono_ms();
     let mut buf = [0u8; 8192];
     let mut answered = 0usize;
-    let verdict = tokio::time::timeout(VERDICT_TIMEOUT, async {
+    let verdict = tokio::time::timeout(wait, async {
         loop {
             match recv.read(&mut buf).await {
                 Ok(Some(n)) => {
@@ -149,7 +177,7 @@ async fn provoke(
                     StreamOutcome::ConnectionClosed { code, reason }
                 }
                 _ => StreamOutcome::TimedOut {
-                    after_ms: VERDICT_TIMEOUT.as_millis() as u64,
+                    after_ms: wait.as_millis() as u64,
                 },
             }
         }
@@ -246,6 +274,47 @@ pub async fn trailing_bytes(
     Provocation {
         peer,
         fault: Fault::TrailingBytes { kind, extra },
+        outcome,
+        connection_reusable: None,
+        at_wall_ms,
+    }
+}
+
+/// Open a stream, name a real protocol, and then say nothing at all.
+///
+/// The kind byte puts the protocol in force (`simple.md:122-124`), so the
+/// node is left waiting for a message that never arrives, on a stream that
+/// is never finished. A node that waits forever holds the stream — and
+/// whatever it allocated for it — for as long as the peer keeps the
+/// connection open, and one peer can open many.
+///
+/// **A real kind, deliberately.** Using an unassigned one would let the
+/// node reject on the kind byte alone and never reach the waiting, which is
+/// the thing being measured.
+///
+/// The verdict is whatever the node does within `silence`: a reset or a
+/// finish means it reclaimed the stream, and nothing at all means it did
+/// not. DESIGN §11 N7 marks this soft, and so does the row — the NP sets no
+/// timeout for an idle stream, so "it waited longer than we did" is a
+/// report, not a violation.
+pub async fn slow_loris(
+    connection: &Conn,
+    peer: u16,
+    kind: u8,
+    silence: Duration,
+    trace: &Mutex<Trace>,
+) -> Provocation {
+    let at_wall_ms = wall_ms();
+    // The kind byte and nothing else, and the stream is never finished:
+    // finishing it would tell the node no message is coming, which is the
+    // opposite of what a slow-loris does.
+    let outcome = provoke_waiting(connection, peer, kind, &[kind], false, silence, trace).await;
+    Provocation {
+        peer,
+        fault: Fault::SlowLoris {
+            kind,
+            silence_ms: silence.as_millis() as u64,
+        },
         outcome,
         connection_reusable: None,
         at_wall_ms,

@@ -38,6 +38,27 @@ use crate::dsl::{check, log, Check, Control, Severity};
 /// validator that exists — the confusion `findings.md` §8 records.
 pub const PROVOKER_PEER: u16 = 0x4E;
 
+/// What a kill-and-restart of the node under test produced.
+///
+/// DESIGN §11 N7: "Kill and restart NUT mid-epoch | re-syncs via CE 128/129;
+/// authors again in its next slot."
+#[derive(Debug, Clone)]
+pub struct RestartFacts {
+    pub killed_at_wall_ms: u64,
+    pub restarted_at_wall_ms: u64,
+    /// Whether the node answered an ordinary CE 128 request after coming
+    /// back. `None` where the run never got to ask.
+    pub served_again: Option<bool>,
+    /// Slots the node authored a block in *after* the restart.
+    pub authored_after: Vec<u32>,
+    /// The first slot it was the scheduled author for after the restart, if
+    /// the run could work one out.
+    ///
+    /// Without this the authoring row has no subject: "it authored again"
+    /// is only meaningful against a slot it owed a block in.
+    pub first_due_slot: Option<u32>,
+}
+
 /// What the harness sent to provoke the node, and what came back.
 #[derive(Debug, Clone)]
 pub struct Provocation {
@@ -70,6 +91,15 @@ pub enum Fault {
     /// A valid kind and a complete, well-formed message, followed by bytes
     /// that are not a message.
     TrailingBytes { kind: u8, extra: usize },
+    /// A valid kind byte and then nothing: the stream is held open, never
+    /// finished, and no message is ever sent.
+    ///
+    /// The protocol is in force from the kind byte on (`simple.md:122-124`),
+    /// so the node is waiting for a message that will not come. A node that
+    /// waits forever keeps a stream — and whatever it allocated for it — for
+    /// as long as the peer cares to hold the connection, which is the point
+    /// of the fault.
+    SlowLoris { kind: u8, silence_ms: u64 },
 }
 
 impl Fault {
@@ -87,6 +117,10 @@ impl Fault {
             Fault::TrailingBytes { kind, extra } => {
                 format!("a well-formed CE {kind} message followed by {extra} junk bytes")
             }
+            Fault::SlowLoris { kind, silence_ms } => format!(
+                "a CE {kind} stream opened and then held silent for {} s",
+                silence_ms / 1000
+            ),
         }
     }
 }
@@ -146,6 +180,9 @@ pub struct N7Ctx {
     /// `None` where the run never tried, which reports as unexercised rather
     /// than as a dead node.
     pub alive_after: Option<bool>,
+    /// The kill-and-restart, where the run did one. `None` otherwise, and
+    /// the rows report themselves unexercised rather than passing.
+    pub restart: Option<RestartFacts>,
 }
 
 /// The control every row here depends on: a provocation actually went out.
@@ -293,6 +330,109 @@ pub fn node_alive_after(ctx: &N7Ctx) -> Check {
     })
 }
 
+/// Did the node come back and serve again after being killed?
+///
+/// **Hard**, and for the same reason `node_alive_after` is: no spec text is
+/// needed to say that a node which cannot be restarted is broken. A node
+/// restarted onto the same data directory that then cannot answer a block
+/// request has lost something it should have persisted.
+///
+/// Measured by an ordinary CE 128 request, so a node that is up but not
+/// serving counts as not recovered — which is the case worth catching.
+pub fn restart_resyncs(ctx: &N7Ctx) -> Check {
+    let restart = ctx.restart.clone();
+    check("n7_restart", Severity::Hard, move |_obs| {
+        let Some(restart) = &restart else {
+            return vec![log::check_detail(
+                "n7_restart_not_exercised",
+                false,
+                Severity::Soft,
+                || {
+                    "the run did not kill and restart the node, so nothing is known about \
+                     whether it recovers"
+                        .to_string()
+                },
+            )];
+        };
+        match restart.served_again {
+            Some(true) => vec![log::check("n7_restart_serves_again", true, Severity::Hard)],
+            Some(false) => vec![log::check_detail(
+                "n7_restart_serves_again",
+                false,
+                Severity::Hard,
+                || {
+                    format!(
+                        "the node was killed at wall {} ms and restarted at {} ms, and did \
+                         not answer an ordinary CE 128 request afterwards",
+                        restart.killed_at_wall_ms, restart.restarted_at_wall_ms
+                    )
+                },
+            )],
+            None => vec![log::check_detail(
+                "n7_restart_recovery_not_measured",
+                false,
+                Severity::Soft,
+                || "the node was restarted but never asked for anything afterwards".to_string(),
+            )],
+        }
+    })
+}
+
+/// Did it author again once it was back?
+///
+/// **Soft.** DESIGN says "authors again in its next slot", and the next slot
+/// is a strict bar: a node that has just restarted has to catch up before it
+/// can build on the right parent, and missing one slot to do that is a
+/// reasonable node rather than a broken one. So the row reports which slot
+/// it resumed at and fails only where it never resumed at all.
+///
+/// Reported only where the run knew of a slot the node owed a block in.
+/// Without that there is no claim to make: a node that authored nothing
+/// during a window it was never scheduled in has done nothing wrong.
+pub fn restart_authors_again(ctx: &N7Ctx) -> Check {
+    let restart = ctx.restart.clone();
+    check("n7_restart_authoring", Severity::Soft, move |_obs| {
+        let Some(restart) = &restart else {
+            return Vec::new();
+        };
+        // Authoring at all is positive evidence and needs no control: a
+        // node that produced a block after being killed has resumed, and
+        // which slot it was due in does not change that.
+        if let Some(resumed) = restart.authored_after.iter().min().copied() {
+            return vec![log::check_detail(
+                "n7_restart_authors_again",
+                true,
+                Severity::Soft,
+                || format!("resumed at slot {resumed}"),
+            )];
+        }
+        // Silence is the ambiguous case, and the only one needing a
+        // control. A node that authored nothing may be broken or may simply
+        // not have had a turn -- and this harness cannot always tell, since
+        // under Safrole the node's slots come from tickets rather than a
+        // stride it can infer. Where it cannot, the row says so instead of
+        // failing a node for the harness's ignorance (`findings.md` §5).
+        let control = Control::new(
+            "n7_restart_authoring_not_exercised",
+            "a slot the node was known to be scheduled to author in after the restart",
+            restart.first_due_slot.is_some(),
+        );
+        vec![log::negative(
+            "n7_restart_authors_again",
+            &control,
+            false,
+            Severity::Soft,
+            || {
+                format!(
+                    "the node was due to author in slot {} after its restart and authored \
+                     nothing through the end of the window",
+                    restart.first_due_slot.unwrap_or_default()
+                )
+            },
+        )]
+    })
+}
+
 /// Name the connection a provocation went out on.
 ///
 /// `PROVOKER_PEER` is `0x4E`, outside the validator range on purpose — so
@@ -313,6 +453,8 @@ pub fn all(ctx: &N7Ctx) -> Vec<Check> {
         malformed_stream_contained(ctx),
         connection_reusable(ctx),
         node_alive_after(ctx),
+        restart_resyncs(ctx),
+        restart_authors_again(ctx),
     ]
 }
 
@@ -345,6 +487,21 @@ mod tests {
         N7Ctx {
             provocations,
             alive_after,
+            restart: None,
+        }
+    }
+
+    fn restarted(served_again: Option<bool>, authored_after: Vec<u32>, due: Option<u32>) -> N7Ctx {
+        N7Ctx {
+            provocations: vec![provocation(StreamOutcome::Reset, Some(true))],
+            alive_after: Some(true),
+            restart: Some(RestartFacts {
+                killed_at_wall_ms: 10_000,
+                restarted_at_wall_ms: 12_000,
+                served_again,
+                authored_after,
+                first_due_slot: due,
+            }),
         }
     }
 
@@ -448,6 +605,103 @@ mod tests {
         }
     }
 
+    /// A node that comes back and serves passes hard; one that does not,
+    /// fails hard. This is the row that would catch a node whose restart
+    /// loses state it should have persisted.
+    #[test]
+    fn a_node_that_does_not_recover_fails_hard() {
+        assert_eq!(
+            run(restart_resyncs(&restarted(Some(true), vec![9], Some(9)))),
+            [("n7_restart_serves_again", Outcome::Pass)]
+        );
+        assert_eq!(
+            run(restart_resyncs(&restarted(Some(false), vec![], Some(9)))),
+            [("n7_restart_serves_again", Outcome::Fail(Severity::Hard))]
+        );
+    }
+
+    /// A run that never restarted anything must not collect a pass for it.
+    #[test]
+    fn a_run_without_a_restart_reports_it_unexercised() {
+        let no_restart = ctx(
+            vec![provocation(StreamOutcome::Reset, Some(true))],
+            Some(true),
+        );
+        let rows = run(restart_resyncs(&no_restart));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "n7_restart_not_exercised");
+        assert!(rows[0].1 != Outcome::Pass);
+        // And the authoring row says nothing at all rather than passing.
+        assert!(run(restart_authors_again(&no_restart)).is_empty());
+    }
+
+    /// Recovery unmeasured is not recovery confirmed.
+    #[test]
+    fn unmeasured_recovery_does_not_pass() {
+        let rows = run(restart_resyncs(&restarted(None, vec![], Some(9))));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "n7_restart_recovery_not_measured");
+        assert!(rows[0].1 != Outcome::Pass);
+    }
+
+    /// The authoring row needs a slot the node owed a block in. Without one
+    /// a silent node has done nothing wrong, and the row must say the
+    /// control was missing rather than fail the node for the run's timing --
+    /// the mistake §5 cost two pins.
+    #[test]
+    fn authoring_without_a_due_slot_grades_nobody() {
+        let rows = run(restart_authors_again(&restarted(Some(true), vec![], None)));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "n7_restart_authoring_not_exercised");
+        assert!(rows[0].1 != Outcome::Pass);
+    }
+
+    /// With a due slot, authoring nothing fails and authoring something
+    /// passes.
+    #[test]
+    fn authoring_after_a_restart_is_graded_against_a_due_slot() {
+        assert_eq!(
+            run(restart_authors_again(&restarted(
+                Some(true),
+                vec![],
+                Some(9)
+            ))),
+            [("n7_restart_authors_again", Outcome::Fail(Severity::Soft))]
+        );
+        assert_eq!(
+            run(restart_authors_again(&restarted(
+                Some(true),
+                vec![11],
+                Some(9)
+            ))),
+            [("n7_restart_authors_again", Outcome::Pass)],
+            "resuming a slot or two late is still resuming"
+        );
+    }
+
+    /// A node that authored after the restart passes even where the harness
+    /// could not work out which slot it was due in.
+    ///
+    /// This is the case the first version got wrong, and the first real run
+    /// caught it: under Safrole the node's slots come from tickets, so the
+    /// stride inferred from its earlier blocks is usually irregular and
+    /// `first_due_slot` is `None`. Gating the whole row on that control made
+    /// it report itself unexercised against a node that had visibly resumed
+    /// -- `sessions/n7-4`, where the node authored slot 9954365 and the row
+    /// said it had not been exercised.
+    #[test]
+    fn authoring_passes_without_a_due_slot_when_it_actually_authored() {
+        assert_eq!(
+            run(restart_authors_again(&restarted(
+                Some(true),
+                vec![9_954_365],
+                None
+            ))),
+            [("n7_restart_authors_again", Outcome::Pass)],
+            "a block after the restart is evidence regardless of the schedule"
+        );
+    }
+
     /// A node that answers a malformed request has not contained it in the
     /// sense that matters, but it has not taken the connection down either.
     /// The row passes and the oddity is visible in the trace rather than
@@ -514,13 +768,17 @@ mod tests {
     fn a_run_that_provoked_nothing_reports_itself_unexercised() {
         let nothing = ctx(Vec::new(), Some(true));
         for check in all(&nothing) {
-            let rows = run(check);
-            assert_eq!(rows.len(), 1);
-            assert_eq!(
-                rows[0].0, "n7_not_exercised",
-                "an unprovoked run must say so, not pass"
-            );
-            assert!(rows[0].1 != Outcome::Pass, "and must not pass");
+            for row in run(check) {
+                // Each check names its own absence -- the provocation rows
+                // report `n7_not_exercised`, the restart rows their own --
+                // and none of them may pass.
+                assert!(
+                    row.0.contains("not_exercised") || row.0.contains("not_measured"),
+                    "an unprovoked run must report absence, not {}",
+                    row.0
+                );
+                assert!(row.1 != Outcome::Pass, "{} must not pass", row.0);
+            }
         }
     }
 

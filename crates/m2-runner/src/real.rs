@@ -75,6 +75,7 @@ pub(crate) struct RealRunData {
     pub(crate) nut_announced_preimages: m2_scenario::scenarios::n6::HeardAnnouncements,
     pub(crate) provocations: Arc<Mutex<Vec<m2_scenario::scenarios::n7::Provocation>>>,
     pub(crate) nut_alive_after: Arc<Mutex<Option<bool>>>,
+    pub(crate) restart: Arc<Mutex<Option<m2_scenario::scenarios::n7::RestartFacts>>>,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
@@ -1004,6 +1005,7 @@ fn build_n7_ctx(data: &RealRunData) -> Option<m2_scenario::scenarios::n7::N7Ctx>
     Some(m2_scenario::scenarios::n7::N7Ctx {
         provocations,
         alive_after: *data.nut_alive_after.lock().expect("the liveness check"),
+        restart: data.restart.lock().expect("the restart facts").clone(),
     })
 }
 
