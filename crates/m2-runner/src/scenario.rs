@@ -895,9 +895,9 @@ mod tests {
             .count();
         assert_eq!(contained, 2, "one containment row per provocation");
         assert!(
-            eval.outcomes.iter().any(|o| o.lane == "N7"
-                && o.id.contains("alive")
-                && o.passed),
+            eval.outcomes
+                .iter()
+                .any(|o| o.lane == "N7" && o.id.contains("alive") && o.passed),
             "and the liveness row must be reported"
         );
     }

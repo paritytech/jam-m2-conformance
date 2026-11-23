@@ -166,34 +166,30 @@ fn sent_control(ctx: &N7Ctx) -> Control {
 pub fn malformed_stream_contained(ctx: &N7Ctx) -> Check {
     let provocations = ctx.provocations.clone();
     let control = sent_control(ctx);
-    check(
-        "n7_malformed_stream_contained",
-        Severity::Soft,
-        move |_obs| {
-            if !control.present() {
-                return vec![control.absent("n7_malformed_stream_contained")];
-            }
-            provocations
-                .iter()
-                .map(|p| {
-                    log::check_detail(
-                        "n7_malformed_stream_contained",
-                        p.outcome.is_contained(),
-                        Severity::Soft,
-                        || {
-                            format!(
-                                "sent {} to validator {}'s connection at wall {} ms; the node {}",
-                                p.fault.describe(),
-                                p.peer,
-                                p.at_wall_ms,
-                                p.outcome.describe()
-                            )
-                        },
-                    )
-                })
-                .collect()
-        },
-    )
+    check("n7_containment", Severity::Soft, move |_obs| {
+        if !control.present() {
+            return vec![control.absent("n7_malformed_stream_contained")];
+        }
+        provocations
+            .iter()
+            .map(|p| {
+                log::check_detail(
+                    "n7_malformed_stream_contained",
+                    p.outcome.is_contained(),
+                    Severity::Soft,
+                    || {
+                        format!(
+                            "sent {} on {}'s connection at wall {} ms; the node {}",
+                            p.fault.describe(),
+                            peer_name(p.peer),
+                            p.at_wall_ms,
+                            p.outcome.describe()
+                        )
+                    },
+                )
+            })
+            .collect()
+    })
 }
 
 /// After a malformed stream, does the connection still carry other protocols?
@@ -208,7 +204,7 @@ pub fn malformed_stream_contained(ctx: &N7Ctx) -> Check {
 pub fn connection_reusable(ctx: &N7Ctx) -> Check {
     let provocations = ctx.provocations.clone();
     let control = sent_control(ctx);
-    check("n7_connection_reusable", Severity::Soft, move |_obs| {
+    check("n7_reuse", Severity::Soft, move |_obs| {
         if !control.present() {
             return vec![control.absent("n7_connection_reusable")];
         }
@@ -237,10 +233,10 @@ pub fn connection_reusable(ctx: &N7Ctx) -> Check {
                     Severity::Soft,
                     || {
                         format!(
-                            "after {}, an ordinary CE 128 request on the same connection to \
-                             validator {} got no answer; the node {}",
+                            "after {}, an ordinary CE 128 request on {}'s same \
+                             connection got no answer; the node {}",
                             p.fault.describe(),
-                            p.peer,
+                            peer_name(p.peer),
                             p.outcome.describe()
                         )
                     },
@@ -265,7 +261,7 @@ pub fn node_alive_after(ctx: &N7Ctx) -> Check {
         .map(|p| p.fault.describe())
         .collect();
     let control = sent_control(ctx);
-    check("n7_node_alive_after", Severity::Hard, move |_obs| {
+    check("n7_liveness", Severity::Hard, move |_obs| {
         if !control.present() {
             return vec![control.absent("n7_node_alive_after")];
         }
@@ -297,6 +293,20 @@ pub fn node_alive_after(ctx: &N7Ctx) -> Check {
     })
 }
 
+/// Name the connection a provocation went out on.
+///
+/// `PROVOKER_PEER` is `0x4E`, outside the validator range on purpose — so
+/// printing it as "validator 78" names a validator that does not exist,
+/// which is the confusion `findings.md` §8 records and is exactly what the
+/// first run of this lane against the real node printed.
+fn peer_name(peer: u16) -> String {
+    if peer == PROVOKER_PEER {
+        "the provoker".to_string()
+    } else {
+        format!("validator {peer}")
+    }
+}
+
 /// Every N7 check, in reporting order.
 pub fn all(ctx: &N7Ctx) -> Vec<Check> {
     vec![
@@ -313,7 +323,9 @@ mod tests {
 
     fn provocation(outcome: StreamOutcome, reusable: Option<bool>) -> Provocation {
         Provocation {
-            peer: 1,
+            // The peer the lane really uses: a fixture on a validator index
+            // would have hidden the naming bug this file's own test catches.
+            peer: PROVOKER_PEER,
             fault: Fault::UnknownKind(130),
             outcome,
             connection_reusable: reusable,
@@ -396,6 +408,44 @@ mod tests {
             detail.contains("unassigned kind 130"),
             "and must name what provoked it; it said: {detail}"
         );
+    }
+
+    /// The provoker is not a validator, and a row must not call it one.
+    ///
+    /// `PROVOKER_PEER` is `0x4E`, so the first version of this row printed
+    /// "validator 78" against a run whose validator set runs 0..=5 -- the
+    /// confusion `findings.md` §8 records, reintroduced in the one place
+    /// whose doc comment cites it. Caught by reading the first real report,
+    /// not by any test, which is why this one exists.
+    #[test]
+    fn a_row_does_not_call_the_provoker_a_validator() {
+        let closed = ctx(
+            vec![provocation(
+                StreamOutcome::ConnectionClosed {
+                    code: 257,
+                    reason: "Bad incoming stream protocol 200".into(),
+                },
+                Some(false),
+            )],
+            Some(true),
+        );
+        let obs = ObsLog::new();
+        for check in [
+            malformed_stream_contained(&closed),
+            connection_reusable(&closed),
+        ] {
+            for row in (check.run)(&obs) {
+                let Some(detail) = row.detail else { continue };
+                assert!(
+                    !detail.contains("validator 78") && !detail.contains("validator 0x4E"),
+                    "a row named the provoker as a validator: {detail}"
+                );
+                assert!(
+                    detail.contains("the provoker"),
+                    "and it must name it as what it is: {detail}"
+                );
+            }
+        }
     }
 
     /// A node that answers a malformed request has not contained it in the

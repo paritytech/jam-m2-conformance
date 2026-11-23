@@ -2221,3 +2221,75 @@ reset" is a design intention; only `simple.md` decides what a node owes.
 Every row's severity traces to spec text or to something true without it,
 never to our own table — and where the table and the spec disagree, the
 table is what changes.
+
+---
+
+## 35. The node contains an unassigned stream kind in range, and closes the connection for everything else
+
+**Status:** open, node defect, and a refinement of §30 rather than a new
+one. Measured 2026-11-23 against polkajam `main` at `d92cadd30`, in
+`sessions/n7-1` and reproduced in `sessions/n7-2`. First results from the
+N7 lane.
+
+Four provocations, each on a connection of its own, from an ordinary
+non-validator peer:
+
+| sent | the node | connection after |
+|---|---|---|
+| stream kind **130** (unassigned, inside the CE span) | **reset the stream** | **usable** |
+| stream kind **200** (unassigned, outside it) | closed the connection: `Bad incoming stream protocol 200` (257) | dead |
+| CE 128 message, length prefix claims 4096, 8 bytes sent | closed: `Message size 4096 outside expected range 0..=37` (257) | dead |
+| complete CE 128 request + 16 junk bytes | closed: `Data received but was expecting finish` (257) | dead |
+
+The node stayed up throughout: `n7_node_alive_after` is a hard pass, on a
+fresh connection after all four.
+
+**The first row is the interesting one.** polkajam already does the right
+thing for a kind it does not recognise *inside* the assigned span — resets
+the stream, keeps the connection, and the harness went on to make an
+ordinary CE 128 request on that same connection and get an answer. So the
+graceful path exists and is reachable. Kind 200 takes a different path
+purely because it is out of range, and that path kills the connection.
+
+That makes §30 narrower and more actionable than it looked. It is not "the
+node closes connections when it dislikes something"; it is that **one
+branch handles the unknown gracefully and the others treat a malformed
+stream as a connection-level offence.** The three closes are three
+different code paths — an unknown protocol number, a message-size bound,
+and trailing data — and all three could plausibly do what the first does.
+
+**Why the harness reports this soft.** The NP does not require a reset over
+a connection close; it defines what a reset means (`simple.md:116-120`) and
+names one circumstance for closing a connection, a bad certificate (`:20`).
+§34 records that reasoning in full. The rows say what the node did, in the
+node's own words, and leave the question of whether it is permitted to the
+spec's author. The cost is real regardless: a connection carries every
+protocol with that peer, so refusing one stream this way takes block
+requests, tickets, package sharing and availability with it.
+
+**What the messages are worth to whoever fixes it.** All three name their
+own cause precisely, which is more than §30 had — that finding had to infer
+the provocation from timing. `Message size 4096 outside expected range
+0..=37` even gives CE 128's exact request width (32 + 1 + 4). A node this
+articulate about *what* it refused is a few lines from being equally
+graceful about *how*.
+
+**Two harness defects this run exposed**, neither of which any test caught:
+
+- Every row printed the provoker as "validator 78" — `PROVOKER_PEER` is
+  `0x4E`, outside the validator range on purpose, and the row formatted it
+  as a validator index against a run whose set is 0..=5. That is §8's
+  confusion exactly, reintroduced in the one file whose doc comment cites
+  §8 as the reason the constant is out of range. The unit tests missed it
+  because the fixture used `peer: 1`, a real validator, where the lane
+  always uses the provoker. Fixed, the fixture now uses what the lane uses,
+  and a test asserts no row calls the provoker a validator.
+- The check and its rows shared a name, so the report read
+  `n7_malformed_stream_contained.n7_malformed_stream_contained`. Checks are
+  now named by topic (`n7_containment`, `n7_reuse`, `n7_liveness`) as every
+  other lane names them.
+
+**The rule.** *Read the first real report, not just the test output.* Both
+defects were in code with passing tests, and both were obvious in the first
+line of output from a live run. A fixture that differs from production in
+one field is a fixture that cannot see bugs in that field.
