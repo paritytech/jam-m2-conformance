@@ -31,6 +31,13 @@
 
 use crate::dsl::{check, log, Check, Control, Severity};
 
+/// The peer index N7's provocations are recorded under.
+///
+/// Outside the validator range, like `n6::ORDINARY_PEER` (`0x6E`) and
+/// `n0::BUILDER_PEER` (`0xB0`), so a row naming it cannot be mistaken for a
+/// validator that exists — the confusion `findings.md` §8 records.
+pub const PROVOKER_PEER: u16 = 0x4E;
+
 /// What the harness sent to provoke the node, and what came back.
 #[derive(Debug, Clone)]
 pub struct Provocation {

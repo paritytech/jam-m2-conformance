@@ -138,6 +138,8 @@ pub struct Emulator {
     preimage_solicited: Arc<Mutex<bool>>,
     preimages_announced: Arc<Mutex<Vec<m2_scenario::scenarios::n6::AnnouncedPreimage>>>,
     preimage_requests: Arc<Mutex<Vec<m2_scenario::scenarios::n6::PreimageRequested>>>,
+    provocations: Arc<Mutex<Vec<m2_scenario::scenarios::n7::Provocation>>>,
+    nut_alive_after: Arc<Mutex<Option<bool>>>,
     nut_announced_preimages: m2_scenario::scenarios::n6::HeardAnnouncements,
     sync_probe_pending: Arc<AtomicBool>,
     /// Highest finalized slot the NUT has advertised over UP 0; see
@@ -280,6 +282,12 @@ pub struct EmuShared {
     pub preimage_solicited: Arc<Mutex<bool>>,
     pub preimages_announced: Arc<Mutex<Vec<m2_scenario::scenarios::n6::AnnouncedPreimage>>>,
     pub preimage_requests: Arc<Mutex<Vec<m2_scenario::scenarios::n6::PreimageRequested>>>,
+    /// N7's provocations: streams no conforming peer would open, and what
+    /// the node did with each.
+    pub provocations: Arc<Mutex<Vec<m2_scenario::scenarios::n7::Provocation>>>,
+    /// Whether the node answered on a fresh connection afterwards.
+    /// `None` until the run checks, which is not the same as `false`.
+    pub nut_alive_after: Arc<Mutex<Option<bool>>>,
     /// CE 142 announcements the NUT made, by the peer that heard each one.
     pub nut_announced_preimages: m2_scenario::scenarios::n6::HeardAnnouncements,
     /// Cleared by whichever connection runs the sync probes, so they run once
@@ -465,6 +473,8 @@ impl Emulator {
             preimage_solicited: Arc::new(Mutex::new(false)),
             preimages_announced: Arc::new(Mutex::new(Vec::new())),
             preimage_requests: Arc::new(Mutex::new(Vec::new())),
+            provocations: Arc::new(Mutex::new(Vec::new())),
+            nut_alive_after: Arc::new(Mutex::new(None)),
             nut_announced_preimages: Arc::new(Mutex::new(Vec::new())),
             sync_probe_pending: Arc::new(AtomicBool::new(true)),
             nut_final_slot: Arc::new(AtomicU32::new(NO_ADVERTISED_FINAL)),
@@ -655,6 +665,8 @@ impl Emulator {
             preimage_solicited: Arc::clone(&self.preimage_solicited),
             preimages_announced: Arc::clone(&self.preimages_announced),
             preimage_requests: Arc::clone(&self.preimage_requests),
+            provocations: Arc::clone(&self.provocations),
+            nut_alive_after: Arc::clone(&self.nut_alive_after),
             nut_announced_preimages: Arc::clone(&self.nut_announced_preimages),
             sync_probe_pending: Arc::clone(&self.sync_probe_pending),
             nut_final_slot: Arc::clone(&self.nut_final_slot),

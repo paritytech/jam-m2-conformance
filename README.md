@@ -59,8 +59,16 @@ CLI: `--seed` (run seed), `--validator-index` (default 5 — index 0 is degenera
 preferred-initiator rule), `--base-port`, `--preset` (`polkajam`/`docker`/`mock`),
 `--session-dir`, `--startup-timeout`, `--observe-secs` (observation window),
 `--lanes` (which lanes to grade, default `n0,n1,n2`; a lane left out is neither graded nor
-exercised, and `--lanes n0` skips ticket proving entirely), `--dry-run`. N3, N4 and N6 are
-opt-in by name: `--lanes n0,n1,n2,n3,n4,n6`.
+exercised, and `--lanes n0` skips ticket proving entirely), `--dry-run`. N3, N4, N6 and N7 are
+opt-in by name: `--lanes n0,n1,n2,n3,n4,n6,n7`.
+
+**N7 is opt-in for a stronger reason than the others.** It is the only lane
+that deliberately sends the node malformed streams, and a node that answers
+one by closing the connection takes every other protocol on it down too
+(`findings.md` §30). It provokes on connections of its own, one per fault,
+so the fallout is contained — but a run that did not ask for N7 is not
+provoked at all. N5 is not implemented: it is parked until polkajam's
+CE 144/145 tranche redesign reaches `main` (`findings.md` §32).
 
 ## Real-surface results vs polkajam-as-NUT (2026-11)
 

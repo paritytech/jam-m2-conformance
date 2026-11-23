@@ -252,6 +252,62 @@ pub async fn trailing_bytes(
     }
 }
 
+/// Does an ordinary request still get through on this connection?
+///
+/// A valid CE 128 ascending walk from genesis: every node holds genesis, so
+/// a conforming one answers. What is being measured is not the answer's
+/// contents — N0 grades those — but whether the connection still carries a
+/// protocol at all after the provocation.
+///
+/// The verdict is read from the *connection*, not from the reply. A node may
+/// legitimately answer with no blocks, reset the stream, or finish silently,
+/// and none of those means the connection is unusable. Only the connection
+/// having ended does.
+pub async fn connection_still_serves(
+    connection: &Conn,
+    peer: u16,
+    from: [u8; 32],
+    trace: &Mutex<Trace>,
+) -> bool {
+    use jam_types::{Encode, HeaderHash};
+    use jamnp_s::codec::ce128_129::{BlockRequest, Direction};
+    use jamnp_s::framing::CE128;
+
+    // Already gone: no need to ask.
+    if connection.end_reason().is_some() {
+        return false;
+    }
+    let request = BlockRequest {
+        header_hash: HeaderHash::from(from),
+        direction: Direction::AscendingExclusive,
+        max_blocks: 1,
+    };
+    let Ok((mut send, mut recv)) = connection.open_bi().await else {
+        return false;
+    };
+    let stream_id = send.id();
+    let wire = frame(CE128, &request.encode());
+    trace_record(peer, CE128, stream_id, &wire, trace, TraceDir::Rx);
+    if send.write_all(&wire).await.is_err() {
+        return false;
+    }
+    send.finish();
+
+    let mut buf = [0u8; 4096];
+    let _ = tokio::time::timeout(VERDICT_TIMEOUT, async {
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => trace_record(peer, CE128, stream_id, &buf[..n], trace, TraceDir::Tx),
+                _ => return,
+            }
+        }
+    })
+    .await;
+    // Whatever became of that stream, the question is whether the
+    // connection outlived it.
+    connection.end_reason().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

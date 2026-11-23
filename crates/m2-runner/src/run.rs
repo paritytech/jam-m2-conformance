@@ -445,6 +445,18 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             }
             phase("plan_package", t);
         }
+        // N7 last among the dialled tasks, and on connections of its own.
+        // The provocations are the one thing here a conforming peer would
+        // not do, and a node that answers by closing the connection
+        // (`findings.md` §30) must cost this lane its connection and no
+        // other lane theirs.
+        if cli.lanes.needs_provocation() {
+            let shared_for_n7 = shared.clone();
+            let san = nut_san.clone();
+            dial_tasks.push(tokio::spawn(async move {
+                provoke_node(nut_addr, san, genesis_hash, shared_for_n7).await;
+            }));
+        }
         let submissions = emu.submissions();
         let sharing_answer = emu.sharing_answer();
         let distributed = emu.distributed();
@@ -478,6 +490,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             preimages_announced: Arc::clone(&shared.preimages_announced),
             preimage_requests: Arc::clone(&shared.preimage_requests),
             nut_announced_preimages: Arc::clone(&shared.nut_announced_preimages),
+            provocations: Arc::clone(&shared.provocations),
+            nut_alive_after: Arc::clone(&shared.nut_alive_after),
             ref_chain,
             nut_blocks,
             deliveries,
@@ -1857,6 +1871,162 @@ fn internal(e: impl std::fmt::Display) -> RunError {
 
 fn startup(e: impl std::fmt::Display) -> RunError {
     RunError::Startup(e.to_string())
+}
+
+/// How many slots into the run before N7 provokes the node.
+///
+/// Late enough that the other lanes have their connections established and
+/// their early work done, so a node that answers a provocation by closing
+/// connections has already been observed behaving normally — the difference
+/// between "it was broken" and "we broke it" is the ordering here.
+const PROVOKE_AFTER_SLOTS: u32 = 6;
+
+/// Open streams the node should refuse, and record what survived (N7).
+///
+/// Every provocation gets a **fresh connection**. Two reasons, and the
+/// second is the one that matters: a node that closes the connection on the
+/// first provocation would otherwise leave the rest with nothing to send on,
+/// so the lane would report one finding and three absences; and reuse is
+/// measured on the connection the provocation was sent to, which only means
+/// anything if that connection carried the provocation and nothing else.
+///
+/// Liveness is measured last and on a connection of its own, because it asks
+/// a different question — whether the *node* survived, not whether the
+/// connection did.
+async fn provoke_node(
+    addr: SocketAddr,
+    expected_san: String,
+    genesis_hash: [u8; 32],
+    shared: m2_emu::emu::EmuShared,
+) {
+    use m2_emu::robustness;
+    sleep_until_slot(m2_reference::chain::wall_clock_slot() + PROVOKE_AFTER_SLOTS).await;
+    let genesis = shared.ref_chain.genesis_hash();
+
+    // An ordinary peer, as N6 uses: a key outside the validator set. A
+    // validator's connection would do on the wire, but provoking from one
+    // conflates "what does it do with a bad stream" with "what does it do
+    // with a bad stream from a peer it has duties toward".
+    let dial = async |nonce: u8| {
+        let mut seed = [0u8; 32];
+        seed[0] = 0x4E;
+        seed[1] = nonce;
+        use jamnp_s::transport::Transport as _;
+        jamnp_s::transport::quic::QuicTransport
+            .connect(
+                jamnp_s::endpoint::EndpointConfig {
+                    genesis_hash,
+                    builder: false,
+                },
+                ed25519_consensus::SigningKey::from(seed),
+                expected_san.clone(),
+                addr,
+            )
+            .await
+    };
+
+    // The faults, in increasing order of how much the node has to read
+    // before it can object: a kind byte naming no protocol, then a message
+    // that ends early, then one that is complete with junk behind it.
+    for (nonce, which) in [(0u8, 0u8), (1, 1), (2, 2), (3, 3)].iter() {
+        let connection = match dial(*nonce).await {
+            Ok(connection) => connection,
+            Err(e) => {
+                eprintln!("[n7] could not connect to provoke ({which}): {e}");
+                continue;
+            }
+        };
+        let mut provocation = match which {
+            0 => {
+                robustness::unknown_kind(
+                    &connection,
+                    m2_scenario::scenarios::n7::PROVOKER_PEER,
+                    robustness::UNASSIGNED_IN_RANGE,
+                    &shared.trace,
+                )
+                .await
+            }
+            1 => {
+                robustness::unknown_kind(
+                    &connection,
+                    m2_scenario::scenarios::n7::PROVOKER_PEER,
+                    robustness::UNASSIGNED_OUT_OF_RANGE,
+                    &shared.trace,
+                )
+                .await
+            }
+            2 => {
+                robustness::truncated_message(
+                    &connection,
+                    m2_scenario::scenarios::n7::PROVOKER_PEER,
+                    jamnp_s::framing::CE128,
+                    4096,
+                    8,
+                    &shared.trace,
+                )
+                .await
+            }
+            _ => {
+                // A real CE 128 request, so what the node objects to is the
+                // junk behind it and not the request itself.
+                use jam_types::{Encode, HeaderHash};
+                use jamnp_s::codec::ce128_129::{BlockRequest, Direction};
+                let request = BlockRequest {
+                    header_hash: HeaderHash::from(genesis),
+                    direction: Direction::AscendingExclusive,
+                    max_blocks: 1,
+                };
+                robustness::trailing_bytes(
+                    &connection,
+                    m2_scenario::scenarios::n7::PROVOKER_PEER,
+                    jamnp_s::framing::CE128,
+                    &request.encode(),
+                    16,
+                    &shared.trace,
+                )
+                .await
+            }
+        };
+        provocation.connection_reusable = Some(
+            robustness::connection_still_serves(
+                &connection,
+                m2_scenario::scenarios::n7::PROVOKER_PEER,
+                genesis,
+                &shared.trace,
+            )
+            .await,
+        );
+        eprintln!(
+            "[n7] {} -> the node {}; connection reusable: {}",
+            provocation.fault.describe(),
+            provocation.outcome.describe(),
+            provocation.connection_reusable.unwrap_or(false)
+        );
+        m2_emu::emu::lock(&shared.provocations).push(provocation);
+        drop(connection);
+    }
+
+    // And is the node still there at all? A fresh connection, because the
+    // ones above may have been closed on purpose and that is not the
+    // question this row asks.
+    let alive = match dial(0xFF).await {
+        Ok(connection) => {
+            let serves = robustness::connection_still_serves(
+                &connection,
+                m2_scenario::scenarios::n7::PROVOKER_PEER,
+                genesis,
+                &shared.trace,
+            )
+            .await;
+            drop(connection);
+            serves
+        }
+        Err(e) => {
+            eprintln!("[n7] the node refused a fresh connection after the provocations: {e}");
+            false
+        }
+    };
+    *m2_emu::emu::lock(&shared.nut_alive_after) = Some(alive);
 }
 
 #[cfg(test)]
