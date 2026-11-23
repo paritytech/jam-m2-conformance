@@ -2166,3 +2166,58 @@ its code and reason kept apart from an idle timeout and from this side
 hanging up — and the emulator records every one, on the connections it
 dials and the ones it accepts. The accepted half had never been logged at
 all, which is why validator 1 went unnoticed through five sessions.
+
+---
+
+## 34. DESIGN's N7 table expects more than the NP requires
+
+**Status:** open, and it is a defect in our own design document rather than
+in any node. Found 2026-11-23, writing the N7 lane.
+
+**Numbering note.** §32 and §33 exist on the unmerged `jv-n5-auditing`
+branch. This is §34 so the two cannot collide; if N7 lands first there will
+be a gap until N5's branch merges.
+
+DESIGN §11 N7 tabulates the robustness expectations, and marks these hard
+by not marking them soft:
+
+| Fault | Expected |
+|---|---|
+| Unknown stream byte (130, 200) | reset stream, connection stays up |
+| Length prefix mismatch / truncated / trailing bytes | reset, no crash, connection reusable |
+
+**The NP does not say this.** `simple.md:116-120` defines what a reset
+*means* — "resetting/stopping of a stream by the stream acceptor should be
+considered rejection of the request or failure to process the request" —
+and nowhere obliges a node to reject that way rather than by closing the
+connection. Searching `aa0e2b8` for "unknown", "unsupported" and
+"unrecognised" returns nothing in the protocol sections: the document says
+nothing whatever about a kind byte naming no protocol. The one circumstance
+it names for closing a connection is a missing or invalid certificate
+(`:20`).
+
+So a lane that hard-failed a node here would be failing it on a rule nobody
+wrote, which is the mistake §18 and §27 record and the reason
+`n0::connection_close` is already **Soft** with that rationale spelled out.
+Two lanes grading the same behaviour at two severities would also have been
+its own defect.
+
+**What N7 does instead.** Keeps N0's reading: *how* a node rejects is soft
+and reported in the node's own words. One row is hard —
+`n7_node_alive_after` — and it needs no spec text, because a node that a
+malformed message takes down is broken under any reading of any document.
+
+**What this is not.** Not an argument that closing the connection is fine.
+§30 is open and the behaviour is bad: it takes every other protocol with
+that peer down to refuse one stream. The claim here is narrower and only
+about grading — that the harness may report the cost loudly without
+asserting a conformance failure the spec does not define. The place to fix
+this is the NP, and `ask_ce-144-145.md`'s third question already asks a
+neighbouring version of it.
+
+**The rule.** *A design document is not a source of requirements.* DESIGN
+§11's tables were written to plan lanes, and a plan that says "expected:
+reset" is a design intention; only `simple.md` decides what a node owes.
+Every row's severity traces to spec text or to something true without it,
+never to our own table — and where the table and the spec disagree, the
+table is what changes.

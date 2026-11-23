@@ -11,5 +11,6 @@ pub mod emu;
 pub mod nut_block;
 pub mod preimage_io;
 pub mod report_io;
+pub mod robustness;
 pub mod sync_probe;
 pub mod ticket_io;
