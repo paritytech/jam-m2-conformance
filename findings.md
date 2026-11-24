@@ -2648,3 +2648,66 @@ such gate, because they go out on connections of their own; that is
 measured, not assumed (`sessions/n0-control` against
 `sessions/n7-3-combined`: 24 hard passes, 3 soft, and the same single known
 failure either way).
+
+---
+
+## 37. The node serves everyone else through a 480-stream-per-second flood
+
+**Status:** open only as a record; the result is the node behaving
+correctly. Measured 2026-11-24 against polkajam `main` at `d92cadd30`,
+`sessions/n7-flood-2`. The fifth of DESIGN §11 N7's nine rows.
+
+One peer opened **2400 CE 141 streams in five seconds — 480/s against the
+500/s DESIGN asks for** — while a second, ordinary peer on its own
+connection asked for a block. The bystander was answered during the flood
+and after it, the node went on serving, and it did not even drop the
+flooder.
+
+### The row asks about bystanders, not about the flooder
+
+This is the part worth keeping. The obvious shape for a flood row is
+"did the flooding connection survive?", and that shape grades the wrong
+thing: **a node that throttles or drops a peer opening streams as fast as
+it can is defending itself**, which is correct, and a row that failed it
+would mark good behaviour wrong and reward a node that let itself be
+swamped. Worse, it would pass a node that stayed polite to the flooder
+while going silent for everyone else — the actual failure.
+
+So the measurement is taken on a second connection doing nothing unusual,
+and the flooder's own fate is recorded but not graded. A unit test pins
+that: both values of `flooder_survived` must produce identical rows.
+
+### Two harness defects this row found before the node was asked anything
+
+**The flood ran at half the rate it claimed.** The first version opened
+streams one at a time, so the loop was paced by each open's round trip
+rather than by the target: 1140 streams in five seconds, **228/s against a
+500/s target** (`sessions/n7-flood-1`). A flood test that quietly runs at
+half the specified rate is not testing the specified thing. Opening in
+concurrent batches, ten ticks a second, reached 480/s. What the carrier
+will not grant still shows in the reported count rather than being hidden.
+
+**"Still serving" was measured as "connection alive".** `connection_still_serves`
+reads its verdict from `connection.end_reason()`, which is right after a
+provocation the node may answer by closing the connection — and wrong under
+load, where the failure is a node that answers nobody while leaving every
+connection open. The stand-in refuses by resetting streams, so the first
+version of this row reported a deliberately-broken node as healthy. Caught
+by the sim test, which is what it is for. `connection_answers` is the
+stricter measure and the flood row uses it; the provocation rows keep the
+other, because they are asking a different question.
+
+### What the result does and does not say
+
+It says polkajam survives this rate from **one connection**. It does not
+say it survives 500/s from twenty, and the limit reached here is partly the
+carrier's: QUIC bounds concurrent streams per connection, and polkajam
+takes quinn's defaults — `net/endpoint.rs` carries a `TODO @dave: Review
+configuration` over the transport config, so those bounds are unreviewed
+rather than chosen. A flood across many connections is a different test
+and is not one of DESIGN's nine rows.
+
+The authoring half of the row reported itself unexercised: the node
+authored nothing in the two slots after the flood, and this harness cannot
+say whether it was due to. That is the same limit §36 records for the
+restart row, and the same honest answer.

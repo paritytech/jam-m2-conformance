@@ -102,6 +102,8 @@ async fn provoke_with(
         alive_after: Some(true),
         // No process to kill: SimNode runs in this test's own process.
         restart: None,
+        // The flood has its own test; it does not go through this helper.
+        flood: None,
     };
     let obs = m2_scenario::dsl::ObsLog::new();
     let rows = n7::all(&ctx)
@@ -263,6 +265,7 @@ async fn the_slow_loris_row_catches_a_node_that_never_reclaims_a_stream() {
         provocations: vec![held.clone()],
         alive_after: Some(true),
         restart: None,
+        flood: None,
     };
     let detail = (n7::malformed_stream_contained(&ctx).run)(&obs)[0]
         .detail
@@ -272,4 +275,80 @@ async fn the_slow_loris_row_catches_a_node_that_never_reclaims_a_stream() {
         detail.contains("held silent for 30 s"),
         "the row must name the fault; it said: {detail}"
     );
+}
+
+/// Can the flood row tell a node defending itself from a node falling over?
+///
+/// The distinction is the whole row. A node that throttles or drops the
+/// flooding peer is correct; a node whose other connections stop being
+/// answered is not. So the measurement is taken on a *second* connection
+/// that is doing nothing unusual, and the control is a stand-in that serves
+/// it throughout.
+#[tokio::test(start_paused = true)]
+async fn the_flood_row_measures_bystanders_not_the_flooder() {
+    let transport = Arc::new(MockNetwork::new()) as Arc<dyn Transport>;
+    let oracle = m2_reference::oracle::Oracle::for_tests();
+
+    // Both halves of the experiment, so the only difference is the fault.
+    for (fault, bystander_should_be_served) in [
+        (SimFault::None, true),
+        (SimFault::StopsServingUnderLoad, false),
+    ] {
+        let node_chain =
+            Arc::new(RefChain::tiny_for(&oracle, NUT_INDEX).expect("the node's chain"));
+        let genesis = node_chain.genesis_hash();
+        let node = Arc::new(SimNode::at_index(Arc::clone(&node_chain), fault, NUT_INDEX));
+        let (nut_addr, serving) = Arc::clone(&node)
+            .listen(
+                Arc::clone(&transport),
+                SigningKey::from([0x96u8; 32]),
+                "127.0.0.1:0".parse::<SocketAddr>().expect("an address"),
+            )
+            .await
+            .expect("the simulated node binds");
+
+        let dial = async |seed: u8| {
+            transport
+                .connect(
+                    EndpointConfig {
+                        genesis_hash: genesis,
+                        builder: false,
+                    },
+                    SigningKey::from([seed; 32]),
+                    san_of(NUT_INDEX),
+                    nut_addr,
+                )
+                .await
+                .expect("the peer connects")
+        };
+        let flooder = dial(0x7f).await;
+        let bystander = dial(0x7e).await;
+        let trace = Mutex::new(Trace::default());
+
+        let opened = robustness::flood_streams(
+            &flooder,
+            PEER,
+            jamnp_s::framing::CE141,
+            500,
+            std::time::Duration::from_millis(500),
+            &trace,
+        )
+        .await;
+        // `connection_answers`, not `connection_still_serves`: the defect
+        // here is a node that answers nobody while every connection stays
+        // open, which a connection-liveness check reports as healthy.
+        let served = robustness::connection_answers(&bystander, PEER, genesis, &trace).await;
+
+        assert_eq!(
+            served,
+            bystander_should_be_served,
+            "with {fault:?} the bystander should{} have been served; {opened} streams opened",
+            if bystander_should_be_served {
+                ""
+            } else {
+                " not"
+            }
+        );
+        serving.abort();
+    }
 }

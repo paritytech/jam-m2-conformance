@@ -321,6 +321,128 @@ pub async fn slow_loris(
     }
 }
 
+/// Open streams as fast as a target rate allows, and count what got open.
+///
+/// **A stream flood, not a message flood.** Each stream carries its kind
+/// byte and is finished immediately: no message follows. That is deliberate.
+/// A flood of *invalid* CE 141 messages would be refused on the first one
+/// and, against a node that answers a refusal by closing the connection
+/// (`findings.md` §30), the flood would end before it started — measuring
+/// that finding over again instead of this one. The kind byte alone is what
+/// DESIGN §11 N7 asks for ("500 CE 141 streams per second"), and it puts the
+/// load where the row is aiming: stream setup and teardown.
+///
+/// Returns the number of streams successfully opened, which is normally well
+/// under `rate * seconds`. QUIC bounds concurrent streams per connection, so
+/// the carrier pushes back before the node has to — that backpressure is the
+/// transport working, not the node failing, and the count is reported rather
+/// than graded.
+pub async fn flood_streams(
+    connection: &Conn,
+    peer: u16,
+    kind: u8,
+    rate_per_sec: u32,
+    duration: Duration,
+    trace: &Mutex<Trace>,
+) -> u32 {
+    let started = clock::current().mono_ms();
+    let deadline_ms = started + duration.as_millis() as u64;
+    let mut opened = 0u32;
+    // Trace one stream. At this rate a per-stream record would bury every
+    // other protocol in the run's trace, and they are all identical.
+    trace_record(peer, kind, 0, &[kind], trace, TraceDir::Rx);
+
+    // Opened in concurrent batches, not one at a time. Each open is a round
+    // trip, so a sequential loop is paced by latency rather than by the
+    // target: the first version of this reached 228/s against a target of
+    // 500 and was quietly testing half of what it claimed. A batch per tick
+    // puts the rate back under the caller's control, and what the carrier
+    // will not grant still shows up in the returned count.
+    let per_tick = (rate_per_sec as usize).div_ceil(TICKS_PER_SEC);
+    let tick = Duration::from_millis(1000 / TICKS_PER_SEC as u64);
+
+    while clock::current().mono_ms() < deadline_ms {
+        let opens = (0..per_tick).map(|_| async {
+            let (mut send, _recv) = connection.open_bi().await.ok()?;
+            send.write_all(&[kind]).await.ok()?;
+            send.finish();
+            Some(())
+        });
+        let landed = futures::future::join_all(opens).await;
+        let got = landed.iter().filter(|r| r.is_some()).count() as u32;
+        opened += got;
+        // Nothing at all got open: the connection is gone, which is the
+        // node dropping the flooder and a legitimate answer. Stop rather
+        // than spin for the rest of the window.
+        if got == 0 {
+            break;
+        }
+        tokio::time::sleep(tick).await;
+    }
+    opened
+}
+
+/// How many batches a second [`flood_streams`] opens.
+///
+/// Ten: fine enough that a batch is a small fraction of the target rate,
+/// coarse enough that the pacing sleep is not the dominant cost.
+const TICKS_PER_SEC: usize = 10;
+
+/// Does an ordinary request get an **answer** on this connection?
+///
+/// Stricter than [`connection_still_serves`], and the two measure different
+/// failures. That one asks whether the connection survived, which is the
+/// right question after a provocation the node may answer by closing it.
+/// This one asks whether bytes came back, which is the right question under
+/// load: a node that stops answering while leaving every connection open is
+/// exactly the flood defect, and a liveness check that only watched the
+/// connection would call it healthy.
+pub async fn connection_answers(
+    connection: &Conn,
+    peer: u16,
+    from: [u8; 32],
+    trace: &Mutex<Trace>,
+) -> bool {
+    use jam_types::{Encode, HeaderHash};
+    use jamnp_s::codec::ce128_129::{BlockRequest, Direction};
+    use jamnp_s::framing::CE128;
+
+    if connection.end_reason().is_some() {
+        return false;
+    }
+    let request = BlockRequest {
+        header_hash: HeaderHash::from(from),
+        direction: Direction::AscendingExclusive,
+        max_blocks: 1,
+    };
+    let Ok((mut send, mut recv)) = connection.open_bi().await else {
+        return false;
+    };
+    let stream_id = send.id();
+    let wire = frame(CE128, &request.encode());
+    trace_record(peer, CE128, stream_id, &wire, trace, TraceDir::Rx);
+    if send.write_all(&wire).await.is_err() {
+        return false;
+    }
+    send.finish();
+
+    let mut buf = [0u8; 4096];
+    let mut answered = 0usize;
+    let _ = tokio::time::timeout(VERDICT_TIMEOUT, async {
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => {
+                    trace_record(peer, CE128, stream_id, &buf[..n], trace, TraceDir::Tx);
+                    answered += n;
+                }
+                _ => return,
+            }
+        }
+    })
+    .await;
+    answered > 0
+}
+
 /// Does an ordinary request still get through on this connection?
 ///
 /// A valid CE 128 ascending walk from genesis: every node holds genesis, so

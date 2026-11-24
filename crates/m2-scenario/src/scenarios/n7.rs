@@ -38,6 +38,38 @@ use crate::dsl::{check, log, Check, Control, Severity};
 /// validator that exists — the confusion `findings.md` §8 records.
 pub const PROVOKER_PEER: u16 = 0x4E;
 
+/// What a flood of stream opens from one peer produced.
+///
+/// DESIGN §11 N7: "Flood: 500 CE 141 streams per second from one peer |
+/// stays responsive; authors on time."
+///
+/// **The flooder's own fate is recorded, not graded.** A node that throttles
+/// or drops a peer opening streams as fast as it can is defending itself,
+/// which is the correct answer and not a defect. What the rows ask is
+/// whether *everyone else* kept being served — a node one peer can silence
+/// for the rest of the network is the failure worth catching, and it is a
+/// different question from how that peer was treated.
+#[derive(Debug, Clone)]
+pub struct FloodFacts {
+    pub target_rate_per_sec: u32,
+    pub duration_ms: u64,
+    /// Streams the harness actually got open. Below the target is expected:
+    /// QUIC bounds concurrent streams per connection, so the carrier pushes
+    /// back before the node has to.
+    pub streams_opened: u32,
+    /// Whether the flooding connection itself was still up at the end.
+    pub flooder_survived: bool,
+    /// Whether an ordinary CE 128 request **on a different connection** was
+    /// answered while the flood was running. `None` where the run did not
+    /// ask.
+    pub served_bystander_during: Option<bool>,
+    /// And once the flood stopped.
+    pub served_bystander_after: Option<bool>,
+    /// Slots the node authored in between the flood starting and the
+    /// measurement ending.
+    pub authored_during: Vec<u32>,
+}
+
 /// What a kill-and-restart of the node under test produced.
 ///
 /// DESIGN §11 N7: "Kill and restart NUT mid-epoch | re-syncs via CE 128/129;
@@ -183,6 +215,8 @@ pub struct N7Ctx {
     /// The kill-and-restart, where the run did one. `None` otherwise, and
     /// the rows report themselves unexercised rather than passing.
     pub restart: Option<RestartFacts>,
+    /// The stream flood, where the run ran one.
+    pub flood: Option<FloodFacts>,
 }
 
 /// The control every row here depends on: a provocation actually went out.
@@ -433,6 +467,108 @@ pub fn restart_authors_again(ctx: &N7Ctx) -> Check {
     })
 }
 
+/// Did the node keep serving other peers while one peer flooded it?
+///
+/// **This is the flood row that matters.** Not whether the flooder was
+/// tolerated — throttling or dropping it is the correct answer — but
+/// whether a bystander on its own connection still got an ordinary CE 128
+/// request answered. A node one peer can silence for everyone else is the
+/// failure the row exists to catch.
+///
+/// **Soft.** The NP sets no rate limit, no concurrency bound and no
+/// obligation about behaviour under load, so a node that degrades here has
+/// broken no written rule. `findings.md` §34 has the reasoning. The row
+/// reports what happened, loudly, and leaves the question of what is
+/// permitted to the spec's author.
+pub fn flood_serves_bystanders(ctx: &N7Ctx) -> Check {
+    let flood = ctx.flood.clone();
+    check("n7_flood", Severity::Soft, move |_obs| {
+        let Some(flood) = &flood else {
+            return vec![log::check_detail(
+                "n7_flood_not_exercised",
+                false,
+                Severity::Soft,
+                || {
+                    "the run did not flood the node, so nothing is known about it under load"
+                        .to_string()
+                },
+            )];
+        };
+        let mut rows = Vec::new();
+        match flood.served_bystander_during {
+            Some(served) => rows.push(log::check_detail(
+                "n7_flood_serves_bystander_during",
+                served,
+                Severity::Soft,
+                || {
+                    format!(
+                        "while one peer held {} streams open at a target of {}/s for {} ms, an \
+                         ordinary CE 128 request on a different connection got no answer",
+                        flood.streams_opened, flood.target_rate_per_sec, flood.duration_ms
+                    )
+                },
+            )),
+            None => rows.push(log::check_detail(
+                "n7_flood_bystander_not_measured",
+                false,
+                Severity::Soft,
+                || "the flood ran but no bystander asked the node for anything".to_string(),
+            )),
+        }
+        // Recovery is the softer half: a node that throttles hard under load
+        // and comes back afterwards is behaving well, and only a node that
+        // stays unresponsive once the flood stops is still wrong.
+        if let Some(after) = flood.served_bystander_after {
+            rows.push(log::check_detail(
+                "n7_flood_serves_bystander_after",
+                after,
+                Severity::Soft,
+                || {
+                    "once the flood stopped, an ordinary CE 128 request on a different \
+                     connection still got no answer"
+                        .to_string()
+                },
+            ));
+        }
+        rows
+    })
+}
+
+/// Did it go on authoring through the flood?
+///
+/// **Soft**, and reported only where the node authored at all during the
+/// run: this harness cannot say which slots the node was due in (see
+/// [`RestartFacts::first_due_slot`]), so silence is ambiguous and a verdict
+/// drawn from it would be a guess.
+pub fn flood_authors(ctx: &N7Ctx) -> Check {
+    let flood = ctx.flood.clone();
+    check("n7_flood_authoring", Severity::Soft, move |_obs| {
+        let Some(flood) = &flood else {
+            return Vec::new();
+        };
+        if let Some(first) = flood.authored_during.iter().min().copied() {
+            return vec![log::check_detail(
+                "n7_flood_authors",
+                true,
+                Severity::Soft,
+                || format!("authored slot {first} under load"),
+            )];
+        }
+        vec![log::check_detail(
+            "n7_flood_authoring_not_exercised",
+            false,
+            Severity::Soft,
+            || {
+                format!(
+                    "the node authored nothing in the {} ms the flood covered, and this \
+                     harness cannot say whether it was due to",
+                    flood.duration_ms
+                )
+            },
+        )]
+    })
+}
+
 /// Name the connection a provocation went out on.
 ///
 /// `PROVOKER_PEER` is `0x4E`, outside the validator range on purpose — so
@@ -455,6 +591,8 @@ pub fn all(ctx: &N7Ctx) -> Vec<Check> {
         node_alive_after(ctx),
         restart_resyncs(ctx),
         restart_authors_again(ctx),
+        flood_serves_bystanders(ctx),
+        flood_authors(ctx),
     ]
 }
 
@@ -488,6 +626,30 @@ mod tests {
             provocations,
             alive_after,
             restart: None,
+            flood: None,
+        }
+    }
+
+    fn flooded(
+        flooder_survived: bool,
+        during: Option<bool>,
+        after: Option<bool>,
+        authored: Vec<u32>,
+    ) -> N7Ctx {
+        N7Ctx {
+            flood: Some(FloodFacts {
+                target_rate_per_sec: 500,
+                duration_ms: 3_000,
+                streams_opened: 1_480,
+                flooder_survived,
+                served_bystander_during: during,
+                served_bystander_after: after,
+                authored_during: authored,
+            }),
+            ..ctx(
+                vec![provocation(StreamOutcome::Reset, Some(true))],
+                Some(true),
+            )
         }
     }
 
@@ -502,6 +664,7 @@ mod tests {
                 authored_after,
                 first_due_slot: due,
             }),
+            flood: None,
         }
     }
 
@@ -700,6 +863,118 @@ mod tests {
             [("n7_restart_authors_again", Outcome::Pass)],
             "a block after the restart is evidence regardless of the schedule"
         );
+    }
+
+    /// The flooder's own fate is not graded.
+    ///
+    /// A node that throttles or drops a peer opening streams as fast as it
+    /// can is defending itself. Grading that as a failure would mark correct
+    /// behaviour wrong and, worse, would reward a node that let itself be
+    /// swamped. Both values of `flooder_survived` must give the same rows.
+    #[test]
+    fn dropping_the_flooder_is_not_graded() {
+        let dropped = run(flood_serves_bystanders(&flooded(
+            false,
+            Some(true),
+            Some(true),
+            vec![9],
+        )));
+        let tolerated = run(flood_serves_bystanders(&flooded(
+            true,
+            Some(true),
+            Some(true),
+            vec![9],
+        )));
+        assert_eq!(
+            dropped, tolerated,
+            "the flooder's fate must not change any row"
+        );
+        assert!(
+            dropped.iter().all(|(_, o)| *o == Outcome::Pass),
+            "a node serving bystanders passes however it treated the flooder: {dropped:?}"
+        );
+    }
+
+    /// A node that stops answering everyone else fails the row.
+    #[test]
+    fn silencing_bystanders_fails() {
+        let rows = run(flood_serves_bystanders(&flooded(
+            true,
+            Some(false),
+            Some(true),
+            vec![9],
+        )));
+        assert!(
+            rows.contains(&(
+                "n7_flood_serves_bystander_during",
+                Outcome::Fail(Severity::Soft)
+            )),
+            "a node that silenced a bystander must fail: {rows:?}"
+        );
+        // And recovering afterwards is reported separately, as a pass.
+        assert!(rows.contains(&("n7_flood_serves_bystander_after", Outcome::Pass)));
+    }
+
+    /// Staying unresponsive after the flood stops is the worse case, and is
+    /// its own row.
+    #[test]
+    fn not_recovering_after_the_flood_fails_its_own_row() {
+        let rows = run(flood_serves_bystanders(&flooded(
+            true,
+            Some(false),
+            Some(false),
+            vec![],
+        )));
+        assert!(rows.contains(&(
+            "n7_flood_serves_bystander_after",
+            Outcome::Fail(Severity::Soft)
+        )));
+    }
+
+    /// A run that never flooded grades nobody.
+    #[test]
+    fn a_run_without_a_flood_reports_it_unexercised() {
+        let no_flood = ctx(
+            vec![provocation(StreamOutcome::Reset, Some(true))],
+            Some(true),
+        );
+        let rows = run(flood_serves_bystanders(&no_flood));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "n7_flood_not_exercised");
+        assert!(rows[0].1 != Outcome::Pass);
+        assert!(run(flood_authors(&no_flood)).is_empty());
+    }
+
+    /// Unmeasured is not served.
+    #[test]
+    fn an_unmeasured_bystander_does_not_pass() {
+        let rows = run(flood_serves_bystanders(&flooded(true, None, None, vec![9])));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "n7_flood_bystander_not_measured");
+        assert!(rows[0].1 != Outcome::Pass);
+    }
+
+    /// Authoring under load passes; silence says so rather than failing,
+    /// since the harness cannot tell a missed turn from no turn.
+    #[test]
+    fn authoring_under_load_is_graded_like_authoring_after_a_restart() {
+        assert_eq!(
+            run(flood_authors(&flooded(
+                true,
+                Some(true),
+                Some(true),
+                vec![9_954_400]
+            ))),
+            [("n7_flood_authors", Outcome::Pass)]
+        );
+        let silent = run(flood_authors(&flooded(
+            true,
+            Some(true),
+            Some(true),
+            vec![],
+        )));
+        assert_eq!(silent[0].0, "n7_flood_authoring_not_exercised");
+        assert!(silent[0].1 != Outcome::Pass);
     }
 
     /// A node that answers a malformed request has not contained it in the

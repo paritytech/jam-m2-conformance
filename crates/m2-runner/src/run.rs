@@ -497,6 +497,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             provocations: Arc::clone(&shared.provocations),
             nut_alive_after: Arc::clone(&shared.nut_alive_after),
             restart: Arc::clone(&shared.restart),
+            flood: Arc::clone(&shared.flood),
             ref_chain,
             nut_blocks,
             deliveries,
@@ -539,6 +540,17 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             .sleep(Duration::from_secs(cli.observe_secs))
             .await;
         phase("observation_window", t);
+    }
+    // N7's flood, before the restart: it needs the node alive and the
+    // emulator still authoring, and it is the gentler of the two -- the
+    // node is expected to survive it, where the restart ends it on purpose.
+    if cli.lanes.needs_provocation() {
+        let t = std::time::Instant::now();
+        let facts = flood_node(nut_addr, &nut_san, genesis_hash, real_run.as_ref()).await;
+        if let Some(data) = real_run.as_ref() {
+            *m2_emu::emu::lock(&data.flood) = facts;
+        }
+        phase("n7_flood", t);
     }
     // N7's kill-and-restart, after the window and before the emulator is
     // torn down: the dial tasks are still running, so the node has peers to
@@ -1901,6 +1913,110 @@ fn internal(e: impl std::fmt::Display) -> RunError {
 
 fn startup(e: impl std::fmt::Display) -> RunError {
     RunError::Startup(e.to_string())
+}
+
+/// N7's flood: target stream rate, and how long to sustain it.
+///
+/// DESIGN §11 N7 says 500 CE 141 streams per second. Both numbers are fixed
+/// here rather than scaled to the machine, so two runs are comparable; the
+/// harness reports how many streams it actually got open, which is normally
+/// well under the target because QUIC bounds concurrent streams per
+/// connection long before the node has to do anything.
+const FLOOD_RATE_PER_SEC: u32 = 500;
+const FLOOD_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Flood the node from one connection and watch a second one (N7).
+///
+/// Two connections, and that is the whole design. A node that throttles or
+/// drops the peer opening streams as fast as it can is defending itself,
+/// which is correct; what the row asks is whether a *bystander* — an
+/// ordinary peer doing nothing unusual — went on being answered. Measuring
+/// on the flooder's own connection would grade the defence instead of the
+/// damage.
+async fn flood_node(
+    addr: SocketAddr,
+    expected_san: &str,
+    genesis_hash: [u8; 32],
+    data: Option<&crate::real::RealRunData>,
+) -> Option<m2_scenario::scenarios::n7::FloodFacts> {
+    use m2_emu::robustness;
+    use m2_scenario::scenarios::n7::{FloodFacts, PROVOKER_PEER};
+
+    let data = data?;
+    let genesis = data.ref_chain.genesis_hash();
+    let trace = std::sync::Mutex::new(jamnp_s::trace::Trace::default());
+
+    let dial = async |nonce: u8| {
+        let mut seed = [0u8; 32];
+        seed[0] = 0x4F;
+        seed[1] = nonce;
+        use jamnp_s::transport::Transport as _;
+        jamnp_s::transport::quic::QuicTransport
+            .connect(
+                jamnp_s::endpoint::EndpointConfig {
+                    genesis_hash,
+                    builder: false,
+                },
+                ed25519_consensus::SigningKey::from(seed),
+                expected_san.to_string(),
+                addr,
+            )
+            .await
+    };
+    let (Ok(flooder), Ok(bystander)) = (dial(0).await, dial(1).await) else {
+        eprintln!("[n7] could not open the two connections the flood needs");
+        return None;
+    };
+
+    let before: Vec<u32> = m2_emu::emu::lock(&data.nut_blocks)
+        .iter()
+        .map(|n| n.block.header.slot)
+        .collect();
+
+    // The flood and the bystander's question run together: asking after it
+    // stopped would measure recovery, which is the other row.
+    let flooding = robustness::flood_streams(
+        &flooder,
+        PROVOKER_PEER,
+        jamnp_s::framing::CE141,
+        FLOOD_RATE_PER_SEC,
+        FLOOD_DURATION,
+        &trace,
+    );
+    let watching = async {
+        // Let the flood build before asking, or the question lands while
+        // the node is still idle and answers something that proves nothing.
+        jamnp_s::clock::current().sleep(FLOOD_DURATION / 2).await;
+        robustness::connection_answers(&bystander, PROVOKER_PEER, genesis, &trace).await
+    };
+    let (streams_opened, during) = tokio::join!(flooding, watching);
+
+    let after = robustness::connection_answers(&bystander, PROVOKER_PEER, genesis, &trace).await;
+    let flooder_survived = flooder.end_reason().is_none();
+    eprintln!(
+        "[n7] flood: {streams_opened} streams at a target of {FLOOD_RATE_PER_SEC}/s; \
+         bystander answered during: {during}, after: {after}; flooder survived: {flooder_survived}"
+    );
+    drop(flooder);
+    drop(bystander);
+
+    // A couple of slots so an authoring turn can land.
+    sleep_until_slot(m2_reference::chain::wall_clock_slot() + 2).await;
+    let authored_during: Vec<u32> = m2_emu::emu::lock(&data.nut_blocks)
+        .iter()
+        .map(|n| n.block.header.slot)
+        .filter(|slot| !before.contains(slot))
+        .collect();
+
+    Some(FloodFacts {
+        target_rate_per_sec: FLOOD_RATE_PER_SEC,
+        duration_ms: FLOOD_DURATION.as_millis() as u64,
+        streams_opened,
+        flooder_survived,
+        served_bystander_during: Some(during),
+        served_bystander_after: Some(after),
+        authored_during,
+    })
 }
 
 /// How long to let the node re-sync and get a chance to author after a
