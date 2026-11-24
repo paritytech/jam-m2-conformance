@@ -2957,3 +2957,80 @@ the checks being hard to write.
 
 N7 therefore stands at **five rows done and four blocked**, which is the
 lane's honest ceiling until the oracle can do those two things.
+
+---
+
+## 41. Two more rows are index-dependent, and the cause is not yet known
+
+**Status:** open, cause undiagnosed. Found 2026-11-24 by rotating every
+lane rather than only N0, which is what §39 bought.
+
+Seven lanes at validator indices 1, 3 and 5, 300 s windows:
+
+| index | rows | hard pass | failures |
+|---|---|---|---|
+| 1 | 703 | 463 | 5 |
+| 3 | 667 | 421 | 4 |
+| 5 | 630 | 408 | 3 |
+
+```
+n3_ce135_inclusion.n3_ce135_report_included            — passed at [3, 5], failed at [1]
+n6_ce142_announce.n6_ce143_requested_after_announcement — passed at [5], failed at [1, 3]
+```
+
+**Not run-to-run variance.** Both lanes depend on which slots the node wins
+and when packages land, which varies at a *fixed* index too — the row
+counts above differ by 73 between configurations that differ only in index.
+So the sharper test was two further runs at index 1: both rows failed in
+both, and pass at index 5. Three runs, one verdict.
+
+### What each failure says
+
+`n3_ce135_report_included`: "the report 526a86e5c75c2de7 guaranteed on core
+1 and distributed in slot 9967152 was never included; the NUT's blocks
+carried ["04c74d2a848d2001"]" — the node authored, and included a different
+report.
+
+`n6_ce143_requested_after_announcement`: "the NUT did not ask for the
+preimage b16ae7fe that service 0 had solicited on chain, within the
+10000 ms the announcer held the connection open."
+
+### What has been ruled out
+
+- **The grid restriction of §39.** CE 135 is `GuaranteeBroadcast`, which
+  polkajam permits from any validator, neighbour or not. CE 142 is
+  `PreimageAnnouncement`, which it permits from an ordinary peer — and the
+  N6 announcer is deliberately an ordinary peer for that reason. CE 143's
+  `PreimageRequest` is disallowed inbound from an ordinary peer, but the
+  node *opening* CE 143 is outbound and unrestricted.
+- **The harness distributing on the node's own core.** Core assignment
+  moves with the index — at k=1 core 0 is [0,1,4] and core 1 is [2,3,5];
+  at k=5 core 0 is [2,3,4] and core 1 is [0,1,5] — but in both the harness
+  distributed on the core the node is *not* a guarantor of. Same relative
+  position, different outcome.
+- **The solicit never reaching a block**, for N6: the announcer bails with
+  "no block carries the solicit" when that happens, and it did not. The
+  solicit was on chain and the node still did not ask.
+
+### What to look at next
+
+The two rows may share one cause or none. The ones worth testing, cheapest
+first:
+
+1. Whether the core the harness distributes on is already *engaged* — a
+   core holds a report until availability clears it, so a second report on
+   it cannot be included. The `[assignment]` lines carry the core, and the
+   chain can be asked which cores were engaged at that slot.
+2. Whether the solicit *accumulated* rather than merely being included.
+   The N6 gate watches for a block carrying the package and then waits two
+   slots; inclusion-to-accumulation lag depends on when the package was
+   guaranteed, which moves with the index. If that is it, the lane
+   announces too early and the node is right to decline — §5's mistake in
+   a new place.
+3. Whether index 2 and 4 behave like 1 or like 5, which would say whether
+   this follows the grid or something else.
+
+**Until then neither row should be read as a node defect.** Three of the
+four index-dependent rows found so far were the harness's own doing (§39),
+and the fourth has not been diagnosed. The rows are reported here as
+unstable, not as failures.
