@@ -8,6 +8,7 @@ pub mod keygen;
 pub mod launch;
 pub mod real;
 pub mod report;
+pub mod rotation;
 pub mod run;
 pub mod scenario;
 pub mod spec;

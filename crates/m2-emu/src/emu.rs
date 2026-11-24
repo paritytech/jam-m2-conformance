@@ -307,6 +307,13 @@ pub struct EmuShared {
     /// one thing the harness knows about the node's internal progress without
     /// asking it anything. The ticket sender gates on it.
     pub nut_final_slot: Arc<AtomicU32>,
+    /// Which validator index the node under test holds.
+    ///
+    /// Derived from `emu_indices`: this harness emulates every validator
+    /// but one, so the NUT is the index missing from that list. Needed
+    /// because whether a peer may ask the node for blocks depends on
+    /// whether it is the node's grid neighbour (`findings.md` §39).
+    pub nut_index: u16,
 }
 
 /// `nut_final_slot` before the NUT has advertised a finalized block.
@@ -680,6 +687,9 @@ impl Emulator {
             nut_announced_preimages: Arc::clone(&self.nut_announced_preimages),
             sync_probe_pending: Arc::clone(&self.sync_probe_pending),
             nut_final_slot: Arc::clone(&self.nut_final_slot),
+            // Every validator but one is emulated, so the node under test
+            // is the index this list does not hold.
+            nut_index: nut_index_of(&self.emu_indices),
         }
     }
 
@@ -2339,5 +2349,28 @@ mod tests {
         let advertised = advertised_final(&[], genesis);
         assert_eq!(advertised.header_hash.0, genesis);
         assert_eq!(advertised.slot, 0);
+    }
+}
+
+/// Which index the node under test holds, given the emulated ones.
+///
+/// The harness emulates every validator but the node, so the node is the
+/// one index in `0..=emu_indices.len()` that is missing. Derived rather
+/// than passed because every caller already has the list and a second
+/// parameter is a second thing to get wrong.
+fn nut_index_of(emu_indices: &[usize]) -> u16 {
+    let count = emu_indices.len() + 1;
+    (0..count).find(|i| !emu_indices.contains(i)).unwrap_or(0) as u16
+}
+
+#[cfg(test)]
+mod nut_index_tests {
+    use super::nut_index_of;
+
+    #[test]
+    fn the_missing_index_is_the_node() {
+        assert_eq!(nut_index_of(&[0, 1, 2, 3, 4]), 5);
+        assert_eq!(nut_index_of(&[0, 1, 2, 4, 5]), 3);
+        assert_eq!(nut_index_of(&[1, 2, 3, 4, 5]), 0);
     }
 }

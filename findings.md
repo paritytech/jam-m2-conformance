@@ -2711,3 +2711,174 @@ The authoring half of the row reported itself unexercised: the node
 authored nothing in the two slots after the flood, and this harness cannot
 say whether it was due to. That is the same limit §36 records for the
 restart row, and the same honest answer.
+
+---
+
+## 38. Two of N7's rows need a fork the reference engine cannot author
+
+**Status:** open, and it is a limit of the harness's design rather than a
+defect in anything. Found 2026-11-24, starting N7's equivocation row.
+
+DESIGN §11 N7 asks for two rows that both need the harness to hold a block
+its own chain does not contain:
+
+| row | needs |
+|---|---|
+| Equivocating emulated author | two validly-sealed blocks, same slot, same author |
+| Reorg: emulated majority extends a sibling | a competing branch from an earlier parent |
+
+**The reference engine will not author either.** `author_block_no_import`
+takes a `head: Option<(HeaderHash, &Storage)>` and so looks like it can
+build on any parent. It cannot. Measured directly against the oracle:
+
+```
+parent == the chain's best block  ->  Authored(Some(..))
+parent == genesis, head elsewhere ->  Error("Best block changed")
+```
+
+The cause is in polkajam's authoring, not in the oracle: the preimage table
+and the guarantee table are keyed to the chain's head, and authoring checks
+`table.head() != parent` and bails (`chain/authoring/mod.rs:313`, `:374`).
+The `head` parameter is an optimisation for a caller that already read the
+head, not fork support.
+
+**What was tried and reverted.** An `AuthorBlockFrom { session, slot,
+parent }` message, through `m2-oracle-proto`, the oracle handler and
+`RefChain`. It works only when the parent is already the head, which is the
+one case nobody needs, so it was removed rather than left as protocol
+surface that errors for its only purpose. The measurement above is what it
+was worth.
+
+**The tempting wrong fix.** Mutate an authored block to make a second one
+with the same slot. Its seal no longer verifies, so the node rejects it on
+the seal — and the row would be measuring seal validation while claiming to
+measure equivocation handling. A row that passes for the wrong reason is
+worse than an absent one, and this is `findings.md` §18's rule pointed at
+ourselves.
+
+**What it would take.** Either an engine entry point that authors against a
+supplied parent without consulting the head-keyed tables, which is a change
+inside polkajam rather than in this repository; or a second oracle session
+driven down a different branch, which gives two chains but cannot guarantee
+the same validator holds the slot on both — Safrole picks the author from
+the state at the parent, and the two states differ. The second is cheaper
+and weaker: it produces *a* fork, but not reliably an equivocation.
+
+**So the two rows are blocked, not pending**, and should be marked that way
+in DESIGN rather than left looking like unstarted work — the same
+distinction §32 draws for N5. Of DESIGN's nine N7 rows: five done, two
+blocked here, and two left that need nothing new — epoch-transition with a
+validator-set change, and index rotation.
+
+---
+
+## 39. N0's sync rows pass at index 5 by luck of the grid
+
+**Status:** open. Two defects, one in the harness and one a node/spec
+divergence, found 2026-11-24 by the first use of N7's index-rotation row
+and reproduced across two rounds of runs.
+
+N0 graded at three validator indices, same seed, same window:
+
+| index | result |
+|---|---|
+| 1 | 24 hard pass, 3 soft pass, 1 known failure |
+| 3 | **18 hard pass, 3 soft pass, 3 failures** |
+| 5 | 24 hard pass, 3 soft pass, 1 known failure |
+
+```
+ce128_serve.ce128_ascending_covers_reference — passed at [1, 5], failed at [3]
+ce128_serve.ce128_both_halves_fin            — passed at [1, 5], failed at [3]
+ce129_serve.ce129_served                     — passed at [1, 5], failed at [3]
+```
+
+All three fail the same way: the node resets the stream with
+`Reset(91141958510814)` = `0x52e4a40fa8de`, which is polkajam's
+`ErrorCode::TooMany`, *"Per-peer concurrency limit exceeded"*
+(`net/error.rs:78`).
+
+### Why the limit was hit with one stream open
+
+It is not a concurrency limit in any ordinary sense. `node/config.rs:85-86`:
+
+```rust
+let mut as_val_from_non_neighbor = as_val_from_neighbor.clone();
+as_val_from_non_neighbor[BlockOrStateRequest] = disallowed.clone();
+```
+
+`disallowed` is `max_per_peer: 0`, so **every** CE 128 or CE 129 stream from
+a validator that is not a grid neighbour is refused, on the first one.
+`TooMany` is the code for "the limit is zero" as much as for "you opened too
+many".
+
+With `W = floor(sqrt(6)) = 2`, the tiny grid gives NUT 3 the neighbours
+{1, 2, 5}, NUT 1 {0, 3, 5}, and NUT 5 {1, 3, 4}. The sync probe runs on
+whichever connection establishes first — `claim_sync_probe` is a race with
+no neighbour check — so at index 3 it lands on a non-neighbour often enough
+to fail every run of it so far, and at 1 and 5 it does not.
+
+### The harness defect
+
+**N0's CE 128/129 serve rows have been passing by luck of topology.** The
+lane is the oldest in the project and these rows have read "26/27 hard
+pass" for weeks against index 5. They would have failed the node at index 3
+the whole time, for a restriction the node applies deliberately — which is
+the harness accusing the node of a defect that is the harness's own
+arrangement, the class of mistake §8 and §25 record and the reason §18
+exists.
+
+**Fixed.** `start_sync_probe` now claims only from a connection whose peer
+is a grid neighbour of the node; `n6::grid_neighbours` already computed the
+set, and the node's own index is derived from `emu_indices` — this harness
+emulates every validator but one, so the node is the index missing from
+that list.
+
+Measured after the fix, same seed and window:
+
+```
+                       index 3                index 5
+before   18 hard pass, 3 failures   24 hard pass, 1 failure
+after    24 hard pass, 1 failure    24 hard pass, 1 failure
+
+--compare sessions/rot3-k3 sessions/rot3-k5
+  No row passed at one index and failed at another.
+```
+
+The one remaining failure at both indices is
+`ce129_boundary_parent_before_child`, the node defect that has stood since
+the first N0 runs.
+
+**One consequence to know about.** If no grid neighbour ever connects, the
+probe does not run and the CE 128/129 serve rows report nothing rather than
+failing. That is the right answer — the harness cannot ask, so it cannot
+grade — but it means those rows are now conditional on topology in a way
+they were not before, and a run that reaches neither is a run that proved
+nothing about sync serving.
+
+### The node/spec divergence
+
+Separately, and for whoever owns the NP: `simple.md` marks CE 128
+**`Node -> Node`**, and says nothing about restricting it to grid
+neighbours. The grid is introduced "primarily for the purpose of block and
+preimage announcements" (`:184`), which is about *announcements*, not about
+who may request a block. polkajam refusing CE 128/129 from a non-neighbour
+validator is stricter than the protocol as written.
+
+Whether that is the node being wrong or the NP being under-specified is not
+ours to settle — a node that served every peer's block requests would be
+trivially floodable, so the restriction is defensible engineering. But the
+two documents disagree, and a conformance harness cannot grade this until
+they agree.
+
+### What the row cost and bought
+
+The row found both on its first use, which is the argument for it. It also
+needed almost no machinery: `--validator-index` already existed, so the
+work was the comparison (`rotation.rs`) and recording the index in the
+report, without which two reports cannot be compared at all.
+
+**The comparison is deliberately conservative.** Which lane work fires
+inside a window varies run to run at a *fixed* index too, so a row present
+in one run and absent in another is reported separately and is not called a
+disagreement. Only a row that passed at one index and failed at another is.
+Four rows fell in the first bucket here and none of them means anything.

@@ -61,6 +61,7 @@ pub fn write_report(
     session_dir: &Path,
     results: &[CheckOutcome],
     findings: &[Finding],
+    validator_index: usize,
 ) -> std::io::Result<()> {
     let report_dir = session_dir.join("report");
     std::fs::create_dir_all(&report_dir)?;
@@ -77,6 +78,10 @@ pub fn write_report(
     md.push_str("# M2 Conformance Report\n\n");
     md.push_str(&format!("- Run: {run_id}\n"));
     md.push_str(&format!("- Timestamp: {secs} (unix seconds)\n"));
+    // Where in the validator set the node sat. Two reports are only
+    // comparable if you know this, and N7's index-rotation row compares
+    // reports for a living (DESIGN §11 N7).
+    md.push_str(&format!("- Validator index: {validator_index}\n"));
     md.push_str(&format!(
         "- Checks: {}, Findings: {}\n\n",
         results.len(),
@@ -197,7 +202,7 @@ mod tests {
                 details: "reset".into(),
             },
         ];
-        write_report(tmp.path(), &results, &[]).unwrap();
+        write_report(tmp.path(), &results, &[], 5).unwrap();
         let md = std::fs::read_to_string(tmp.path().join("report/report.md")).unwrap();
         assert!(md.contains("| N0 | up0_handshake | hard | HARD PASS |"));
         assert!(md.contains("| N0 | preferred_initiator | soft | SOFT PASS |"));
@@ -223,7 +228,7 @@ mod tests {
                 message: "preferred peer never connected".into(),
             },
         ];
-        write_report(tmp.path(), &[], &findings).unwrap();
+        write_report(tmp.path(), &[], &findings, 5).unwrap();
         let raw = std::fs::read_to_string(tmp.path().join("report/findings.json")).unwrap();
         let parsed: Vec<Finding> = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed, findings);
@@ -262,7 +267,7 @@ mod tests {
             evidence: "traces/jamnp.bin#1".into(),
             message: "preferred peer never connected".into(),
         }];
-        write_report(tmp.path(), &[], &findings).unwrap();
+        write_report(tmp.path(), &[], &findings, 5).unwrap();
         let md = std::fs::read_to_string(tmp.path().join("report/report.md")).unwrap();
         assert!(md.contains("## Findings"), "findings section missing");
         assert!(md.contains("soft"), "severity missing");
