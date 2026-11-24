@@ -2882,3 +2882,78 @@ inside a window varies run to run at a *fixed* index too, so a row present
 in one run and absent in another is reported separately and is not called a
 disagreement. Only a row that passed at one index and failed at another is.
 Four rows fell in the first bucket here and none of them means anything.
+
+---
+
+## 40. The spec can schedule a validator-set change; the reference chain cannot follow one
+
+**Status:** open. A feasibility answer rather than a defect, 2026-11-24,
+asked before building N7's last row because the two rows before it turned
+out to need a capability nothing had (§38) and making that mistake twice in
+one lane would be careless.
+
+DESIGN §11 N7's last unbuilt row wants a run "with a scheduled
+validator-set change". Two halves, and they have different answers.
+
+### The spec can schedule one — yes
+
+JAM rotates the sets at each epoch boundary, confirmed in polkajam
+`chain/exec/safrole.rs:110`:
+
+```text
+lambda' <- kappa ; kappa' <- gamma_k ; gamma_k' <- iota
+```
+
+`tiny_spec` writes **one** keyset into all four slots — `Validators` (κ),
+`Designates` (ι), `PrevValidators` (λ) and Safrole's `waiting_validators`
+(γ_k) — which is precisely why no set change ever happens in a run today.
+Writing a *different* set into `Designates` schedules one, active two epoch
+boundaries later. Two tests in `spec.rs` establish both halves of that: the
+four slots agree today, and a rotation is a genuinely different set.
+
+A **rotation** is the right shape: every validator keeps its keys and its
+address, and only its index moves. The harness already holds the six
+keysets and already listens on their addresses, so the emulated side needs
+nothing new, while every index-derived thing the node computes — grid
+neighbours, shard index, authoring turns — moves, which is what the row is
+about.
+
+### The reference chain cannot follow one — no
+
+The oracle builds its keystore **once, by index, at session open**
+(`oracle/src/session.rs:80-86`):
+
+```rust
+let validators = SecretKeysets(FixedVec::from_fn(|i| {
+    if held.contains(&(i as u16)) { SecretKeyset::trivial(i as u32) }
+    else { SecretKeyset::trivial(NON_VALIDATOR_KEYSET) }
+}));
+```
+
+Position `i` holds `trivial(i)`. After a rotation the validator at index
+`i` holds `trivial((i + 1) % 6)`, so the keystore no longer matches the
+active set and the harness can no longer author for it. There is no
+re-keying path: `AuthoringHarness::new(chain_spec, validators, config)`
+takes the keystore by value and exposes no setter, and pins one identity at
+construction (`harness.rs:123`, `// pick one`).
+
+So the chain would reach the boundary and then stall — the reference chain
+stops authoring exactly when the row wants to watch the node across the
+transition.
+
+### What it would take
+
+Re-keying the session's authoring harness at the boundary, which means
+either rebuilding it over the same database at the new keyset or a polkajam
+entry point that accepts one. That is a change in the oracle and probably
+in polkajam, not in the lanes.
+
+**So the row is blocked for the same class of reason as §38's two**, and
+for the record that is three of DESIGN's nine N7 rows blocked on the
+reference engine rather than on effort: equivocation and reorg need
+authoring on a chosen parent, this one needs authoring under a changed
+keyset. All three are the harness being unable to *drive* a scenario, never
+the checks being hard to write.
+
+N7 therefore stands at **five rows done and four blocked**, which is the
+lane's honest ceiling until the oracle can do those two things.
