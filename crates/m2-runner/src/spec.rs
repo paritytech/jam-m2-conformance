@@ -640,3 +640,115 @@ mod tests {
         cleanup(&dir);
     }
 }
+
+#[cfg(test)]
+mod set_change_feasibility {
+    //! Can the harness schedule a validator-set change? (DESIGN §11 N7,
+    //! epoch-transition connectivity.)
+    //!
+    //! Asked before building the row, because the two N7 rows before it
+    //! turned out to need a capability nothing had (`findings.md` §38) and
+    //! making that mistake twice in one lane would be careless.
+    //!
+    //! The rotation, from polkajam `chain/exec/safrole.rs:110`:
+    //!
+    //! ```text
+    //! lambda' <- kappa ; kappa' <- gamma_k ; gamma_k' <- iota
+    //! ```
+    //!
+    //! `tiny_spec` writes one keyset into all four slots, so nothing ever
+    //! changes. Writing a *different* set into `Designates` (iota) schedules
+    //! a change that becomes active two epoch boundaries later. These tests
+    //! establish that the state can express it and that the genesis the two
+    //! sides agree on still agrees.
+
+    use super::*;
+    use jam_std_common::{SafroleState, StorageKey, SystemKey, ValKeysets};
+
+    fn ips() -> Vec<[u8; 16]> {
+        (0..6)
+            .map(|i| {
+                let mut ip = [0u8; 16];
+                ip[10] = 0xff;
+                ip[11] = 0xff;
+                ip[12] = 127;
+                ip[15] = (i + 1) as u8;
+                ip
+            })
+            .collect()
+    }
+    fn ports() -> Vec<u16> {
+        (0..6).map(|i| 41_000 + i as u16).collect()
+    }
+
+    /// The set a rotation would schedule: every validator keeps its keys and
+    /// its address, and only its *index* moves.
+    ///
+    /// A rotation rather than new keys on purpose. The harness already holds
+    /// these six keysets and already listens on their addresses, so the
+    /// emulated side needs nothing new — while every index-derived thing the
+    /// node computes (grid neighbours, shard index, authoring turns) moves,
+    /// which is what the row is about.
+    fn rotated() -> ValKeysets {
+        let ips = ips();
+        let ports = ports();
+        ValKeysets::from_fn_fill(|i| {
+            let from = (i + 1) % 6;
+            let metadata = crate::keygen::metadata_for(from, ips[from], ports[from]);
+            jam_std_common::SecretKeyset::trivial(from as u32).public(metadata)
+        })
+    }
+
+    #[test]
+    fn a_rotation_is_a_different_set_from_the_one_at_genesis() {
+        let spec = tiny_spec(&Oracle::for_tests(), &ips(), &ports(), 0).expect("the spec builds");
+        let current = spec
+            .state
+            .iter()
+            .find(|(k, _)| **k == StorageKey::from(SystemKey::Validators).0)
+            .map(|(_, v)| ValKeysets::decode_all(&mut v.as_slice()).expect("decode"))
+            .expect("the state carries the validators");
+
+        assert_ne!(
+            rotated(),
+            current,
+            "a rotation that equalled the genesis set would schedule no change at all"
+        );
+        // And it is a permutation, not new validators: the same keys, moved.
+        let mut a: Vec<_> = rotated().iter().map(|v| v.ed25519).collect();
+        let mut b: Vec<_> = current.iter().map(|v| v.ed25519).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "the rotation must reuse the keys the harness holds");
+    }
+
+    /// The four slots agree at genesis today, which is why no set change
+    /// ever happens. Writing `Designates` is the one edit that schedules
+    /// one.
+    #[test]
+    fn todays_spec_schedules_no_change_because_all_four_slots_agree() {
+        let spec = tiny_spec(&Oracle::for_tests(), &ips(), &ports(), 0).expect("the spec builds");
+        let get = |key: SystemKey| {
+            spec.state
+                .iter()
+                .find(|(k, _)| **k == StorageKey::from(key).0)
+                .map(|(_, v)| v.clone())
+                .expect("the key is in the state")
+        };
+        let validators = get(SystemKey::Validators);
+        assert_eq!(get(SystemKey::Designates), validators, "iota == kappa");
+        assert_eq!(
+            get(SystemKey::PrevValidators),
+            validators,
+            "lambda == kappa"
+        );
+
+        let safrole = SafroleState::decode_all(&mut get(SystemKey::Safrole).as_slice())
+            .expect("decode safrole");
+        assert_eq!(
+            safrole.waiting_validators.encode(),
+            validators,
+            "gamma_k == kappa"
+        );
+    }
+}
