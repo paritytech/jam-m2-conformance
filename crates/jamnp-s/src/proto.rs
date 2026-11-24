@@ -158,8 +158,8 @@ pub fn encode_message(msg: &Message) -> Result<(u8, Vec<u8>), ProtoError> {
         Message::Ce142Announce(m) => m.encode(),
         Message::Ce143Request(m) => m.encode(),
         Message::Ce143Reply(m) => m.encode(),
-        Message::Ce144Announce(m) => m.encode(),
-        Message::Ce145Judgment(m) => m.encode(),
+        Message::Ce144Announce(m) => encode_seq(m),
+        Message::Ce145Judgment(m) => encode_seq(m),
         // Message 1 only, as CE 133's arm does: the rest of a CE 146
         // bundle is four further messages, and this layer carries one.
         Message::Ce146Submission(m) => m.encode_initial(),
@@ -218,8 +218,8 @@ pub fn from_kind_and_payload(kind: u8, payload: &[u8]) -> Result<Message, ProtoE
             decode_full::<ce141_145::PreimageAnnouncement>(payload).map(Ce142Announce)
         }
         framing::CE143 => decode_pair(payload, Ce143Request, Ce143Reply),
-        framing::CE144 => decode_full::<Vec<ce141_145::Announcement>>(payload).map(Ce144Announce),
-        framing::CE145 => decode_full::<Vec<ce141_145::Judgment>>(payload).map(Ce145Judgment),
+        framing::CE144 => decode_seq::<ce141_145::Announcement>(payload).map(Ce144Announce),
+        framing::CE145 => decode_seq::<ce141_145::Judgment>(payload).map(Ce145Judgment),
         framing::CE146 => {
             let mut input: &[u8] = payload;
             ce137_148::BundleSubmission::decode_initial(&mut input)
@@ -264,6 +264,40 @@ pub fn decode_message(kind: u8, bytes: &[u8]) -> Result<Message, ProtoError> {
 /// [payload]`, see [`framing::frame`]).
 pub fn frame_message(kind: u8, payload: &[u8]) -> Vec<u8> {
     framing::frame(kind, payload)
+}
+
+/// Encodes a message that is a bare sequence: the items concatenated, with no
+/// count in front of them.
+///
+/// `simple.md:148-152` is explicit, and it is the opposite of what a derived
+/// codec does: a sequence *not* preceded by `len++` takes its length from
+/// context, and "in the case of a message consisting of a single sequence, the
+/// length of the sequence is implied by the message size in bytes". CE 144's
+/// `[Announcement]` and CE 145's `[Judgment]` are written without `len++`, so
+/// `Vec`'s own `Encode` -- which writes a compact length first -- puts a byte
+/// on the wire that no conforming reader expects. `findings.md` §33 records
+/// what that cost and why the round-trip test did not catch it.
+fn encode_seq<T: codec::Encode>(items: &[T]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in items {
+        item.encode_to(&mut out);
+    }
+    out
+}
+
+/// Decodes a bare sequence: items until the payload runs out.
+///
+/// The count comes from the message length and nothing else, which is why
+/// every element of these two protocols has to be self-delimiting. Both are:
+/// an `Intent` and a `Validity` each carry a one-byte discriminator that says
+/// how much follows.
+fn decode_seq<T: Decode>(payload: &[u8]) -> Result<Vec<T>, ProtoError> {
+    let mut input: &[u8] = payload;
+    let mut items = Vec::new();
+    while !input.is_empty() {
+        items.push(T::decode(&mut input).map_err(|e| ProtoError::Decode(e.to_string()))?);
+    }
+    Ok(items)
 }
 
 /// SCALE-decodes `T` from `payload`, requiring the whole payload to be consumed.
@@ -410,6 +444,84 @@ mod tests {
 
     fn sig64() -> [u8; 64] {
         [0u8; 64]
+    }
+
+    /// CE 144 and CE 145 messages carry no length prefix.
+    ///
+    /// `simple.md:148-152`: a sequence not preceded by `len++` takes its
+    /// length from context, and "in the case of a message consisting of a
+    /// single sequence, the length of the sequence is implied by the message
+    /// size in bytes". Both protocols are written `[Announcement]` and
+    /// `[Judgment]`, without `len++`.
+    ///
+    /// The round-trip test below cannot see this, and did not: it encodes and
+    /// decodes with the same codec, so a spurious compact length survives the
+    /// trip intact. That is how this harness shipped `Vec`'s derived codec on
+    /// both protocols -- a byte in front of every message that no conforming
+    /// node would expect (`findings.md` §33). So this test counts bytes
+    /// against the field widths the spec lists instead of trusting the
+    /// round trip.
+    #[test]
+    fn ce144_and_ce145_messages_are_bare_sequences() {
+        let announcement = |intent| AuditAnnouncement {
+            header_hash: HeaderHash::from([0x55; 32]),
+            validator_index: 0x0005,
+            intent,
+            signature: [0x50; 96],
+        };
+        // Header Hash (32) ++ Validator Index (2) ++ Intent ++ Bandersnatch
+        // Signature (96), where `Intent` is one byte for the initial tranche
+        // and three for a later one, which names a core (`simple.md:777-778`).
+        const INITIAL: usize = 32 + 2 + 1 + 96;
+        const LATER: usize = 32 + 2 + 3 + 96;
+
+        let (kind, payload) = encode_message(&Message::Ce144Announce(vec![
+            announcement(Intent::Initial),
+            announcement(Intent::Later(1)),
+        ]))
+        .expect("the announcements encode");
+        assert_eq!(kind, framing::CE144);
+        assert_eq!(
+            payload.len(),
+            INITIAL + LATER,
+            "a batch is its items concatenated and nothing else"
+        );
+        assert_eq!(
+            payload[0], 0x55,
+            "the message starts at the first header hash, not at a count"
+        );
+
+        // Epoch Index (4) ++ Validator Index (2) ++ Validity (1, for Valid)
+        // ++ Work-Report Hash (32) ++ Ed25519 Signature (64)
+        // (`simple.md:820-821`).
+        const VALID_JUDGMENT: usize = 4 + 2 + 1 + 32 + 64;
+        let judgment = Judgment {
+            epoch_index: 7,
+            validator_index: 0x0005,
+            validity: Validity::Valid,
+            report_hash: [0xab; 32],
+            signature: sig64(),
+        };
+
+        let (kind, payload) = encode_message(&Message::Ce145Judgment(vec![
+            judgment.clone(),
+            judgment.clone(),
+        ]))
+        .expect("the judgments encode");
+        assert_eq!(kind, framing::CE145);
+        assert_eq!(payload.len(), 2 * VALID_JUDGMENT);
+
+        // And one judgment on its own is exactly the judgment: this is the
+        // case where a length prefix is least visible, because the pre-aa0e2b8
+        // message was the same bytes.
+        let (_, payload) =
+            encode_message(&Message::Ce145Judgment(vec![judgment])).expect("the judgment encodes");
+        assert_eq!(payload.len(), VALID_JUDGMENT);
+        assert_eq!(
+            payload[..4],
+            [7, 0, 0, 0],
+            "the message starts at the epoch index"
+        );
     }
 
     /// Every variant decodable from `(kind, payload)` alone: one per protocol,
