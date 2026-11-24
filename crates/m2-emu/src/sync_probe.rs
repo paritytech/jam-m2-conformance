@@ -31,6 +31,12 @@ const CE128_MAX_BLOCKS: u32 = 64;
 /// state must truncate, which is what makes the size cap observable.
 const CE129_MAX_SIZE: u32 = 16 * 1024;
 
+/// How many validators the tiny preset has.
+///
+/// The grid is computed over the whole set, so the count has to be the
+/// set's and not the number of peers this harness emulates.
+const VALIDATOR_COUNT: u16 = 6;
+
 /// Seconds to let the node sync before asking it to serve.
 ///
 /// A node that has not caught up has nothing to answer with, and an empty
@@ -262,6 +268,21 @@ async fn request_frames(
 /// Once, not per peer: the probes are assertions about the node, and five
 /// copies of the same answer would be five identical rows in the report.
 pub fn start_sync_probe(connection: &Conn, peer: u16, shared: &EmuShared) {
+    // Only a grid neighbour may ask. polkajam refuses CE 128 and CE 129
+    // outright from a validator that is not one -- `max_per_peer: 0`, which
+    // it reports as `TooMany` -- so a probe from anyone else measures the
+    // harness's choice of connection and nothing about the node.
+    //
+    // This cost N0 three rows at validator index 3 while passing at 1 and
+    // 5, for weeks, because the claim below is a race and whichever
+    // connection arrived first won it (`findings.md` §39). Whether CE 128
+    // may be restricted this way is a question for the NP -- it marks the
+    // protocol `Node -> Node` -- but failing the node for it here was the
+    // harness's defect either way.
+    let neighbours = m2_scenario::scenarios::n6::grid_neighbours(shared.nut_index, VALIDATOR_COUNT);
+    if !neighbours.contains(&peer) {
+        return;
+    }
     if !shared.claim_sync_probe() {
         return;
     }

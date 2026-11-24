@@ -50,6 +50,16 @@ pub struct Cli {
     /// CE 144/145 redesign lands (`findings.md` §32).
     #[arg(long, default_value = "n0,n1,n2", value_parser = LaneSet::parse)]
     pub lanes: LaneSet,
+    /// Compare finished runs instead of making one: pass a session
+    /// directory per `--compare` and the rows that answered differently are
+    /// printed.
+    ///
+    /// This is the reading half of DESIGN §11 N7's index-rotation row. The
+    /// re-running half is this same binary with `--validator-index`, once
+    /// per index; each report records the index it ran at, so the
+    /// comparison takes it from the file rather than from the caller.
+    #[arg(long = "compare", value_name = "SESSION_DIR")]
+    pub compare: Vec<std::path::PathBuf>,
     /// Skip NUT launch and connectivity; fabricate a conforming observation
     /// log so the scenario checks pass and the report renders. The
     /// deterministic S4 baseline (no network, no processes).
@@ -200,7 +210,43 @@ fn exit_code(all_hard_passed: bool, startup_failed: bool) -> i32 {
 }
 
 /// Orchestrate a full §4 run and map its outcome to a process exit code.
+/// Read each session's report and print the rows that disagree.
+///
+/// Exit 0 whether or not rows disagreed: a disagreement is a finding to
+/// read, not a failed run, and the rotation has no node of its own to
+/// grade. A directory that cannot be read is exit 2 — that is the harness
+/// failing, and reporting "no disagreements" because a file was missing
+/// would be the worst of the available answers.
+fn compare_sessions(dirs: &[std::path::PathBuf]) -> i32 {
+    let mut runs = Vec::new();
+    for dir in dirs {
+        let path = dir.join("report").join("report.md");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("m2-runner: cannot read {}", path.display());
+            return 2;
+        };
+        match crate::rotation::RunRows::from_report_file(&text) {
+            Some(run) => runs.push(run),
+            None => {
+                eprintln!(
+                    "m2-runner: {} has no `- Validator index:` line, so it cannot be compared",
+                    path.display()
+                );
+                return 2;
+            }
+        }
+    }
+    print!(
+        "{}",
+        crate::rotation::describe(&crate::rotation::compare(&runs))
+    );
+    0
+}
+
 pub async fn run(cli: Cli) -> i32 {
+    if !cli.compare.is_empty() {
+        return compare_sessions(&cli.compare);
+    }
     match run::run_once(cli).await {
         Ok(eval) => exit_code(eval.all_hard_passed, false),
         // A run that dies before it can write a report has nowhere else to
@@ -355,6 +401,7 @@ mod tests {
             startup_timeout: 30,
             observe_secs: 60,
             lanes: LaneSet::parse("n0,n1,n2").expect("lanes parse"),
+            compare: Vec::new(),
             dry_run: true,
         };
         let code = run(cli).await;
@@ -405,6 +452,7 @@ mod tests {
             startup_timeout: 30,
             observe_secs: 60,
             lanes: LaneSet::parse("n0,n1,n2").expect("lanes parse"),
+            compare: Vec::new(),
             dry_run: true,
         };
         let cli = mk(dir.path());
@@ -453,6 +501,7 @@ mod tests {
             startup_timeout: 1,
             observe_secs: 60,
             lanes: LaneSet::parse("n0,n1,n2").expect("lanes parse"),
+            compare: Vec::new(),
             dry_run: false,
         };
         let code = run(cli).await;
@@ -505,7 +554,7 @@ mod tests {
             "the missing CERT_SAN_OK must surface as a hard FAIL row"
         );
 
-        crate::report::write_report(dir.path(), &eval.outcomes, &eval.findings)
+        crate::report::write_report(dir.path(), &eval.outcomes, &eval.findings, 5)
             .expect("report writes");
         let md = std::fs::read_to_string(dir.path().join("report/report.md")).expect("report");
         assert!(md.contains("FAIL"), "report must contain a FAIL row");

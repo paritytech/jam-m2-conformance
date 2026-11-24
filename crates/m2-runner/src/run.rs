@@ -685,7 +685,8 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     } = evaluation;
     let mut findings = conn_findings;
     findings.extend(scenario_findings);
-    report::write_report(session_dir, &outcomes, &findings).map_err(internal)?;
+    report::write_report(session_dir, &outcomes, &findings, cli.validator_index)
+        .map_err(internal)?;
     let trace_result = match &source {
         ObsSource::Emulator { trace, .. } => report::write_trace(session_dir, &lock(trace)),
         ObsSource::Fabricated { trace, .. } => report::write_trace(session_dir, trace),

@@ -760,13 +760,22 @@ validator chosen by the same helper above.
 | Length prefix mismatch / truncated / trailing bytes | reset, no crash, connection reusable |
 | Slow-loris CE stream (kind byte then 30 s silence) | timeout and reset *(soft)* |
 | Flood: 500 CE 141 streams per second from one peer | stays responsive; authors on time |
-| Equivocating emulated author | builds on neither; no re-announce *(soft)* |
-| Reorg: emulated majority extends a sibling | NUT follows the reference best chain; CE 128 ascending reflects it |
+| Equivocating emulated author | builds on neither; no re-announce *(soft)* — **blocked**, `findings.md` §38 |
+| Reorg: emulated majority extends a sibling | NUT follows the reference best chain; CE 128 ascending reflects it — **blocked**, `findings.md` §38 |
 | Epoch-transition connectivity `:86-98` | with a scheduled validator-set change: connect to the next set, keep the old set until the first block of the epoch is finalized **and** one slot elapsed; UP 0 topology re-evaluated `:200-202` |
 | Kill and restart NUT mid-epoch | re-syncs via CE 128/129; authors again in its next slot |
 | NUT index rotation | every lane re-run with `k ∈ {1..5}` to catch index-dependent bugs (grid neighbours, shard index) |
 
 Out of scope: GRANDPA/BEEFY (no JAMNP-S spec). Finality is emulated by the harness (§10).
+
+**Two rows are blocked rather than unstarted.** Equivocation and reorg both
+need the harness to hold a block its own chain does not contain, and the
+reference engine will not author one: it refuses any parent that is not the
+chain's best block, because its preimage and guarantee tables are keyed to
+the head. Building them needs either a change inside polkajam's authoring
+or a second session driven down a different branch, which gives a fork but
+cannot guarantee the same validator holds the slot on both. `findings.md`
+§38 has the measurement and what was tried.
 
 ## 12. Open questions for the conformance group (with proposed defaults)
 
