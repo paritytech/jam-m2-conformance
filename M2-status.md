@@ -9,9 +9,12 @@ nothing else does:
 | `M2 Conformance - Delivery Plan.md` | the delivery plan — milestone ladder, effort, rollout |
 | `M2-status.md` (this file) | progress against that ladder, and the evidence for it |
 
-Last verified 2026-11-02 against polkajam @ `e3d216c24`, branch `devel` @ `8270303` plus
-the uncommitted re-pin and spec-parameter fix below. The results of §3 were taken on
-2026-10-30 against the previous pin `940ef56c7` and are unchanged by the re-pin.
+Last verified **2026-11-24** against polkajam @ `d92cadd30` (`polkajam 0.1.29`, GP 0.8.0),
+`main` @ `590f07b`, with the spec pinned to `jam-np/simple.md` @ `aa0e2b8` (2026-10-26).
+
+The dated sections below are kept as written — each records what was true when it was
+taken, and several were superseded by the next one. §3 and the milestone ladder are the
+current state; where an older section disagrees with them, the ladder is right.
 
 ### Re-pin, 2026-11-02: `940ef56c` → `e3d216c2`
 
@@ -651,12 +654,30 @@ hidden it.
 | Milestone | Lanes | Coverage | Status |
 |---|---|---|---|
 | **M2-A** — Foundations live | N0, N1 | 6 / 41 | ✅ **complete** — §1 |
-| **M2-B** — Self-tested | N2 | 8 / 41 | ⚠️ **partial** — the N2 lane is complete; the self-test mechanism exists and has proven 38 of the 65 check rows a node can cause, across N0, N1 and N2. See below |
-| **M2-C** — Guaranteeing | N3 | 21 / 41 | ⏳ not started |
-| **M2-D** — Availability | N4 | 30 / 41 | ⏳ not started |
-| **M2-E** — Audit & preimages | N5, N6 | 41 / 41 | ⏳ not started |
-| **M2-F** — Adversarial | N7 | + fault matrix | ⏳ not started |
-| **M2-G** — Rollout | — | ecosystem-gated | ⏳ not started |
+| **M2-B** — Self-tested | N2 | 8 / 41 | ✅ **complete** — the N2 lane is complete, and the self-test mechanism now covers every implemented lane: 75 named faults, 22 integration tests, one file per lane. See below |
+| **M2-C** — Guaranteeing | N3 | 21 / 41 | ✅ **complete** — the lane runs against polkajam and every submission row is held to the fault bar (`m2-sim/tests/n3_*_sim_it.rs`, 36 tests) |
+| **M2-D** — Availability | N4 | 30 / 41 | ✅ **complete** — the lane runs; serve, assurance and inclusion rows all proven by injected faults (`n4_sim_it.rs`, `n4_inclusion_sim_it.rs`, 14 tests) |
+| **M2-E** — Audit & preimages | N5, N6 | 41 / 41 | ◑ **half** — N6 complete and passing (2026-11-20, `n6_sim_it.rs`, 9 tests). **N5 parked**, see below |
+| **M2-F** — Adversarial | N7 | + fault matrix | ◑ **started** — four of DESIGN §11 N7's nine rows, run against polkajam 2026-11-23 (§34–36 of `findings.md`) |
+| **M2-G** — Rollout | — | ecosystem-gated | ⏳ not started — one node has ever been graded |
+
+**On N5, the one designed lane with no implementation.** Not blocked on effort. `jam-np`
+replaced the CE 144/145 wire format on 2026-10-26 (`aa0e2b8`); polkajam `main` still speaks
+the superseded one, and the replacement sits on an unmerged branch
+(`feat/tranche-redesign`). Grading a format that is about to be replaced would produce rows
+about a node nobody will run again, so the lane waits for the redesign to land.
+`findings.md` §32 records the decision and two things that are easy to forget by then: the
+redesign makes N5 *harder* rather than easier, because the current format derives the
+tranche and cores from a Bandersnatch VRF output instead of declaring them; and the two
+formats are separable by message length, if a tolerant reader is ever wanted.
+
+**On N7.** Four rows of nine: unknown stream kind, malformed and truncated messages,
+slow-loris, and kill-and-restart. The five still to come are flood, equivocation, reorg,
+epoch-transition with a validator-set change, and index rotation. Three of the rows that
+exist have no fault-injection coverage and cannot get it from `m2-sim`, which runs
+in-process: there is no process to kill and no stand-in that can pose "came back but will
+not serve". §36 records that as a real gap in the terms the project holds every other lane
+to.
 
 **On M2-B.** Its bar is *"Safrole tickets covered, **and** the harness's own checks are proven
 by deliberately faulty simulated clients"* — the delivery plan calls it the structural
@@ -671,23 +692,23 @@ rule's set membership is unobservable with this topology, a hard bound at the fo
 window's nominal upper edge would fail a conforming node under tiny, and "no forward" is not
 assertable for a fault delivered over CE 132. DESIGN §10 and §11 N2 record each one.
 
-*Proven by deliberately faulty simulated clients* is now **under way rather than absent**. The
-machinery exists — an in-process transport, a virtual clock and `m2-sim`, a node-shaped
-stand-in that can be broken in one named way at a time — and the first five check rows have
-been proven: each is shown to pass against an honest simulated node and to *fail, present in
-the report*, against one that gets exactly that thing wrong (`crates/m2-sim/tests/n0_sim_it.rs`,
-which grades six nodes in 0.07 s). That is 38 of the 65 rows a node can cause — thirteen in N0,
-five in N1 on blocks the simulated node authored itself, and twenty in N2, on tickets it won
-in a real lottery, on tickets the harness delivered to it, on what it then put in its own
-blocks, and on when and how long it went on forwarding. §4.2 lists the other 27 a node could
-still be made to fail, and the ten no node can.
+*Proven by deliberately faulty simulated clients* now **holds across every implemented
+lane**. The machinery — an in-process transport, a virtual clock and `m2-sim`, a node-shaped
+stand-in that can be broken in one named way at a time — carries 75 named faults and 22
+integration tests, one file per lane: each row is shown to pass against an honest simulated
+node and to *fail, present in the report*, against one that gets exactly that thing wrong.
 
-The distinction this closes is not pedantic. Two of the four hard failures ever observed were
-harness defects of exactly the kind a faulty client catches, and N2's injected ticket faults
-would not have caught either, because both were in how the harness itself spoke to the node.
-What remains is coverage — the other 70 rows, and the N1 and N2 behaviour a simulated node
-would need before it can be graded on them — plus the fact that nothing drives a simulated run
-from the CLI yet: the proofs live in the test suite, which is where they run on every commit.
+The distinction this closes is not pedantic, and the project kept earning it. Two of the four
+hard failures ever observed were harness defects of exactly the kind a faulty client catches.
+Writing N4's inclusion faults found both of `n4_ce141_inclusion`'s rows asking for the wrong
+block (`findings.md` §14). Writing N6's found a row that *vanished* instead of failing when
+the node asked for the wrong preimage. Writing N7's found two defects in its own rows —
+caught not by a test but by reading the first real report, which is the rule §35 ends on.
+
+What remains: three N7 rows that cannot be covered this way at all, because `m2-sim` runs in
+the test process and there is no process to kill (§36); and the fact that nothing drives a
+simulated run from the CLI — the proofs live in the test suite, which is where they run on
+every commit.
 
 This document records what each milestone required, the evidence that it holds, what is not
 covered, and how to point the suite at a third-party node.
@@ -776,13 +797,17 @@ Result: the node accepts every ticket the emulator offers. `invalid ticket signa
 
 | | |
 |---|---|
-| Crates | 6 (`jamnp-s`, `m2-reference`, `m2-emu`, `m2-scenario`, `m2-runner`, `m2-sim`) |
-| Rust | 36.4k lines under `crates/*/src`, 41.3k with the integration tests; 549 test functions |
-| `cargo test --workspace` | **558 passed / 0 failed** (plus 19 in the oracle tree) |
+| Crates | 7 (`jamnp-s`, `m2-oracle-proto`, `m2-reference`, `m2-emu`, `m2-scenario`, `m2-runner`, `m2-sim`) |
+| Rust | 40.3k lines under `crates/*/src`, 46.0k with the integration tests |
+| `cargo test --workspace` | **592 passed / 0 failed** (plus the oracle tree's own) |
+| Lanes implemented | N0, N1, N2, N3, N4, N6, and N7 in part. N5 parked — see the ladder |
+| Fault injection | 75 named `SimFault` variants, 22 integration tests across 16 files, one per lane |
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets` | 3 warnings, all pre-existing |
-| Dry-run baseline | exits 0 — the harness's own expectations are satisfiable |
+| Dry-run baseline | exits 0 — 137 rows, 122 hard and 15 soft, all passing |
 | Live run | exits 1 — correct; hard findings exist |
+| Spec pin | `jam-np/simple.md` @ `aa0e2b8` (2026-10-26) |
+| Node pin | polkajam `d92cadd30` (`polkajam 0.1.29`, GP 0.8.0) |
 
 ### Live results vs polkajam-as-NUT
 
@@ -795,11 +820,22 @@ what a 300 s one does — because which slots the node wins and
 when a proxied ticket arrives decide which rules get exercised. A single run is not a stable
 baseline, and the set of findings is not stable either — see the caution below.
 
-| Lane | Coverage | Result |
-|---|---|---|
-| N0 connectivity and sync | UP 0, CE 128, CE 129 | 26/27 hard pass |
-| N1 authoring | asserted over UP 0 and CE 128 | parent, seal, prior/posterior state roots graded per block |
-| N2 Safrole tickets | CE 131, CE 132 | complete against DESIGN §11 N2: proofs, target epochs, attempt ranges, per-epoch caps, proxy routing, the forward window, the stopping rule, inclusion, and the Faults column — bad proof, wrong proxy, wrong epoch, late and duplicate |
+**Current, `sessions/status-all` (2026-11-24), all seven lanes over a 300 s window: 631
+rows — 406 hard passes, 40 soft passes, 3 hard findings.**
+
+| Lane | Protocols | Rows | Result |
+|---|---|---|---|
+| N0 connectivity and sync | UP 0, CE 128, CE 129 | 43 | 1 hard failure: `ce129_boundary_parent_before_child`, a node defect standing since the first runs |
+| N1 authoring | asserted over UP 0 and CE 128 | 67 | clean; parent, seal and prior/posterior state roots graded per block |
+| N2 Safrole tickets | CE 131, CE 132 | 133 | 1 hard failure: `n2_unknown_epoch_reset_observed` — the ticket is refused, the stream is not reset |
+| N3 guaranteeing | CE 133, CE 146, CE 134, CE 135 | 74 | 1 hard failure: `n3_ce146_oversized_refused` — `findings.md` §4, a question rather than a verdict |
+| N4 availability | CE 137–141, CE 148 | 297 | clean on hard rows; 127 soft rows are one unexercised control |
+| N6 preimages | CE 142, CE 143 | 5 | clean |
+| N7 adversarial | malformed streams, restart | 12 | 6 soft failures — `findings.md` §35; the restart row is correctly unexercised outside an N7-only run |
+
+The three hard findings are the same three the previous run reported, and none is the
+harness's. The older narrative below records how four earlier ones were closed, every one of
+them ours.
 
 Four distinct hard failures have been observed. Reading the node's own log alongside them shows
 that **only two are node defects**; the other two are the harness blaming the node for a refusal
@@ -1093,30 +1129,47 @@ result — confirm the checks were *exercised*, not merely *not failed*.
 
 ## 4. What is not covered yet
 
-M2-A is the first milestone on the ladder. Clearing it is not a statement about protocol
-coverage beyond its own 6 / 41.
+Six of the seven designed lanes are implemented and one is parked, so what follows is a
+list of real gaps rather than of unstarted work.
 
-- **Messages asserted: 8 of 41.** UP 0, CE 128, CE 129, CE 131, CE 132. Lanes N3–N7
-  (guaranteeing, availability, auditing/disputes, preimages, adversarial) are designed in
-  DESIGN §11 and not implemented.
-- **Self-testing works, on 38 of the 65 check rows a node can cause.** M2-B's criterion is *transport and clock
+- **Protocols asserted:** UP 0, CE 128, CE 129, CE 131, CE 132, CE 133, CE 134, CE 135,
+  CE 137–141, CE 142, CE 143, CE 146, CE 148. **Not asserted: CE 136, CE 144, CE 145, CE 147**
+  — the auditing and disputes protocols, which belong to the parked N5 lane. CE 136 and
+  CE 147 have codecs and no lane driving them.
+- **Self-testing is built and used throughout.** M2-B's criterion is *transport and clock
   injectable, QUIC behaviour unchanged*, and all three pieces are built: `jamnp_s::transport`
   with a QUIC carrier and an in-process mock, `jamnp_s::clock` with the machine's clock and a
   virtual one, and `m2-sim`, a node-shaped stand-in that can be broken one named way at a time
   (DESIGN §3). **No crate above `jamnp-s` depends on `quinn`**, so that half is enforced by the
-  build. The stand-in authors blocks and runs the Safrole lottery, so N1 and N2's generation
-  side can grade it, and it takes delivery of tickets, refuses what it cannot act on and
-  forwards what it is proxy for, and includes what it received in the blocks it authors. What
-  is missing is coverage: 27 rows a node could make fire have still never been shown to. §4.1
-  has the shape of the work and §4.2 lists them, with the ten that are out of scope and why.
-- **Negative testing exists in N2 only.** N2 injects its whole Faults column — bad proof, wrong
-  proxy, wrong epoch, late, duplicate, plus an over-cap attempt DESIGN does not list — and gates
-  every negative verdict on a control. Nothing equivalent exists for the other lanes, because the
-  other lanes do not exist. And the faults are injected into an honest emulator's ticket stream,
-  which is not the same thing as a faulty client (see M2-B above).
-- **One real node has been graded.** The suite has only ever run against polkajam.
+  build.
+
+  **§4.1 and §4.2 below are stale and have not been re-derived.** They were written when N0,
+  N1 and N2 were the only lanes and they count 65 rows, of which 38 were then proven. That
+  arithmetic no longer describes anything: four more lanes have landed, each with its own
+  fault file. Rather than invent a new total, the current state is the per-lane files
+  themselves — `crates/m2-sim/tests/`, 16 of them, 22 tests, 75 named faults. The two
+  sections are kept for the method they describe and the ten rows they rule out of scope,
+  not for their totals.
+- **Negative testing now exists in every implemented lane.** 75 named `SimFault` variants
+  and 22 integration tests, one file per lane, each showing a row passing against an honest
+  stand-in and failing against one broken in exactly that way. Three N7 rows are the
+  exception and cannot be covered this way: `m2-sim` runs in the test process, so there is no
+  process to kill and no stand-in that can pose "came back but will not serve"
+  (`findings.md` §36).
+
+- **One real node has been graded, and the bar it clears is the harness's own.** Several
+  rows assert deliberately less than DESIGN's wording reads like, each recorded where it is
+  made: N2's proxy membership is unobservable with this topology, N7's containment rows are
+  soft because the NP defines what a stream reset *means* but never requires one over a
+  connection close (§34), and the preimage lane's precondition is on chain rather than on
+  the wire.
+- **Still only polkajam.** The suite has never been pointed at a second implementation,
+  which is the one thing that would test whether these rows encode the spec or encode
+  polkajam. §5 documents how to do it.
 
 ### 4.1 Re-estimating the transport and clock work
+
+> **Stale, 2026-11-24.** The work it estimates is done; kept for the record of what it cost.
 
 *Measured 2026-11-09, on `main` at `b6a9f79`.* The delivery plan put this at "only 10 call
 sites". That number was an undercount, but the more useful correction is that it measures
@@ -1211,6 +1264,9 @@ nut_reannounces_learned_block fail; it reported Some(Pass)`.
 What is left of M2-B is coverage, not mechanism: 27 reachable rows unproven, listed in §4.2.
 
 ### 4.2 What each check row's evidence is, and the 27 a node could still be made to fail
+
+> **Stale, 2026-11-24.** Written against N0/N1/N2 only. The enumeration and its totals
+> predate N3, N4, N6 and N7; the method and the out-of-scope reasoning still hold.
 
 *Counted 2026-11-09 from `m2-scenario/src/scenarios/{n0,n1,n2}.rs`, excluding test code.* The
 lanes report **75 rows**. "Unproven" below means *unproven end to end by a faulty client*,
@@ -1647,7 +1703,7 @@ have been failed for it.
 ./scripts/prepare-nut.sh
 
 # Harness checks.
-cargo test --workspace            # 558 passed / 0 failed
+cargo test --workspace            # 592 passed / 0 failed
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 

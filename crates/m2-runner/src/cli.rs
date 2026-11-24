@@ -36,10 +36,18 @@ pub struct Cli {
     pub observe_secs: u64,
     /// Comma-separated lane set to grade, e.g. `n0` or `n1,n2`.
     ///
-    /// The default is the lanes a run grades unasked. N3 and N4 are not
-    /// among them yet: neither has a simulated misbehaving node to prove
-    /// its rows can fail, so a pass from either is a pass nobody has
-    /// checked the meaning of. They are asked for by name until then.
+    /// The default is the lanes a run grades unasked: N0, N1 and N2. N3,
+    /// N4, N6 and N7 are asked for by name.
+    ///
+    /// They all have simulated misbehaving nodes now, so the original
+    /// reason for holding them back is gone; what keeps them opt-in is
+    /// cost and blast radius. N3 and N4 need a work package submitted and
+    /// guaranteed, N6 needs a preimage solicited on chain, and each adds
+    /// minutes to a run. N7 sends the node streams no conforming peer
+    /// would send, and on an N7-only run it kills and restarts the node.
+    ///
+    /// N5 is not implemented and is refused: it is parked until polkajam's
+    /// CE 144/145 redesign lands (`findings.md` §32).
     #[arg(long, default_value = "n0,n1,n2", value_parser = LaneSet::parse)]
     pub lanes: LaneSet,
     /// Skip NUT launch and connectivity; fabricate a conforming observation

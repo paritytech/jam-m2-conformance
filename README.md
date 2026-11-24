@@ -12,14 +12,20 @@ artefact the NUT produces against the polkajam `hazmat` reference engine.
 
 **Implemented and green:** P0 infrastructure complete plus conformance lanes **N0**
 (connectivity/sync), **N1** (block authoring) and **N2** (Safrole tickets), which run by default,
-plus **N3** (guaranteeing) and **N4** (availability), which are graded by name — see the roadmap
-below for why. See [DESIGN.md](DESIGN.md) for the design; this README documents the current
-implementation state.
+plus **N3** (guaranteeing), **N4** (availability), **N6** (preimages) and **N7** (adversarial
+and robustness), which are graded by name — see the roadmap below for why. **N5**
+(auditing/disputes) is the one designed lane with no implementation: it is parked until
+polkajam's CE 144/145 tranche redesign reaches their `main` (`findings.md` §32). See
+[DESIGN.md](DESIGN.md) for the design; this README documents the current implementation
+state.
 
-- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **546 passed / 0 failed** ✓,
+- Workspace: `cargo build --workspace` ✓, `cargo test --workspace` **592 passed / 0 failed** ✓,
   `cargo fmt --all --check` ✓, no `unwrap`/`panic`/`expect`/`todo!` in non-test code.
 - Dry-run baseline: `cargo run -p m2-runner -- --preset mock --dry-run --session-dir /tmp/x`
-  exits 0 with **all N0+N1+N2 checks HARD PASS** — the harness's own expectations are satisfiable.
+  exits 0 — the harness's own expectations are satisfiable. Over every lane
+  (`--lanes n0,n1,n2,n3,n4,n6,n7`) it reports **137 rows, 122 hard and 15 soft, all passing**.
+  N7 reports nothing there and is meant to: a dry run provokes nobody, and a fabricated pass
+  on a robustness lane would be the one row nobody should trust.
 
 ## Crates
 
@@ -29,9 +35,9 @@ implementation state.
 | `m2-oracle-proto` | The wire protocol between the harness and the reference oracle: a 4-byte length prefix and a JAM-codec message, with the fuzz protocol's own tags kept where they were. |
 | `m2-reference` | Client of the reference oracle: `RefChain` (tiny 6-validator chain, deterministic authoring of emulated slots), NUT-block import + state diff (`import.rs`/`state.rs`), ticket generation/planning/verification (`tickets.rs`), work packages and guaranteed reports (`reports.rs`), erasure-coded bundles and segment justifications (`availability.rs`). Holds a connection and a session id; the engine itself is in `oracle/`. |
 | `oracle/` | **Outside the workspace.** The reference engine, behind a unix socket: the one crate that depends on polkajam's `jam-node` and its `hazmat` feature. Built by `scripts/prepare-nut.sh` from the same revision as the node under test, which is what makes its answers a standard to grade that node by. |
-| `m2-emu` | Five emulated validators (skeletons — no core logic; all values/decisions injected from `m2-reference`): UP 0 announce, CE 128/129 serve, NUT-block fetch (N1), CE 131/132 ticket send/receive (N2), CE 133/146 submission and CE 134/135 share and report receive (N3), CE 137–140 and CE 148 fetch with CE 141 assurances (N4). |
-| `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `n0.rs` (10 checks), `n1.rs` (6), `n2.rs` (7), `n3.rs` (6), `n4.rs` (6), `n6.rs` (3). A check reports one row per thing it graded, so a run's row count is far larger than its check count. |
-| `m2-runner` | CLI: keygen → spec → NUT launch (docker/polkajam presets) → connectivity → scenario (N0–N4) → `report.md`/`findings.json`/trace → exit code. |
+| `m2-emu` | Five emulated validators (skeletons — no core logic; all values/decisions injected from `m2-reference`): UP 0 announce, CE 128/129 serve, NUT-block fetch (N1), CE 131/132 ticket send/receive (N2), CE 133/146 submission and CE 134/135 share and report receive (N3), CE 137–140 and CE 148 fetch with CE 141 assurances (N4), CE 142/143 preimage announce and serve (N6), and `robustness.rs` — the one module that speaks the protocol *wrongly* on purpose, for N7. |
+| `m2-scenario` | The §5 DSL (`check`/`expect_subseq`/`log::check`) + hard-coded lanes: `n0.rs` (11 checks), `n1.rs` (6), `n2.rs` (7), `n3.rs` (7), `n4.rs` (6), `n6.rs` (3), `n7.rs` (5). A check reports one row per thing it graded, so a run's row count is far larger than its check count. |
+| `m2-runner` | CLI: keygen → spec → NUT launch (docker/polkajam presets) → connectivity → scenario (N0–N4, N6, N7) → `report.md`/`findings.json`/trace → exit code. For N7 it also drives the provocations and, on an N7-only run, the kill-and-restart. |
 | `m2-sim` | A simulated node the harness can grade in-process: honest, or broken in one named way, so a check can be shown to fail when it should. |
 
 ## Build and run
@@ -77,14 +83,29 @@ report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,jso
 `M2-status.md` records the milestone evidence in full, and how to point the suite at a
 third-party node.
 
-Latest run, `sessions/n6-5`, all six lanes over a 300 s window: **592 rows, three hard
-findings.** None of the three is the harness's:
+Latest run, `sessions/status-all` (2026-11-24), all seven lanes over a 300 s window:
+**631 rows — 406 hard passes, 40 soft passes, 3 hard findings.** None of the three is the
+harness's, and they are the same three as the previous run:
 
 | row | what it is |
 |---|---|
 | `ce129_boundary_parent_before_child` | a node defect, standing since the first N0 runs |
 | `n2_unknown_epoch_reset_observed` | a node defect: the ticket is rejected, the stream is not reset |
 | `n3_ce146_oversized_refused` | `findings.md` §4 — the node applies the work-package size cap on CE 133 and not on CE 146. Whether the cap binds the receiver at all is unsettled, so this is a question rather than a verdict |
+
+Rows per lane: N0 43, N1 67, N2 133, N3 74, N4 297, N6 5, N7 12.
+
+**The 182 soft rows are mostly one thing.** 127 are
+`n4_ce141_inclusion_not_exercised` — a control the run did not reach, which
+reports itself rather than crediting the node — and 25 are
+`n4_ce141_sent_before_the_slot`. 16 are `rejection_keeps_the_connection`,
+which is `findings.md` §30 seen passively; N7 now provokes the same
+behaviour deliberately and reports 6 of its own. A soft row is a report,
+not a verdict, and an `_not_exercised` row is neither: it is the harness
+declining to grade something it did not exercise.
+
+N7's restart row correctly reports itself unexercised here — the
+kill-and-restart only runs when N7 is the only lane selected.
 
 **Three where earlier runs reported seven, and every one of the four that went was ours.**
 `n3_ce134_answered` was the harness sharing a bundle anchored to a block the node had
@@ -281,8 +302,8 @@ and pins `PvmBackend::Interpreter`.
 | P0 | `jamnp-s`, runner skeleton, N0 | ✅ implemented |
 | P1 | `m2-reference` (now an oracle client), N1 authoring, N2 tickets | ✅ implemented |
 | P2 | N3 guaranteeing, N4 availability | ✅ implemented — graded by name (`--lanes n0,n1,n2,n3,n4`), not by default; see below |
-| P3 | N5 auditing/disputes, N6 preimages | ◑ — **N6 implemented** 2026-11-20 and passing against polkajam. N5's wire format re-specified against the current spec and its codecs rewritten (`findings.md` §28); no N5 lane yet |
-| P4 | N7 adversarial, index rotation, IPv6, web UI | ⏳ |
+| P3 | N5 auditing/disputes, N6 preimages | ◑ — **N6 implemented** 2026-11-20 and passing against polkajam. **N5 parked**: its codecs are written and correct against `aa0e2b8`, but polkajam `main` still speaks the superseded CE 144/145 format and the replacement sits on an unmerged branch, so there is nothing current to grade (`findings.md` §32) |
+| P4 | N7 adversarial, index rotation, IPv6, web UI | ◑ — **N7 implemented in part** 2026-11-23: four of DESIGN §11 N7's nine rows, run against polkajam (`findings.md` §34–36). Index rotation, IPv6 and the web UI not started |
 
 **Why N3 and N4 are not in the default lane set.** A check nobody has seen
 fail is a check nobody knows is a check. Every N4 check is now held to that
@@ -307,6 +328,25 @@ simulated node now refines a bundle it is sent and answers with the
 report's hash, and three faults -- refusing a well-formed share, naming the
 wrong hash, and taking a share coded for the wrong validator count -- each
 cost their own row.
+
+**Why N7 is opt-in, and what it found.** N7 is the only lane that sends the
+node streams no conforming peer would send, so a run that did not ask for it
+is not provoked at all. Each provocation uses a connection of its own, which
+keeps the fallout off other lanes — measured, not assumed: `--lanes n0` and
+`--lanes n0,n7` give identical results. The kill-and-restart row is gated
+further, to runs where N7 is the only lane, because killing the node
+mid-window destroys every other lane's subject.
+
+Against polkajam it found that the node **already has the graceful path** —
+an unassigned stream kind inside the CE span, and a stream held silent for
+30 s, are both answered with a stream reset that leaves the connection
+usable — while three other paths (a kind outside the span, a short message,
+trailing bytes) close the whole connection. That narrows `findings.md` §30
+from "the node closes connections" to one branch handling the unknown well
+and three others treating a malformed stream as a connection-level offence.
+Those rows are **soft**: the NP defines what a reset *means* but nowhere
+requires one over a connection close, and §34 records why grading them hard
+would fail a node on a rule nobody wrote.
 
 **Every row a node can cause in N3 and N4 has now been seen to fail.** The
 last one that could not be reached was the CE 134 mapping row, and getting
