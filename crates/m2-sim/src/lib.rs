@@ -361,6 +361,13 @@ pub enum SimFault {
     /// protocol timeout does; with this fault it waits for one forever, so
     /// a peer can hold streams open for nothing.
     HoldsIdleStreams,
+    /// Stop serving everyone once enough streams have been opened.
+    ///
+    /// The flood defect, and the shape that matters: not that the flooding
+    /// peer is refused -- throttling an abusive peer is correct -- but that
+    /// one peer's load silences the node for every other connection too.
+    /// After [`FLOOD_TOLERANCE`] streams this stand-in answers nobody.
+    StopsServingUnderLoad,
 }
 
 /// Application error code the node resets a refused ticket stream with.
@@ -369,6 +376,13 @@ const TICKET_REFUSED_CODE: u32 = 1;
 /// Application error code for an availability request naming a root this
 /// node does not hold.
 const NO_DATA_CODE: u32 = 2;
+
+/// How many streams [`SimFault::StopsServingUnderLoad`] tolerates before it
+/// stops answering anyone.
+///
+/// Low, because the point is to cross it quickly in a test rather than to
+/// model any real node's capacity.
+const FLOOD_TOLERANCE: u64 = 32;
 
 /// How long this stand-in waits for a stream's first message before
 /// reclaiming it.
@@ -407,6 +421,9 @@ pub struct SimNode {
     chain: Arc<RefChain>,
     genesis_hash: [u8; 32],
     fault: SimFault,
+    /// Streams accepted over this node's life, for
+    /// [`SimFault::StopsServingUnderLoad`].
+    streams_seen: std::sync::atomic::AtomicU64,
     /// Announcements for every live UP 0 stream. Fan-out rather than a held
     /// send half, which is not clonable.
     announce: broadcast::Sender<Vec<u8>>,
@@ -536,6 +553,7 @@ impl SimNode {
             chain,
             genesis_hash,
             fault,
+            streams_seen: std::sync::atomic::AtomicU64::new(0),
             index,
             peers: Mutex::new(Vec::new()),
             announce: broadcast::Sender::new(16),
@@ -1077,6 +1095,19 @@ impl SimNode {
         recv: RecvHalf,
         peer: Option<u16>,
     ) {
+        // Count every accepted stream, and once a flooded node is past its
+        // tolerance refuse *everyone* -- which is the defect N7's flood row
+        // looks for. Refusing only the flooder would be correct behaviour
+        // and would prove nothing.
+        if self.fault == SimFault::StopsServingUnderLoad {
+            let seen = self
+                .streams_seen
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if seen >= FLOOD_TOLERANCE {
+                send.reset(NO_DATA_CODE);
+                return;
+            }
+        }
         let mut reader = StreamReader::new(recv);
         // A stream whose first message never arrives. A real node has a
         // protocol timeout for this; without one, a peer that opens streams

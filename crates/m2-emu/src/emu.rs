@@ -141,6 +141,7 @@ pub struct Emulator {
     provocations: Arc<Mutex<Vec<m2_scenario::scenarios::n7::Provocation>>>,
     nut_alive_after: Arc<Mutex<Option<bool>>>,
     restart: Arc<Mutex<Option<m2_scenario::scenarios::n7::RestartFacts>>>,
+    flood: Arc<Mutex<Option<m2_scenario::scenarios::n7::FloodFacts>>>,
     nut_announced_preimages: m2_scenario::scenarios::n6::HeardAnnouncements,
     sync_probe_pending: Arc<AtomicBool>,
     /// Highest finalized slot the NUT has advertised over UP 0; see
@@ -291,6 +292,8 @@ pub struct EmuShared {
     pub nut_alive_after: Arc<Mutex<Option<bool>>>,
     /// What N7's kill-and-restart produced, where the run did one.
     pub restart: Arc<Mutex<Option<m2_scenario::scenarios::n7::RestartFacts>>>,
+    /// What N7's stream flood produced, where the run ran one.
+    pub flood: Arc<Mutex<Option<m2_scenario::scenarios::n7::FloodFacts>>>,
     /// CE 142 announcements the NUT made, by the peer that heard each one.
     pub nut_announced_preimages: m2_scenario::scenarios::n6::HeardAnnouncements,
     /// Cleared by whichever connection runs the sync probes, so they run once
@@ -479,6 +482,7 @@ impl Emulator {
             provocations: Arc::new(Mutex::new(Vec::new())),
             nut_alive_after: Arc::new(Mutex::new(None)),
             restart: Arc::new(Mutex::new(None)),
+            flood: Arc::new(Mutex::new(None)),
             nut_announced_preimages: Arc::new(Mutex::new(Vec::new())),
             sync_probe_pending: Arc::new(AtomicBool::new(true)),
             nut_final_slot: Arc::new(AtomicU32::new(NO_ADVERTISED_FINAL)),
@@ -672,6 +676,7 @@ impl Emulator {
             provocations: Arc::clone(&self.provocations),
             nut_alive_after: Arc::clone(&self.nut_alive_after),
             restart: Arc::clone(&self.restart),
+            flood: Arc::clone(&self.flood),
             nut_announced_preimages: Arc::clone(&self.nut_announced_preimages),
             sync_probe_pending: Arc::clone(&self.sync_probe_pending),
             nut_final_slot: Arc::clone(&self.nut_final_slot),
