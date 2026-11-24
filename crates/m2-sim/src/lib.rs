@@ -340,6 +340,27 @@ pub enum SimFault {
     /// honest answer is to take the stream and do nothing with it. Sharing
     /// it is the defect `n3_ce133_not_a_guarantor_ignored` names.
     SharesForeignCore,
+    /// Answer a stream it will not serve by closing the whole QUIC
+    /// connection, the way polkajam does (`findings.md` §30).
+    ///
+    /// The close carries a code and a reason, because the N7 row is required
+    /// to quote them: a row that says the node closed the connection without
+    /// saying what it said about it is what made §29 take two rounds.
+    ClosesConnectionOnUnknownKind,
+    /// Take a stream it will not serve and then say nothing at all, holding
+    /// it open until the other side gives up.
+    ///
+    /// Distinct from dropping it: a dropped stream ends, and the initiator
+    /// learns the request is over. This one never answers and never ends,
+    /// which is the outcome N7 grades as a hang.
+    HangsOnUnknownKind,
+    /// Never reclaim a stream that was opened and then went silent.
+    ///
+    /// The slow-loris defect. By default this stand-in gives up on a stream
+    /// whose first message never arrives, which is what a node with a
+    /// protocol timeout does; with this fault it waits for one forever, so
+    /// a peer can hold streams open for nothing.
+    HoldsIdleStreams,
 }
 
 /// Application error code the node resets a refused ticket stream with.
@@ -348,6 +369,14 @@ const TICKET_REFUSED_CODE: u32 = 1;
 /// Application error code for an availability request naming a root this
 /// node does not hold.
 const NO_DATA_CODE: u32 = 2;
+
+/// How long this stand-in waits for a stream's first message before
+/// reclaiming it.
+///
+/// Generous: every lane's emulator sends its opening frame immediately, so
+/// nothing legitimate comes near this, and a bound short enough to be
+/// convenient would start failing lanes for scheduling noise.
+const IDLE_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Byte to flip to break a proof without moving the ticket.
 ///
@@ -1049,7 +1078,31 @@ impl SimNode {
         peer: Option<u16>,
     ) {
         let mut reader = StreamReader::new(recv);
-        let Some((kind, content)) = reader.next().await else {
+        // A stream whose first message never arrives. A real node has a
+        // protocol timeout for this; without one, a peer that opens streams
+        // and goes silent costs the node a stream apiece for as long as it
+        // likes (N7's slow-loris row). The bound is only on the *first*
+        // message, so nothing mid-protocol is cut short, and every lane
+        // here sends its first frame immediately.
+        let first = tokio::time::timeout(IDLE_STREAM_TIMEOUT, reader.next()).await;
+        let first = match first {
+            Ok(first) => first,
+            Err(_) => {
+                if self.fault == SimFault::HoldsIdleStreams {
+                    std::future::pending::<()>().await;
+                }
+                send.reset(NO_DATA_CODE);
+                return;
+            }
+        };
+        let Some((kind, content)) = first else {
+            // No complete message arrived. A stream opened with a kind this
+            // node does not serve is the N7 provocation and never carries
+            // one: there is no message to send on a protocol nobody
+            // defines, so the kind byte is the whole of it.
+            if let Some(opened) = reader.opened_kind() {
+                self.unserved_kind(&connection, opened).await;
+            }
             return;
         };
         match kind {
@@ -1071,8 +1124,23 @@ impl SimNode {
                 self.receive_preimage_announcement(&connection, &content)
                     .await
             }
-            // A real node resets an unserved kind; this one is not graded on
-            // that, so it drops the stream.
+            _ => self.unserved_kind(&connection, kind).await,
+        }
+    }
+
+    /// What this node does with a stream whose kind it does not serve.
+    ///
+    /// By default it drops the stream, which ends it — the quiet disposal
+    /// N7 grades as contained. The two faults pose the other answers a real
+    /// node can give, and `findings.md` §30 says polkajam gives the first.
+    async fn unserved_kind(&self, connection: &Conn, _kind: u8) {
+        match self.fault {
+            SimFault::ClosesConnectionOnUnknownKind => {
+                connection.close(257, "Unknown stream kind");
+            }
+            // Hold the stream forever. Returning would drop both halves and
+            // end it, which is the opposite of the fault being posed.
+            SimFault::HangsOnUnknownKind => std::future::pending::<()>().await,
             _ => {}
         }
     }
@@ -2122,6 +2190,16 @@ struct StreamReader {
     recv: RecvHalf,
     reader: FrameReader,
     buf: [u8; 4096],
+    /// The stream-opening kind byte, as it arrived and before anyone judged
+    /// it.
+    ///
+    /// Kept because `next` cannot report it: a kind naming no protocol makes
+    /// `next_frame` error, and a kind with no message behind it leaves it
+    /// waiting, and both reach the caller as `None`. A real node has already
+    /// dispatched by then -- `simple.md:122-124` puts the protocol in force
+    /// the moment the byte is sent -- so a stand-in that forgets the byte
+    /// cannot model what a node does with a stream it will not serve.
+    opened_kind: Option<u8>,
 }
 
 impl StreamReader {
@@ -2130,7 +2208,13 @@ impl StreamReader {
             recv,
             reader: FrameReader::new(),
             buf: [0u8; 4096],
+            opened_kind: None,
         }
+    }
+
+    /// The kind byte this stream was opened with, once any byte has arrived.
+    fn opened_kind(&self) -> Option<u8> {
+        self.opened_kind
     }
 
     /// The next complete message, or `None` once the stream ends or breaks.
@@ -2143,6 +2227,9 @@ impl StreamReader {
             }
             match self.recv.read(&mut self.buf).await {
                 Ok(Some(n)) => {
+                    if self.opened_kind.is_none() && n > 0 {
+                        self.opened_kind = Some(self.buf[0]);
+                    }
                     let (buf, reader) = (&self.buf, &mut self.reader);
                     reader.push(&buf[..n]);
                 }

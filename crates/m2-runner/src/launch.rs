@@ -163,6 +163,19 @@ pub struct NutProcess {
 /// Returns an I/O error if the program cannot be spawned or the log files
 /// cannot be created.
 pub async fn spawn(cmd: &str, session_dir: &Path) -> std::io::Result<NutProcess> {
+    spawn_tagged(cmd, session_dir, "").await
+}
+
+/// As [`spawn`], with `tag` distinguishing this launch's logs from an
+/// earlier one's.
+///
+/// A restart that reused the same paths would truncate the first run's logs
+/// (`File::create`), losing exactly the output anyone would want to read:
+/// what the node said on its way down. N7's restart row passes `.restart`.
+///
+/// # Errors
+/// As [`spawn`].
+pub async fn spawn_tagged(cmd: &str, session_dir: &Path, tag: &str) -> std::io::Result<NutProcess> {
     let mut tokens = cmd.split_whitespace();
     let program = tokens.next().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty launch command")
@@ -171,8 +184,8 @@ pub async fn spawn(cmd: &str, session_dir: &Path) -> std::io::Result<NutProcess>
 
     let logs = session_dir.join("logs");
     tokio::fs::create_dir_all(&logs).await?;
-    let stdout = logs.join("nut.stdout.log");
-    let stderr = logs.join("nut.stderr.log");
+    let stdout = logs.join(format!("nut{tag}.stdout.log"));
+    let stderr = logs.join(format!("nut{tag}.stderr.log"));
     let stdout_file = std::fs::File::create(&stdout)?;
     let stderr_file = std::fs::File::create(&stderr)?;
 

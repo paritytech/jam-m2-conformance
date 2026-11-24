@@ -2166,3 +2166,201 @@ its code and reason kept apart from an idle timeout and from this side
 hanging up — and the emulator records every one, on the connections it
 dials and the ones it accepts. The accepted half had never been logged at
 all, which is why validator 1 went unnoticed through five sessions.
+
+---
+
+## 34. DESIGN's N7 table expects more than the NP requires
+
+**Status:** open, and it is a defect in our own design document rather than
+in any node. Found 2026-11-23, writing the N7 lane.
+
+**Numbering note.** §32 and §33 exist on the unmerged `jv-n5-auditing`
+branch. This is §34 so the two cannot collide; if N7 lands first there will
+be a gap until N5's branch merges.
+
+DESIGN §11 N7 tabulates the robustness expectations, and marks these hard
+by not marking them soft:
+
+| Fault | Expected |
+|---|---|
+| Unknown stream byte (130, 200) | reset stream, connection stays up |
+| Length prefix mismatch / truncated / trailing bytes | reset, no crash, connection reusable |
+
+**The NP does not say this.** `simple.md:116-120` defines what a reset
+*means* — "resetting/stopping of a stream by the stream acceptor should be
+considered rejection of the request or failure to process the request" —
+and nowhere obliges a node to reject that way rather than by closing the
+connection. Searching `aa0e2b8` for "unknown", "unsupported" and
+"unrecognised" returns nothing in the protocol sections: the document says
+nothing whatever about a kind byte naming no protocol. The one circumstance
+it names for closing a connection is a missing or invalid certificate
+(`:20`).
+
+So a lane that hard-failed a node here would be failing it on a rule nobody
+wrote, which is the mistake §18 and §27 record and the reason
+`n0::connection_close` is already **Soft** with that rationale spelled out.
+Two lanes grading the same behaviour at two severities would also have been
+its own defect.
+
+**What N7 does instead.** Keeps N0's reading: *how* a node rejects is soft
+and reported in the node's own words. One row is hard —
+`n7_node_alive_after` — and it needs no spec text, because a node that a
+malformed message takes down is broken under any reading of any document.
+
+**What this is not.** Not an argument that closing the connection is fine.
+§30 is open and the behaviour is bad: it takes every other protocol with
+that peer down to refuse one stream. The claim here is narrower and only
+about grading — that the harness may report the cost loudly without
+asserting a conformance failure the spec does not define. The place to fix
+this is the NP, and `ask_ce-144-145.md`'s third question already asks a
+neighbouring version of it.
+
+**The rule.** *A design document is not a source of requirements.* DESIGN
+§11's tables were written to plan lanes, and a plan that says "expected:
+reset" is a design intention; only `simple.md` decides what a node owes.
+Every row's severity traces to spec text or to something true without it,
+never to our own table — and where the table and the spec disagree, the
+table is what changes.
+
+---
+
+## 35. The node contains an unassigned stream kind in range, and closes the connection for everything else
+
+**Status:** open, node defect, and a refinement of §30 rather than a new
+one. Measured 2026-11-23 against polkajam `main` at `d92cadd30`, in
+`sessions/n7-1` and reproduced in `sessions/n7-2`. First results from the
+N7 lane.
+
+Four provocations, each on a connection of its own, from an ordinary
+non-validator peer:
+
+| sent | the node | connection after |
+|---|---|---|
+| stream kind **130** (unassigned, inside the CE span) | **reset the stream** | **usable** |
+| stream kind **200** (unassigned, outside it) | closed the connection: `Bad incoming stream protocol 200` (257) | dead |
+| CE 128 message, length prefix claims 4096, 8 bytes sent | closed: `Message size 4096 outside expected range 0..=37` (257) | dead |
+| complete CE 128 request + 16 junk bytes | closed: `Data received but was expecting finish` (257) | dead |
+
+The node stayed up throughout: `n7_node_alive_after` is a hard pass, on a
+fresh connection after all four.
+
+**The first row is the interesting one.** polkajam already does the right
+thing for a kind it does not recognise *inside* the assigned span — resets
+the stream, keeps the connection, and the harness went on to make an
+ordinary CE 128 request on that same connection and get an answer. So the
+graceful path exists and is reachable. Kind 200 takes a different path
+purely because it is out of range, and that path kills the connection.
+
+That makes §30 narrower and more actionable than it looked. It is not "the
+node closes connections when it dislikes something"; it is that **one
+branch handles the unknown gracefully and the others treat a malformed
+stream as a connection-level offence.** The three closes are three
+different code paths — an unknown protocol number, a message-size bound,
+and trailing data — and all three could plausibly do what the first does.
+
+**Why the harness reports this soft.** The NP does not require a reset over
+a connection close; it defines what a reset means (`simple.md:116-120`) and
+names one circumstance for closing a connection, a bad certificate (`:20`).
+§34 records that reasoning in full. The rows say what the node did, in the
+node's own words, and leave the question of whether it is permitted to the
+spec's author. The cost is real regardless: a connection carries every
+protocol with that peer, so refusing one stream this way takes block
+requests, tickets, package sharing and availability with it.
+
+**What the messages are worth to whoever fixes it.** All three name their
+own cause precisely, which is more than §30 had — that finding had to infer
+the provocation from timing. `Message size 4096 outside expected range
+0..=37` even gives CE 128's exact request width (32 + 1 + 4). A node this
+articulate about *what* it refused is a few lines from being equally
+graceful about *how*.
+
+**Two harness defects this run exposed**, neither of which any test caught:
+
+- Every row printed the provoker as "validator 78" — `PROVOKER_PEER` is
+  `0x4E`, outside the validator range on purpose, and the row formatted it
+  as a validator index against a run whose set is 0..=5. That is §8's
+  confusion exactly, reintroduced in the one file whose doc comment cites
+  §8 as the reason the constant is out of range. The unit tests missed it
+  because the fixture used `peer: 1`, a real validator, where the lane
+  always uses the provoker. Fixed, the fixture now uses what the lane uses,
+  and a test asserts no row calls the provoker a validator.
+- The check and its rows shared a name, so the report read
+  `n7_malformed_stream_contained.n7_malformed_stream_contained`. Checks are
+  now named by topic (`n7_containment`, `n7_reuse`, `n7_liveness`) as every
+  other lane names them.
+
+**The rule.** *Read the first real report, not just the test output.* Both
+defects were in code with passing tests, and both were obvious in the first
+line of output from a live run. A fixture that differs from production in
+one field is a fixture that cannot see bugs in that field.
+
+---
+
+## 36. The node has a protocol timeout and survives a restart
+
+**Status:** open only as a record; both results are the node behaving
+correctly. Measured 2026-11-23 against polkajam `main` at `d92cadd30`,
+`sessions/n7-4` through `n7-6`. The second and third N7 rows from DESIGN
+§11's table.
+
+**Slow-loris.** A CE 128 stream opened, named, and then held silent for 30
+seconds with the stream never finished: the node **reset the stream and the
+connection stayed usable**. So polkajam does have a protocol timeout for a
+stream whose first message never arrives, and it reclaims rather than
+accumulating held streams. This is the second row polkajam passes outright,
+and it is the same graceful path §35 found for an unassigned kind inside
+the CE span.
+
+**Kill and restart.** The node was killed mid-run and relaunched on the
+same data directory. It came back on its port, answered an ordinary CE 128
+request on a fresh connection (hard pass), and authored again — slot
+9954365 in `n7-4`, 9954469 in `n7-6`.
+
+So N7 now covers four of nine rows, and polkajam passes two of the five
+provocations outright: an unassigned kind in range, and the slow-loris. The
+three it does not are the three §35 records, all of which close the
+connection.
+
+### Two limits of the restart row, both worth knowing before trusting it
+
+**The harness cannot always say when the node was next due to author.**
+There is no "who authors slot `s`" oracle here: the reference chain authors
+for every validator *but* the node, so the node's turns are the gaps, and
+under Safrole those come from tickets rather than a rotation the harness
+can infer. `next_due_slot` therefore infers a stride from the node's
+earlier blocks and returns `None` unless that stride is regular — which, on
+a ticketed chain, it usually is not.
+
+The first version gated the whole authoring row on that inference and so
+reported itself unexercised against a node that had visibly just authored
+(`sessions/n7-4`). The row now passes on the authoring itself, which needs
+no schedule — a block after the restart is evidence regardless — and uses
+the due-slot control only for the ambiguous case, where the node authored
+nothing and the question is whether it was broken or merely not called on.
+
+**The recovery window is a probability, not a bound.** `n7-5` waited four
+slots and the node never got a turn, so the row reported itself
+unexercised; the window is now eight slots, which made it conclusive in
+`n7-6`. Six validators means a turn roughly every six slots, but "roughly"
+is doing real work there — a run can still legitimately end with nothing to
+grade, and the row says so rather than inventing a verdict.
+
+### What neither row can be tested against
+
+Both are graded by unit tests over `RestartFacts` and by live runs, and by
+nothing in between: `SimNode` runs inside the test process, so there is no
+process to kill and no stand-in that can pose "came back but will not
+serve". The same is true of `n7_node_alive_after`. Three of N7's rows
+therefore have no fault-injection coverage, which is a real gap in §18's
+terms — the rows have been seen passing against a live node and failing
+against fabricated facts, but never failing against a *node* that is wrong.
+
+**Why the restart is gated to N7-only runs.** Killing the node mid-window
+destroys every other lane's subject — N1 loses the blocks it grades, N2's
+tickets go unanswered, N3 has nobody to submit to — and a combined run
+would report all of that as node defects. `LaneSet::restarts_the_node()`
+requires N7 and nothing else. The malformed-stream provocations need no
+such gate, because they go out on connections of their own; that is
+measured, not assumed (`sessions/n0-control` against
+`sessions/n7-3-combined`: 24 hard passes, 3 soft, and the same single known
+failure either way).

@@ -73,6 +73,9 @@ pub(crate) struct RealRunData {
     pub(crate) preimage_requests: Arc<Mutex<Vec<m2_scenario::scenarios::n6::PreimageRequested>>>,
     /// CE 142 announcements the NUT made, by the peer that heard each.
     pub(crate) nut_announced_preimages: m2_scenario::scenarios::n6::HeardAnnouncements,
+    pub(crate) provocations: Arc<Mutex<Vec<m2_scenario::scenarios::n7::Provocation>>>,
+    pub(crate) nut_alive_after: Arc<Mutex<Option<bool>>>,
+    pub(crate) restart: Arc<Mutex<Option<m2_scenario::scenarios::n7::RestartFacts>>>,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
@@ -266,6 +269,11 @@ pub(crate) fn build_real_run_ctx(
         n3: Some(n3),
         n4: Some(n4),
         n6: Some(n6),
+        // N7 only where the run provoked: an empty provocation list from a
+        // run that never tried is not the same as a node that answered
+        // nothing, and the lane's own control would report the first as
+        // the second if it were handed a context either way.
+        n7: build_n7_ctx(data),
     })
 }
 
@@ -980,6 +988,25 @@ pub fn collect_nut_finals(trace: &Trace) -> Vec<NutFinal> {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Build the N7 context, or `None` where the run sent no provocations.
+///
+/// The distinction matters more here than in other lanes. N7's rows all read
+/// "what did the node do when we poked it", so a context with an empty
+/// provocation list says the node did nothing — which is exactly what a run
+/// that never poked it also looks like. Returning `None` keeps "not
+/// attempted" out of the report as a verdict.
+fn build_n7_ctx(data: &RealRunData) -> Option<m2_scenario::scenarios::n7::N7Ctx> {
+    let provocations = data.provocations.lock().expect("the provocations").clone();
+    if provocations.is_empty() {
+        return None;
+    }
+    Some(m2_scenario::scenarios::n7::N7Ctx {
+        provocations,
+        alive_after: *data.nut_alive_after.lock().expect("the liveness check"),
+        restart: data.restart.lock().expect("the restart facts").clone(),
+    })
 }
 
 #[cfg(test)]

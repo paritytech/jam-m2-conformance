@@ -65,6 +65,7 @@ pub struct LaneSet {
     pub n3: bool,
     pub n4: bool,
     pub n6: bool,
+    pub n7: bool,
 }
 
 impl LaneSet {
@@ -79,6 +80,7 @@ impl LaneSet {
             n3: false,
             n4: false,
             n6: false,
+            n7: false,
         };
         for name in raw.split(',').map(str::trim).filter(|n| !n.is_empty()) {
             match name.to_ascii_lowercase().as_str() {
@@ -88,14 +90,15 @@ impl LaneSet {
                 "n3" => set.n3 = true,
                 "n4" => set.n4 = true,
                 "n6" => set.n6 = true,
+                "n7" => set.n7 = true,
                 other => {
                     return Err(format!(
-                        "unknown lane {other:?}; implemented lanes are n0, n1, n2, n3, n4, n6"
+                        "unknown lane {other:?}; implemented lanes are n0, n1, n2, n3, n4, n6, n7"
                     ))
                 }
             }
         }
-        if !(set.n0 || set.n1 || set.n2 || set.n3 || set.n4 || set.n6) {
+        if !(set.n0 || set.n1 || set.n2 || set.n3 || set.n4 || set.n6 || set.n7) {
             return Err("no lanes selected".to_string());
         }
         Ok(set)
@@ -133,6 +136,34 @@ impl LaneSet {
     /// includes (`simple.md:705-707`, `findings.md` §28's successor).
     pub fn needs_preimage(&self) -> bool {
         self.n6
+    }
+
+    /// Whether the run provokes the node with streams it should refuse.
+    ///
+    /// Only N7, and it is kept behind its own flag rather than run always:
+    /// the provocations are the one thing this harness does that a
+    /// conforming peer would not, and a node that answers them by closing
+    /// the connection takes every other lane's connection down with it
+    /// (`findings.md` §30). A run grading N7 has asked for that; a run
+    /// grading N0 has not, and would read the fallout as its own defects.
+    pub fn needs_provocation(&self) -> bool {
+        self.n7
+    }
+
+    /// Whether the run kills and restarts the node under test.
+    ///
+    /// N7 only, **and only when N7 is the lane being graded**. Killing the
+    /// node mid-window destroys every other lane's subject: N1 loses the
+    /// blocks it was grading, N2's tickets go unanswered, N3's submission
+    /// has nobody to submit to. A combined run would report those as node
+    /// defects when they are the harness having shot the node.
+    ///
+    /// The malformed-stream provocations are safe to mix -- they go out on
+    /// connections of their own, which `sessions/n0-control` against
+    /// `sessions/n7-3-combined` confirms. This one is not, and no
+    /// connection-level care can make it so.
+    pub fn restarts_the_node(&self) -> bool {
+        self.n7 && !(self.n0 || self.n1 || self.n2 || self.n3 || self.n4 || self.n6)
     }
 }
 
@@ -278,12 +309,19 @@ mod tests {
                 n2: true,
                 n3: false,
                 n4: false,
-                n6: false
+                n6: false,
+                n7: false
             }
         );
+        // N5 is the unimplemented lane now that N7 exists: it is parked
+        // until polkajam's CE 144/145 redesign reaches `main`
+        // (`findings.md` §32). Asking for it must be refused rather than
+        // silently grading nothing.
         assert!(
-            Cli::try_parse_from(["m2-runner", "--lanes", "n7", "--session-dir", "/tmp/x"]).is_err()
+            Cli::try_parse_from(["m2-runner", "--lanes", "n5", "--session-dir", "/tmp/x"]).is_err()
         );
+        assert!(LaneSet::parse("n5").is_err(), "N5 is not implemented");
+        assert!(LaneSet::parse("n7").is_ok(), "N7 is");
     }
 
     /// Only the ticket lanes need a plan, and proving one is the most

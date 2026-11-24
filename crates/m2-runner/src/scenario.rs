@@ -20,7 +20,7 @@ use m2_scenario::scenarios::n6::N6Ctx;
 use m2_scenario::scenarios::obs::{
     EMU_SENT_131, EMU_SENT_132, RECV_CE131, RECV_CE132, TICKET_REFUSED,
 };
-use m2_scenario::scenarios::{n0, n1, n2, n3, n4, n6};
+use m2_scenario::scenarios::{n0, n1, n2, n3, n4, n6, n7};
 
 use crate::cli::LaneSet;
 use crate::report::{CheckOutcome, Finding};
@@ -33,6 +33,7 @@ pub(crate) struct RunCtx {
     pub n3: Option<N3Ctx>,
     pub n4: Option<N4Ctx>,
     pub n6: Option<N6Ctx>,
+    pub n7: Option<n7::N7Ctx>,
 }
 
 /// The outcome of a run's scenario evaluation.
@@ -90,6 +91,9 @@ pub(crate) fn evaluate(obs: &ObsLog, run_ctx: &RunCtx, selected: LaneSet) -> Eva
     }
     if let (true, Some(ctx)) = (selected.n6, &run_ctx.n6) {
         lanes.push(("N6", n6::all(ctx)));
+    }
+    if let (true, Some(ctx)) = (selected.n7, &run_ctx.n7) {
+        lanes.push(("N7", n7::all(ctx)));
     }
     for (lane, checks) in lanes {
         let (out, finds, hard) = run_lane(lane, &checks, obs);
@@ -755,7 +759,12 @@ pub(crate) fn fabricated_run_ctx(
         authored_after_announcement: true,
     };
 
+    // A dry run provokes nobody, so N7 has no context. The lane reports
+    // itself unexercised rather than fabricating a node that survived: a
+    // dry run's job is to prove the report pipeline works, and a fabricated
+    // pass on a robustness lane would be the one row nobody should trust.
     Ok(RunCtx {
+        n7: None,
         // The fabricated log is written for a NUT at index 0, which initiates
         // to every emulated peer and so never needs a fallback dial.
         n0: n0::N0Ctx {
@@ -819,9 +828,80 @@ mod tests {
         n1: true,
         n2: true,
         n3: true,
+        n7: true,
         n4: true,
         n6: true,
     };
+
+    /// A run that provoked nobody must report no N7 verdicts at all.
+    ///
+    /// The dry run is exactly that case, and it is the one most likely to
+    /// go wrong quietly: `ALL_LANES` asks for N7, so the lane is selected,
+    /// and only the missing context keeps it out of the report. A context
+    /// built unconditionally would turn "we never poked it" into a clean
+    /// robustness pass -- the one row in this suite nobody should be able
+    /// to earn without being poked.
+    #[test]
+    fn a_run_that_provoked_nobody_reports_no_n7_verdict() {
+        let run_ctx = fabricated_run_ctx(&m2_reference::oracle::Oracle::for_tests(), 3)
+            .expect("fabricated run ctx builds");
+        assert!(run_ctx.n7.is_none(), "a dry run provokes nobody");
+        let log = fabricated_obs_log(3);
+        let eval = evaluate(&log, &run_ctx, ALL_LANES);
+        assert!(
+            ALL_LANES.n7 && ALL_LANES.needs_provocation(),
+            "the lane must be selected, or this proves nothing"
+        );
+        let n7: Vec<&str> = eval
+            .outcomes
+            .iter()
+            .filter(|o| o.lane == "N7")
+            .map(|o| o.id.as_str())
+            .collect();
+        assert!(n7.is_empty(), "N7 must be absent, not passed; got {n7:?}");
+    }
+
+    /// And a run that did provoke reports one verdict per provocation.
+    #[test]
+    fn a_provoked_run_reports_one_verdict_per_provocation() {
+        use m2_scenario::scenarios::n7;
+        let mut run_ctx = fabricated_run_ctx(&m2_reference::oracle::Oracle::for_tests(), 3)
+            .expect("fabricated run ctx builds");
+        run_ctx.n7 = Some(n7::N7Ctx {
+            provocations: vec![
+                n7::Provocation {
+                    peer: n7::PROVOKER_PEER,
+                    fault: n7::Fault::UnknownKind(130),
+                    outcome: n7::StreamOutcome::Reset,
+                    connection_reusable: Some(true),
+                    at_wall_ms: 1_000,
+                },
+                n7::Provocation {
+                    peer: n7::PROVOKER_PEER,
+                    fault: n7::Fault::UnknownKind(200),
+                    outcome: n7::StreamOutcome::Reset,
+                    connection_reusable: Some(true),
+                    at_wall_ms: 1_100,
+                },
+            ],
+            alive_after: Some(true),
+            restart: None,
+        });
+        let log = fabricated_obs_log(3);
+        let eval = evaluate(&log, &run_ctx, ALL_LANES);
+        let contained = eval
+            .outcomes
+            .iter()
+            .filter(|o| o.lane == "N7" && o.id.contains("contained"))
+            .count();
+        assert_eq!(contained, 2, "one containment row per provocation");
+        assert!(
+            eval.outcomes
+                .iter()
+                .any(|o| o.lane == "N7" && o.id.contains("alive") && o.passed),
+            "and the liveness row must be reported"
+        );
+    }
 
     #[test]
     fn evaluate_reports_lanes() {

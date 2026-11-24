@@ -132,6 +132,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
     };
 
     let mut nut: Option<NutProcess> = None;
+    // Kept for N7's restart row, which relaunches the node with the command
+    // it was launched with.
+    let mut nut_cmd: Option<String> = None;
     let mut conn_findings: Vec<Finding> = Vec::new();
     // N0 facts the connectivity phase establishes. A dry run leaves them at
     // the conforming values, since it fabricates a conforming node.
@@ -154,6 +157,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             Preset::Docker => launch::preset_docker(&cfg).replace("{image}", &image),
             Preset::Mock => "sleep 30".to_string(),
         };
+        nut_cmd = Some(cmd.clone());
         nut = Some(launch::spawn(&cmd, session_dir).await.map_err(startup)?);
         if !wait_for_nut(nut_addr, &nut_san, genesis_hash, cli.startup_timeout).await {
             if let Some(nut) = nut.take() {
@@ -445,6 +449,18 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             }
             phase("plan_package", t);
         }
+        // N7 last among the dialled tasks, and on connections of its own.
+        // The provocations are the one thing here a conforming peer would
+        // not do, and a node that answers by closing the connection
+        // (`findings.md` §30) must cost this lane its connection and no
+        // other lane theirs.
+        if cli.lanes.needs_provocation() {
+            let shared_for_n7 = shared.clone();
+            let san = nut_san.clone();
+            dial_tasks.push(tokio::spawn(async move {
+                provoke_node(nut_addr, san, genesis_hash, shared_for_n7).await;
+            }));
+        }
         let submissions = emu.submissions();
         let sharing_answer = emu.sharing_answer();
         let distributed = emu.distributed();
@@ -478,6 +494,9 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             preimages_announced: Arc::clone(&shared.preimages_announced),
             preimage_requests: Arc::clone(&shared.preimage_requests),
             nut_announced_preimages: Arc::clone(&shared.nut_announced_preimages),
+            provocations: Arc::clone(&shared.provocations),
+            nut_alive_after: Arc::clone(&shared.nut_alive_after),
+            restart: Arc::clone(&shared.restart),
             ref_chain,
             nut_blocks,
             deliveries,
@@ -520,6 +539,31 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             .sleep(Duration::from_secs(cli.observe_secs))
             .await;
         phase("observation_window", t);
+    }
+    // N7's kill-and-restart, after the window and before the emulator is
+    // torn down: the dial tasks are still running, so the node has peers to
+    // re-sync from and the slot driver is still authoring for it to catch up
+    // to. Inline rather than spawned because it owns the node process.
+    if cli.lanes.restarts_the_node() {
+        if let (Some(process), Some(cmd)) = (nut.take(), nut_cmd.clone()) {
+            let t = std::time::Instant::now();
+            let (facts, relaunched) = restart_the_node(
+                process,
+                &cmd,
+                session_dir,
+                nut_addr,
+                &nut_san,
+                genesis_hash,
+                cli.startup_timeout,
+                real_run.as_ref(),
+            )
+            .await;
+            nut = relaunched;
+            if let Some(data) = real_run.as_ref() {
+                *m2_emu::emu::lock(&data.restart) = facts;
+            }
+            phase("n7_restart", t);
+        }
     }
     // Abort rather than drop: dropping a `JoinHandle` detaches the task, so the
     // slot driver would keep authoring into the reference chain while the
@@ -1857,6 +1901,349 @@ fn internal(e: impl std::fmt::Display) -> RunError {
 
 fn startup(e: impl std::fmt::Display) -> RunError {
     RunError::Startup(e.to_string())
+}
+
+/// How long to let the node re-sync and get a chance to author after a
+/// restart.
+///
+/// Eight slots, which is longer than it looks it needs to be. The tiny
+/// preset has six validators, so a turn comes round about every six slots —
+/// but under Safrole the turns come from tickets, not a rotation, so six is
+/// a median rather than a guarantee. `sessions/n7-5` waited four and the
+/// node never got a turn, leaving the authoring row with nothing to grade;
+/// eight makes that the exception rather than the coin-flip it was.
+///
+/// A node that needs longer still is reported as not having resumed, which
+/// the soft row says in those words rather than calling it broken.
+const RESTART_RECOVERY_SLOTS: u32 = 8;
+
+/// Kill the node, start it again, and record what it did (N7).
+///
+/// Returns the facts and the relaunched process, or `None` for the process
+/// if it could not be brought back — in which case the hard row fails, which
+/// is the correct verdict rather than an error that abandons the run.
+#[allow(clippy::too_many_arguments)]
+async fn restart_the_node(
+    process: launch::NutProcess,
+    cmd: &str,
+    session_dir: &std::path::Path,
+    nut_addr: SocketAddr,
+    nut_san: &str,
+    genesis_hash: [u8; 32],
+    startup_timeout: u64,
+    data: Option<&crate::real::RealRunData>,
+) -> (
+    Option<m2_scenario::scenarios::n7::RestartFacts>,
+    Option<launch::NutProcess>,
+) {
+    use m2_scenario::scenarios::n7::RestartFacts;
+
+    // The slots it authored in before the kill, which is the only basis this
+    // harness has for saying when it was next due.
+    let Some(data) = data else {
+        return (None, None);
+    };
+    let before: Vec<u32> = m2_emu::emu::lock(&data.nut_blocks)
+        .iter()
+        .map(|n| n.block.header.slot)
+        .collect();
+
+    let killed_at_wall_ms = jamnp_s::clock::current().wall_ms();
+    eprintln!("[n7] killing the node at wall {killed_at_wall_ms} ms");
+    if let Err(e) = launch::kill(process).await {
+        eprintln!("[n7] could not reap the node: {e}");
+    }
+
+    let relaunched = match launch::spawn_tagged(cmd, session_dir, ".restart").await {
+        Ok(process) => process,
+        Err(e) => {
+            eprintln!("[n7] the node could not be relaunched: {e}");
+            return (
+                Some(RestartFacts {
+                    killed_at_wall_ms,
+                    restarted_at_wall_ms: jamnp_s::clock::current().wall_ms(),
+                    served_again: Some(false),
+                    authored_after: Vec::new(),
+                    first_due_slot: next_due_slot(&before),
+                }),
+                None,
+            );
+        }
+    };
+    // The restart's own probe writes here. The run's shared trace belongs
+    // to the emulator's tasks, which are still running; a second writer at
+    // teardown time would interleave into the trace file mid-record.
+    let restart_trace = std::sync::Mutex::new(jamnp_s::trace::Trace::default());
+    let came_up = wait_for_nut(nut_addr, nut_san, genesis_hash, startup_timeout).await;
+    let restarted_at_wall_ms = jamnp_s::clock::current().wall_ms();
+    eprintln!("[n7] relaunched; back on its port: {came_up}");
+
+    // Does it serve again? Asked from a connection of its own, as the
+    // liveness row is, so this says the node recovered rather than that some
+    // earlier connection did.
+    let served_again = if came_up {
+        let mut seed = [0u8; 32];
+        seed[0] = 0x4E;
+        seed[1] = 0xFE;
+        use jamnp_s::transport::Transport as _;
+        match jamnp_s::transport::quic::QuicTransport
+            .connect(
+                jamnp_s::endpoint::EndpointConfig {
+                    genesis_hash,
+                    builder: false,
+                },
+                ed25519_consensus::SigningKey::from(seed),
+                nut_san.to_string(),
+                nut_addr,
+            )
+            .await
+        {
+            Ok(connection) => {
+                let serves = m2_emu::robustness::connection_still_serves(
+                    &connection,
+                    m2_scenario::scenarios::n7::PROVOKER_PEER,
+                    data.ref_chain.genesis_hash(),
+                    &restart_trace,
+                )
+                .await;
+                drop(connection);
+                Some(serves)
+            }
+            Err(e) => {
+                eprintln!("[n7] could not reconnect after the restart: {e}");
+                Some(false)
+            }
+        }
+    } else {
+        Some(false)
+    };
+
+    // Give it slots to catch up and take a turn.
+    let resume_from = m2_reference::chain::wall_clock_slot();
+    sleep_until_slot(resume_from + RESTART_RECOVERY_SLOTS).await;
+    let authored_after: Vec<u32> = m2_emu::emu::lock(&data.nut_blocks)
+        .iter()
+        .map(|n| n.block.header.slot)
+        .filter(|slot| !before.contains(slot))
+        .collect();
+    eprintln!(
+        "[n7] after the restart the node served: {served_again:?}; authored slots {authored_after:?}"
+    );
+
+    (
+        Some(RestartFacts {
+            killed_at_wall_ms,
+            restarted_at_wall_ms,
+            served_again,
+            authored_after,
+            first_due_slot: next_due_slot(&before),
+        }),
+        Some(relaunched),
+    )
+}
+
+/// When the node is next due to author, inferred from the slots it authored
+/// in before the restart.
+///
+/// **Inference, not schedule.** This harness has no "who authors slot `s`"
+/// oracle: the reference chain authors for every validator *but* the node,
+/// so the node's turns are the gaps. Where the node took its turns at a
+/// steady stride — one per validator-set rotation, which is what the tiny
+/// preset produces — the next one is the last plus that stride.
+///
+/// Returns `None` from fewer than two observed blocks or an irregular
+/// stride, and the row then reports itself unexercised. That is the right
+/// answer: a due slot guessed wrong would fail a node for the guess.
+fn next_due_slot(before: &[u32]) -> Option<u32> {
+    let mut slots: Vec<u32> = before.to_vec();
+    slots.sort_unstable();
+    slots.dedup();
+    if slots.len() < 2 {
+        return None;
+    }
+    let strides: Vec<u32> = slots.windows(2).map(|w| w[1] - w[0]).collect();
+    let first = strides[0];
+    if !strides.iter().all(|s| *s == first) {
+        return None;
+    }
+    slots.last().map(|last| last + first)
+}
+
+/// How many slots into the run before N7 provokes the node.
+///
+/// Late enough that the other lanes have their connections established and
+/// their early work done, so a node that answers a provocation by closing
+/// connections has already been observed behaving normally — the difference
+/// between "it was broken" and "we broke it" is the ordering here.
+const PROVOKE_AFTER_SLOTS: u32 = 6;
+
+/// How long N7 holds a stream open saying nothing.
+///
+/// DESIGN §11 N7 says 30 s. The number is the harness's patience, not a
+/// bound the NP sets: a node that reclaims the stream at 31 s is reported
+/// as having held it, so the row is soft and says how long it waited.
+const SLOW_LORIS_SILENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Open streams the node should refuse, and record what survived (N7).
+///
+/// Every provocation gets a **fresh connection**. Two reasons, and the
+/// second is the one that matters: a node that closes the connection on the
+/// first provocation would otherwise leave the rest with nothing to send on,
+/// so the lane would report one finding and three absences; and reuse is
+/// measured on the connection the provocation was sent to, which only means
+/// anything if that connection carried the provocation and nothing else.
+///
+/// Liveness is measured last and on a connection of its own, because it asks
+/// a different question — whether the *node* survived, not whether the
+/// connection did.
+async fn provoke_node(
+    addr: SocketAddr,
+    expected_san: String,
+    genesis_hash: [u8; 32],
+    shared: m2_emu::emu::EmuShared,
+) {
+    use m2_emu::robustness;
+    sleep_until_slot(m2_reference::chain::wall_clock_slot() + PROVOKE_AFTER_SLOTS).await;
+    let genesis = shared.ref_chain.genesis_hash();
+
+    // An ordinary peer, as N6 uses: a key outside the validator set. A
+    // validator's connection would do on the wire, but provoking from one
+    // conflates "what does it do with a bad stream" with "what does it do
+    // with a bad stream from a peer it has duties toward".
+    let dial = async |nonce: u8| {
+        let mut seed = [0u8; 32];
+        seed[0] = 0x4E;
+        seed[1] = nonce;
+        use jamnp_s::transport::Transport as _;
+        jamnp_s::transport::quic::QuicTransport
+            .connect(
+                jamnp_s::endpoint::EndpointConfig {
+                    genesis_hash,
+                    builder: false,
+                },
+                ed25519_consensus::SigningKey::from(seed),
+                expected_san.clone(),
+                addr,
+            )
+            .await
+    };
+
+    // The faults, in increasing order of how much the node has to read
+    // before it can object: a kind byte naming no protocol, then a message
+    // that ends early, then one that is complete with junk behind it.
+    for (nonce, which) in [(0u8, 0u8), (1, 1), (2, 2), (3, 3), (4, 4)].iter() {
+        let connection = match dial(*nonce).await {
+            Ok(connection) => connection,
+            Err(e) => {
+                eprintln!("[n7] could not connect to provoke ({which}): {e}");
+                continue;
+            }
+        };
+        let mut provocation = match which {
+            0 => {
+                robustness::unknown_kind(
+                    &connection,
+                    m2_scenario::scenarios::n7::PROVOKER_PEER,
+                    robustness::UNASSIGNED_IN_RANGE,
+                    &shared.trace,
+                )
+                .await
+            }
+            1 => {
+                robustness::unknown_kind(
+                    &connection,
+                    m2_scenario::scenarios::n7::PROVOKER_PEER,
+                    robustness::UNASSIGNED_OUT_OF_RANGE,
+                    &shared.trace,
+                )
+                .await
+            }
+            2 => {
+                robustness::truncated_message(
+                    &connection,
+                    m2_scenario::scenarios::n7::PROVOKER_PEER,
+                    jamnp_s::framing::CE128,
+                    4096,
+                    8,
+                    &shared.trace,
+                )
+                .await
+            }
+            4 => {
+                // Opened, named, and then silent. Last of the five because
+                // it is the only one that costs real time: the fault is the
+                // wait, so the harness has to out-wait the node's protocol
+                // timeout to learn whether it has one.
+                robustness::slow_loris(
+                    &connection,
+                    m2_scenario::scenarios::n7::PROVOKER_PEER,
+                    jamnp_s::framing::CE128,
+                    SLOW_LORIS_SILENCE,
+                    &shared.trace,
+                )
+                .await
+            }
+            _ => {
+                // A real CE 128 request, so what the node objects to is the
+                // junk behind it and not the request itself.
+                use jam_types::{Encode, HeaderHash};
+                use jamnp_s::codec::ce128_129::{BlockRequest, Direction};
+                let request = BlockRequest {
+                    header_hash: HeaderHash::from(genesis),
+                    direction: Direction::AscendingExclusive,
+                    max_blocks: 1,
+                };
+                robustness::trailing_bytes(
+                    &connection,
+                    m2_scenario::scenarios::n7::PROVOKER_PEER,
+                    jamnp_s::framing::CE128,
+                    &request.encode(),
+                    16,
+                    &shared.trace,
+                )
+                .await
+            }
+        };
+        provocation.connection_reusable = Some(
+            robustness::connection_still_serves(
+                &connection,
+                m2_scenario::scenarios::n7::PROVOKER_PEER,
+                genesis,
+                &shared.trace,
+            )
+            .await,
+        );
+        eprintln!(
+            "[n7] {} -> the node {}; connection reusable: {}",
+            provocation.fault.describe(),
+            provocation.outcome.describe(),
+            provocation.connection_reusable.unwrap_or(false)
+        );
+        m2_emu::emu::lock(&shared.provocations).push(provocation);
+        drop(connection);
+    }
+
+    // And is the node still there at all? A fresh connection, because the
+    // ones above may have been closed on purpose and that is not the
+    // question this row asks.
+    let alive = match dial(0xFF).await {
+        Ok(connection) => {
+            let serves = robustness::connection_still_serves(
+                &connection,
+                m2_scenario::scenarios::n7::PROVOKER_PEER,
+                genesis,
+                &shared.trace,
+            )
+            .await;
+            drop(connection);
+            serves
+        }
+        Err(e) => {
+            eprintln!("[n7] the node refused a fresh connection after the provocations: {e}");
+            false
+        }
+    };
+    *m2_emu::emu::lock(&shared.nut_alive_after) = Some(alive);
 }
 
 #[cfg(test)]
