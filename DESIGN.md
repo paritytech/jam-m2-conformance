@@ -756,8 +756,8 @@ validator chosen by the same helper above.
 
 | Fault | Expected | Status |
 |---|---|---|
-| Unknown stream byte (130, 200) | reset stream, connection stays up | **built** |
-| Length prefix mismatch / truncated / trailing bytes | reset, no crash, connection reusable | **built** |
+| Unknown stream byte (130, 200) | the node is still serving afterwards. *How* it refuses — stream reset or connection close — is reported in its own words, not asserted *(soft)* | **built**, `findings.md` §34 |
+| Length prefix mismatch / truncated / trailing bytes | no crash, and the node is still serving afterwards. The refusal path is reported, not asserted *(soft)* | **built**, `findings.md` §34 |
 | Slow-loris CE stream (kind byte then 30 s silence) | timeout and reset *(soft)* | **built** |
 | Flood: 500 CE 141 streams per second from one peer | stays responsive; authors on time | **built**, `findings.md` §37 |
 | Kill and restart NUT mid-epoch | re-syncs via CE 128/129; authors again in its next slot | **built**, `findings.md` §36 |
@@ -767,6 +767,22 @@ validator chosen by the same helper above.
 | Epoch-transition connectivity `:86-98` | with a scheduled validator-set change: connect to the next set, keep the old set until the first block of the epoch is finalized **and** one slot elapsed; UP 0 topology re-evaluated `:200-202` | **blocked**, `findings.md` §40 |
 
 Out of scope: GRANDPA/BEEFY (no JAMNP-S spec). Finality is emulated by the harness (§10).
+
+**The first two rows used to say "reset stream, connection stays up", and
+that was this table inventing a requirement.** `simple.md:116-120` defines
+what a reset *means* — rejection, or failure to process — and nowhere
+obliges a node to refuse that way rather than by closing the connection;
+the one circumstance the document names for closing one is a missing or
+invalid certificate (`:20`). polkajam confirmed on 2026-11-25 that closing
+on a malformed message is deliberate, for DoS reasons, so the stricter
+reading would have failed a node on a rule nobody wrote. What stays hard
+is `n7_node_alive_after`, which needs no spec text: a node that a
+malformed message takes down is broken under any reading of any document.
+`findings.md` §34 has the argument, §30 and §35 the answers.
+
+*A design document is not a source of requirements.* These tables plan
+lanes; only `simple.md` decides what a node owes, and where the two
+disagree this table is what changes.
 
 **Six of the nine are built and three are blocked; none is unstarted.**
 That is the whole lane accounted for, and the distinction matters because

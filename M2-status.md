@@ -855,7 +855,7 @@ rows — 406 hard passes, 40 soft passes, 3 hard findings.**
 | N0 connectivity and sync | UP 0, CE 128, CE 129 | 43 | 1 hard failure: `ce129_boundary_parent_before_child`, a node defect standing since the first runs |
 | N1 authoring | asserted over UP 0 and CE 128 | 67 | clean; parent, seal and prior/posterior state roots graded per block |
 | N2 Safrole tickets | CE 131, CE 132 | 133 | 1 hard failure: `n2_unknown_epoch_reset_observed` — the ticket is refused, the stream is not reset |
-| N3 guaranteeing | CE 133, CE 146, CE 134, CE 135 | 74 | 1 hard failure: `n3_ce146_oversized_refused` — `findings.md` §4, a question rather than a verdict |
+| N3 guaranteeing | CE 133, CE 146, CE 134, CE 135 | 74 | 1 hard failure: `n3_ce146_oversized_refused` — `findings.md` §4, **confirmed a node bug** by polkajam 2026-11-25 |
 | N4 availability | CE 137–141, CE 148 | 297 | clean on hard rows; 127 soft rows are one unexercised control |
 | N6 preimages | CE 142, CE 143 | 5 | clean |
 | N7 adversarial | malformed streams, restart | 12 | 6 soft failures — `findings.md` §35; the restart row is correctly unexercised outside an N7-only run |

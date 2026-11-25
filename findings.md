@@ -226,10 +226,15 @@ which closes the sampling gap this entry was left with.
 
 ---
 
-## 4. The node applies the work-package size cap on CE 133 and not on CE 146
+## 4. The node applies the work-package size cap on CE 133 and not on CE 146 — CLOSED 2026-11-25
 
-**Status:** open, narrowed, and most of what this finding used to say was
-wrong. Opened 2026-11-15 as "the node accepts a CE 133 first message over
+**Status:** closed 2026-11-25, a **confirmed node defect**. Answered by
+polkajam in issue #36: *"I mean it's up to the implementation but PolkaJam
+should be rejecting oversized packages in both cases. If it isn't then that
+is a bug."* The row is right, its severity is right, and the hedge it has
+been carrying in three documents is removed.
+
+Opened 2026-11-15 as "the node accepts a CE 133 first message over
 the size cap". Rewritten 2026-11-20, when §8's investigation showed the
 node had been enforcing that cap all along and the harness could not see
 the refusal.
@@ -283,22 +288,30 @@ that carries the spec's number is the one that was written for this
 protocol. `simple.md:383` states CE 146's cap in the same SHOULD form and
 with the same rationale as `:362-364`.
 
-**The question that survives.** Whether the cap binds the receiver at all
-is still unsettled, and it is still a question for the conformance group
-rather than the harness: `:362-364` and `:383` are both **should**, both
-addressed to the message, and both justified by a protection offered to
-guarantors, which reads more like a licence to refuse than a duty to.
+**The question that survived, and its answer.** The question put was
+whether the cap binds the receiver at all: `:362-364` and `:383` are both
+**should**, both addressed to the message, and both justified by a
+protection offered to guarantors, which reads more like a licence to refuse
+than a duty to. The finding had already narrowed it — polkajam could no
+longer be cited as a node taking the permissive reading, because it takes
+the strict one on CE 133, which made CE 146 look like an oversight rather
+than a position.
 
-What has changed is that polkajam can no longer be cited as a node that
-takes the permissive reading. It takes the strict one on CE 133. The
-likelier reading of CE 146 is now an oversight rather than a position.
+It was an oversight. The answer confirms it directly, and the row grades a
+real defect.
 
-**What this costs the question put to the spec authors.** `ask_dave.md` is
-written around the claim corrected above and must not be sent as it stands.
+**What the answer does not settle.** It is about this node's intent, not
+about the protocol: *"it's up to the implementation, but"*. So the
+**should**/**must** reading of `:362` and `:383` stays open, and matters
+the first time this suite is pointed at a second implementation — a node
+that accepts an over-cap package on both protocols has not been shown to
+violate anything the document requires. The row is correct against
+polkajam, which is the only node that has ever been graded. §39's answer
+came with *"we can probably say in JAM-NP that…"*; this one did not, and
+the difference is worth keeping.
 
 `n3_ce133_oversized_refused` passes against polkajam as of 2026-11-20.
-`n3_ce146_oversized_refused` fails, and is the only part of this finding
-with a live failure behind it.
+`n3_ce146_oversized_refused` fails, and that failure is now a verdict.
 
 ---
 
@@ -2066,9 +2079,28 @@ node's. This one differs: the row was right and the *subject* was missing.
 The node really did not reach validator 4, because there was nothing there
 to reach.
 
-## 30. A message the node refuses closes the whole connection
+## 30. A message the node refuses closes the whole connection — CLOSED 2026-11-25
 
-**Status:** open, and it is a node defect. Found 2026-11-19, chasing §29's
+**Status:** closed 2026-11-25. **Not a defect — intended behaviour**,
+answered by polkajam in issue #36: *"If you send a malformed message then
+you are not following the protocol and PolkaJam will close the connection.
+This is intended."* The stated reasons are avoiding a DoS and clearing a
+transient connection fault by turning it off and on again.
+
+The finding had already concluded this was a policy question rather than a
+bug, and had already kept the row **Soft** on that reading. The answer
+settles the policy in the node's favour, so the row stays soft permanently
+rather than pending a decision, and the escalation stops being something
+the harness reports as wrong.
+
+**What the finding keeps.** The cost is real and the measurement stands:
+refusing one message takes down every unrelated protocol in flight with
+that peer, and a peer cannot tell "this message was rejected" from "this
+connection failed". That is recorded as a cost, not an accusation — and
+it is why the harness reports each close in the node's own words rather
+than silently.
+
+Found 2026-11-19, chasing §29's
 open half: a connection to one emulated validator that ended every few
 slots and nothing could explain.
 
@@ -2247,6 +2279,26 @@ to act on a preimage no service had requested is the rule working.
 ## 32. The node implements the superseded CE 144/145 wire format
 
 **Status:** open, but **not** the node finding it first looked like.
+
+**One answer landed 2026-11-25** (issue #36) and it is a node-side bug for
+whenever N5 unparks: *"Yeah we should accept batched CE 144/145 messages.
+This was recently added to the spec so possibly just not implemented fully
+yet. Possibly there should be a maximum in the spec but this is likely to
+be reworked again for gossiping so not going to worry about that for
+now..."*
+
+So the `ConstU32<1>` receive caps on the tranche-redesign branch are an
+unfinished implementation rather than a position, batching is something a
+receiver **must** accept, and a batch-receive row is a legitimate hard row
+when the lane is built. No maximum is coming, deliberately — which means
+the row asserts that a batch of two is accepted, not that a batch of N is
+refused.
+
+**The other half of that question got no answer**, and is worth re-asking:
+`aa0e2b8` is not backward-compatible with `a96dc6b`, and a single positive
+CE 145 judgment is byte-identical between the two revisions. Two nodes a
+revision apart agree perfectly until the first negative judgment. Nothing
+in the document says so.
 Found 2026-11-20 while starting N5, and corrected the same day: the fix is
 already written upstream, on a branch that has not reached `main`. What is
 left is an integration-timing finding, which is a different thing to report
@@ -2520,10 +2572,22 @@ that governs it, not only the lines that moved.*
 
 ---
 
-## 34. DESIGN's N7 table expects more than the NP requires
+## 34. DESIGN's N7 table expects more than the NP requires — CLOSED 2026-11-25
 
-**Status:** open, and it is a defect in our own design document rather than
-in any node. Found 2026-11-23, writing the N7 lane.
+**Status:** closed 2026-11-25. A defect in our own design document rather
+than in any node, found 2026-11-23 writing the N7 lane, and **fixed where
+it was**: DESIGN §11 N7's first two rows no longer state "reset stream,
+connection stays up" as the expectation. They now say the node is still
+serving afterwards, and that *how* it refuses is reported in its own words
+rather than asserted.
+
+Closing it needed two things. The argument below, which was always the
+harness's own reading of `simple.md`; and polkajam's answer of 2026-11-25
+(issue #36), which confirms the behaviour is deliberate rather than an
+oversight — *"If you send a malformed message then you are not following
+the protocol and PolkaJam will close the connection. This is intended."*
+§30 and §35 record it in full. The table had been describing a
+requirement that neither the document nor the implementer agrees exists.
 
 **Numbering note.** §32 and §33 exist on the unmerged `jv-n5-auditing`
 branch. This is §34 so the two cannot collide; if N7 lands first there will
@@ -2573,11 +2637,37 @@ Every row's severity traces to spec text or to something true without it,
 never to our own table — and where the table and the spec disagree, the
 table is what changes.
 
+**What it cost to leave the table unfixed for two days.** Nothing, as it
+happens, because the lane was written to the spec and not to the table.
+But that is luck rather than process: the next lane written from these
+tables would have inherited the invented requirement, and the finding that
+caught it only exists because someone compared the two by hand. The fix
+belongs in the table, which is where the next reader looks — recording it
+in `findings.md` alone would have left the trap armed.
+
 ---
 
-## 35. The node contains an unassigned stream kind in range, and closes the connection for everything else
+## 35. The node contains an unassigned stream kind in range, and closes the connection for everything else — CLOSED 2026-11-25
 
-**Status:** open, node defect, and a refinement of §30 rather than a new
+**Status:** closed 2026-11-25. **Not a defect — a deliberate exception**,
+answered by polkajam in issue #36: *"As an exception we do not currently
+reject invalid stream protocol IDs. The reason for this is to achieve some
+degree of forward-compatibility. This could change in the future once the
+initial version of the protocol is finalized."*
+
+So the asymmetry this finding measured — kind 130 contained, everything
+else closing — is not an inconsistency. It is one rule with one stated
+exception, for a stated reason, with a stated expiry. The harness should
+not grade a node for being *more* forgiving on exactly the path where
+forward-compatibility is the point.
+
+**Worth keeping for later.** The exception is explicitly temporary. A
+future polkajam may close the connection on an unassigned kind too, and a
+row that hard-asserts today's containment on kind 130 would then fail a
+node for conforming to the finalized protocol. N7's containment rows are
+Soft, which is why this costs nothing — see §34.
+
+A refinement of §30 rather than a new
 one. Measured 2026-11-23 against polkajam `main` at `d92cadd30`, in
 `sessions/n7-1` and reproduced in `sessions/n7-2`. First results from the
 N7 lane.
@@ -2947,6 +3037,20 @@ trivially floodable, so the restriction is defensible engineering. But the
 two documents disagree, and a conformance harness cannot grade this until
 they agree.
 
+**Answered 2026-11-25** in issue #36: *"This is working as intended. We can
+probably say in JAM-NP that validators should not make block requests to
+non-neighbour validators."* The node is right and the NP is the document
+that moves.
+
+Note which way the amendment runs. We read the gap as the node being
+stricter than the protocol permits; the fix proposed is to restrict the
+*requester* instead — a validator should not ask a non-neighbour, rather
+than a node must serve whoever asks. The harness's fix is unaffected
+either way, because it stopped the probe asking a non-neighbour, which is
+exactly what the amendment would require of it. But a harness built on our
+reading would have gone on to assert that a node must serve any validator,
+and that row would have been wrong.
+
 ### What the row cost and bought
 
 The row found both on its first use, which is the argument for it. It also
@@ -3162,7 +3266,7 @@ Three runs at indices 1, 3 and 5 after the fix (`sessions/fix41-k1`,
 All three indices now fail exactly the same three rows, every one of them
 index-independent and already known: `ce129_boundary_parent_before_child`
 (a standing node defect), `n2_unknown_epoch_reset_observed`, and
-`n3_ce146_oversized_refused` (the verdict §4 asks the NP owner about).
+`n3_ce146_oversized_refused` (since confirmed a node bug — §4).
 
 Index 1 reproduced the original N3 shape beat for beat, which is what makes
 the diagnosis more than a plausible story: the distribution went out on
