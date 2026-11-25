@@ -206,8 +206,29 @@ pub struct AssuranceOffered {
     /// Whether the NUT authored any block after it was sent. Without one
     /// there was no opportunity to include anything.
     pub had_opportunity: bool,
+    /// A slot the NUT owned, left empty, and whose block would have had
+    /// this assurance's anchor as its parent.
+    ///
+    /// The difference between "the node never got a turn" and "the node got
+    /// a turn and lost it", which the lane could not tell apart until
+    /// `findings.md` §22 showed they are opposite facts: an invalid
+    /// assurance the node pools and cannot then author past costs it the
+    /// block entirely, and `had_opportunity` reads that as no coverage.
+    pub cost_a_slot: Option<u32>,
     /// Deliberately invalid, and so expected to be left out.
     pub fault: Option<AssuranceFaultKind>,
+}
+
+/// One turn the NUT owned, left empty, and the false claims that were in
+/// its pool at the time.
+///
+/// The unit `n4_ce141_invalid_assurance_cost_a_block` grades. A slot is
+/// lost once however many peers lied about it, so the peers are gathered
+/// under the slot rather than the slot repeated under each peer.
+struct LostTurn {
+    slot: u32,
+    anchor: [u8; 32],
+    blamed: Vec<(u16, AssuranceFaultKind)>,
 }
 
 /// An assurance the harness spoiled on purpose.
@@ -222,6 +243,24 @@ pub enum AssuranceFaultKind {
 }
 
 impl AssuranceFaultKind {
+    /// Whether a receiver can only catch this fault at block composition.
+    ///
+    /// `WrongAnchor` names a block that does not exist and `BadSignature`
+    /// does not verify, so both are refusable the moment they arrive —
+    /// polkajam refuses the second by closing the connection, which is
+    /// visible in any run's log. `EmptyCore` passes every check a receiver
+    /// makes: it is well formed, signed by the validator it claims, and
+    /// anchored at a real block. Only the claim is false, and nothing but
+    /// the engaged set says so.
+    ///
+    /// So this is the only fault that can still be in a node's pool when
+    /// it comes to author, and the only one that can cost it the slot
+    /// (`findings.md` §22). Blaming the others would be blaming assurances
+    /// the node had already thrown away.
+    pub fn survives_until_composition(&self) -> bool {
+        matches!(self, Self::EmptyCore)
+    }
+
     pub fn describe(&self) -> &'static str {
         match self {
             Self::WrongAnchor => "an assurance anchored to the wrong block",
@@ -803,18 +842,47 @@ pub fn n4_ce141_inclusion(ctx: &N4Ctx) -> Check {
         }
 
         let mut results = Vec::new();
+        // Lost turns are collected rather than reported inside the loop,
+        // because the unit being graded is the **slot**, not the offer. A
+        // slot is lost once however many peers had a faulty assurance in
+        // the pool at the time, and one row per offer turned three lost
+        // slots into eight hard failures in the first live run -- which
+        // reads as eight defects.
+        let mut lost: Vec<LostTurn> = Vec::new();
         for offered in &ctx.assurances_offered {
-            // A node that authored nothing after the offer had no chance to
-            // include it, and saying so is not the same as passing it.
+            // A node that authored nothing after the offer usually had no
+            // chance to include it, and saying so is not the same as
+            // passing it. But there is one way to author nothing that is
+            // not an absence of opportunity: the node took its turn, could
+            // not build a block because of the assurance it had pooled, and
+            // produced nothing. That is a failure, and a worse one than
+            // including it would have been (`findings.md` §22).
             if !offered.had_opportunity {
-                results.push(
-                    Control::new(
-                        "n4_ce141_inclusion_not_exercised",
-                        "a NUT block whose parent is the block the assurance anchors",
-                        false,
-                    )
-                    .absent("n4_ce141_inclusion_not_exercised"),
-                );
+                match (offered.cost_a_slot, offered.fault) {
+                    // Only a *faulty* offer can be blamed for a lost turn.
+                    // An honest assurance the node could not author past is
+                    // a node that cannot author its own valid input, which
+                    // is N1's to report and not a conclusion to reach from
+                    // here.
+                    (Some(slot), Some(fault)) if fault.survives_until_composition() => {
+                        match lost.iter_mut().find(|turn| turn.slot == slot) {
+                            Some(turn) => turn.blamed.push((offered.validator, fault)),
+                            None => lost.push(LostTurn {
+                                slot,
+                                anchor: offered.anchor,
+                                blamed: vec![(offered.validator, fault)],
+                            }),
+                        }
+                    }
+                    _ => results.push(
+                        Control::new(
+                            "n4_ce141_inclusion_not_exercised",
+                            "a NUT block whose parent is the block the assurance anchors",
+                            false,
+                        )
+                        .absent("n4_ce141_inclusion_not_exercised"),
+                    ),
+                }
                 continue;
             }
             match offered.fault {
@@ -845,6 +913,40 @@ pub fn n4_ce141_inclusion(ctx: &N4Ctx) -> Check {
                     },
                 )),
             }
+        }
+
+        // One row per lost turn, naming every peer whose false claim could
+        // still have been in the pool when the node came to author -- which
+        // is `EmptyCore` and nothing else, since the other two are
+        // refusable on arrival. Which of them the node actually choked on
+        // is not observable from outside and does not matter: each one
+        // alone would have been enough.
+        for LostTurn {
+            slot,
+            anchor,
+            blamed,
+        } in &lost
+        {
+            results.push(log::check_detail(
+                "n4_ce141_invalid_assurance_cost_a_block",
+                false,
+                Severity::Hard,
+                || {
+                    let who: Vec<String> = blamed
+                        .iter()
+                        .map(|(validator, fault)| {
+                            format!("validator {validator} sent {}", fault.describe())
+                        })
+                        .collect();
+                    format!(
+                        "the NUT owned slot {slot}, whose parent would have been {}, and \
+                         authored nothing there: {}. A node should lose the peer rather than \
+                         the slot",
+                        short(anchor),
+                        who.join("; ")
+                    )
+                },
+            ));
         }
 
         // A report is available once enough validators have assured its
@@ -1141,6 +1243,7 @@ mod tests {
                     sent_in_slot: 10,
                     included: true,
                     had_opportunity: true,
+                    cost_a_slot: None,
                     fault: None,
                 },
                 AssuranceOffered {
@@ -1150,6 +1253,7 @@ mod tests {
                     sent_in_slot: 10,
                     included: true,
                     had_opportunity: true,
+                    cost_a_slot: None,
                     fault: Some(AssuranceFaultKind::BadSignature),
                 },
             ],
@@ -1168,6 +1272,176 @@ mod tests {
         );
     }
 
+    /// The node took its turn, built nothing, and the assurance it had
+    /// pooled was a faulty one anchored at what would have been the parent.
+    ///
+    /// `findings.md` §22. This is the failure the lane could not see: the
+    /// node's answer to an invalid assurance is to produce no block at all,
+    /// and "no block" was the lane's own precondition, so the row graded
+    /// itself out of existence exactly when it mattered most.
+    #[test]
+    fn an_invalid_assurance_that_cost_a_turn_fails_rather_than_going_unexercised() {
+        let ctx = N4Ctx {
+            assurances_offered: vec![AssuranceOffered {
+                validator: 2,
+                anchor: [0x33; 32],
+                cores: vec![0],
+                sent_in_slot: 10,
+                included: false,
+                had_opportunity: false,
+                cost_a_slot: Some(11),
+                fault: Some(AssuranceFaultKind::EmptyCore),
+            }],
+            ..Default::default()
+        };
+        let out = results(n4_ce141_inclusion(&ctx));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "n4_ce141_invalid_assurance_cost_a_block");
+        assert!(
+            matches!(out[0].1, Outcome::Fail(Severity::Hard)),
+            "losing a block to a peer's false claim is a hard failure: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|(n, _)| n == "n4_ce141_inclusion_not_exercised"),
+            "it must not also report itself unexercised: {out:?}"
+        );
+    }
+
+    /// Two peers whose false claims were in the pool for the same lost
+    /// turn earn **one** row between them, naming both.
+    ///
+    /// The unit graded is the slot, not the offer. A live run lost three
+    /// slots with several faulty offers in play for each, and one row per
+    /// offer turned that into eight hard failures -- which reads as eight
+    /// defects rather than three lost blocks.
+    #[test]
+    fn one_lost_turn_earns_one_row_however_many_peers_are_blamed() {
+        let offer = |validator: u16| AssuranceOffered {
+            validator,
+            anchor: [0x33; 32],
+            cores: vec![0],
+            sent_in_slot: 10,
+            included: false,
+            had_opportunity: false,
+            cost_a_slot: Some(11),
+            fault: Some(AssuranceFaultKind::EmptyCore),
+        };
+        let ctx = N4Ctx {
+            assurances_offered: vec![offer(2), offer(5)],
+            ..Default::default()
+        };
+        let out = results(n4_ce141_inclusion(&ctx));
+        let rows: Vec<&(String, Outcome)> = out
+            .iter()
+            .filter(|(n, _)| n == "n4_ce141_invalid_assurance_cost_a_block")
+            .collect();
+        assert_eq!(rows.len(), 1, "one slot, one row: {out:?}");
+        assert!(matches!(rows[0].1, Outcome::Fail(Severity::Hard)));
+    }
+
+    /// Two different lost turns are two rows: collapsing them would hide
+    /// how much the node actually lost.
+    #[test]
+    fn two_lost_turns_earn_two_rows() {
+        let offer = |slot: u32| AssuranceOffered {
+            validator: 2,
+            anchor: [0x33; 32],
+            cores: vec![0],
+            sent_in_slot: 10,
+            included: false,
+            had_opportunity: false,
+            cost_a_slot: Some(slot),
+            fault: Some(AssuranceFaultKind::EmptyCore),
+        };
+        let ctx = N4Ctx {
+            assurances_offered: vec![offer(11), offer(14)],
+            ..Default::default()
+        };
+        let out = results(n4_ce141_inclusion(&ctx));
+        assert_eq!(
+            out.iter()
+                .filter(|(n, _)| n == "n4_ce141_invalid_assurance_cost_a_block")
+                .count(),
+            2,
+            "{out:?}"
+        );
+    }
+
+    /// A fault the node could refuse on arrival is not blamed for a lost
+    /// turn.
+    ///
+    /// `BadSignature` does not verify and `WrongAnchor` names no block, so
+    /// a node throws both away before authoring — polkajam answers the
+    /// first by closing the connection, which every run's log shows. Only
+    /// `EmptyCore` passes every receive-time check and is caught at
+    /// composition, so only it can cost the slot. Blaming the others would
+    /// name peers whose assurances the node had already discarded.
+    #[test]
+    fn only_a_fault_that_survives_to_composition_is_blamed() {
+        let offer = |fault: AssuranceFaultKind| AssuranceOffered {
+            validator: 4,
+            anchor: [0x33; 32],
+            cores: vec![0],
+            sent_in_slot: 10,
+            included: false,
+            had_opportunity: false,
+            cost_a_slot: Some(11),
+            fault: Some(fault),
+        };
+        for refusable in [
+            AssuranceFaultKind::BadSignature,
+            AssuranceFaultKind::WrongAnchor,
+        ] {
+            let ctx = N4Ctx {
+                assurances_offered: vec![offer(refusable)],
+                ..Default::default()
+            };
+            let out = results(n4_ce141_inclusion(&ctx));
+            assert_eq!(
+                out.iter()
+                    .filter(|(n, _)| n == "n4_ce141_invalid_assurance_cost_a_block")
+                    .count(),
+                0,
+                "{refusable:?} is refusable on arrival and must not be blamed: {out:?}"
+            );
+            assert_eq!(
+                out.iter()
+                    .filter(|(n, _)| n == "n4_ce141_inclusion_not_exercised")
+                    .count(),
+                1,
+                "it falls back to unexercised: {out:?}"
+            );
+        }
+    }
+
+    /// An *honest* assurance the node could not author past is not this
+    /// row's to report.
+    ///
+    /// A node that cannot build a block from valid input has a different
+    /// defect, and it belongs to N1. Blaming it here would make the row
+    /// fire on any run where the node simply failed to author, which is
+    /// how a row stops meaning anything.
+    #[test]
+    fn an_honest_assurance_is_not_blamed_for_a_lost_turn() {
+        let ctx = N4Ctx {
+            assurances_offered: vec![AssuranceOffered {
+                validator: 2,
+                anchor: [0x33; 32],
+                cores: vec![0],
+                sent_in_slot: 10,
+                included: false,
+                had_opportunity: false,
+                cost_a_slot: Some(11),
+                fault: None,
+            }],
+            ..Default::default()
+        };
+        let out = results(n4_ce141_inclusion(&ctx));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "n4_ce141_inclusion_not_exercised");
+    }
+
     /// A node that authored nothing after the offer was never asked the
     /// question, and must not be passed for it either.
     #[test]
@@ -1180,6 +1454,7 @@ mod tests {
                 sent_in_slot: 10,
                 included: false,
                 had_opportunity: false,
+                cost_a_slot: None,
                 fault: None,
             }],
             ..Default::default()
@@ -1200,6 +1475,7 @@ mod tests {
                 sent_in_slot: 10,
                 included: true,
                 had_opportunity: true,
+                cost_a_slot: None,
                 fault: None,
             }],
             availability_threshold: 5,

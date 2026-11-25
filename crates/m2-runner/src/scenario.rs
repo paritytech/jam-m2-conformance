@@ -699,6 +699,7 @@ pub(crate) fn fabricated_run_ctx(
                 sent_in_slot: fab_block_slot - 1,
                 included: true,
                 had_opportunity: true,
+                cost_a_slot: None,
                 fault: None,
             },
             n4::AssuranceOffered {
@@ -708,6 +709,7 @@ pub(crate) fn fabricated_run_ctx(
                 sent_in_slot: fab_block_slot - 1,
                 included: false,
                 had_opportunity: true,
+                cost_a_slot: None,
                 fault: Some(n4::AssuranceFaultKind::BadSignature),
             },
         ],

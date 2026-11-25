@@ -145,6 +145,9 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     // node's; on the node's own slots it authors and publishes, and the
     // emulator fetches it -- importing it here would make the block known
     // and the fetch would never happen.
+    // Slots the node owned and left empty, kept the same way the runner
+    // keeps them: the harness could not author, and the node did not.
+    let mut lost_slots: Vec<u32> = Vec::new();
     for slot in first_epoch_start..first_epoch_start + EPOCHS * period {
         at_slot(slot).await;
         match harness_chain.author_block(slot) {
@@ -157,11 +160,14 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
                     .import_nut_block(&block)
                     .expect("the node's chain imports the block");
             }
-            Ok(None) => {
-                if let Ok(Some(authored)) = node_chain.author_block(slot) {
-                    node.publish(authored);
-                }
-            }
+            Ok(None) => match node_chain.author_block(slot) {
+                Ok(Some(authored)) => node.publish(authored),
+                // The node's turn, and no block came out of it. Under
+                // `AssuranceCostsTheSlot` that is the engine refusing to
+                // compose past a pooled assurance naming an unengaged core
+                // -- the same refusal polkajam makes (`findings.md` §22).
+                _ => lost_slots.push(slot),
+            },
             Err(_) => {}
         }
     }
@@ -180,7 +186,16 @@ async fn grade(fault: SimFault) -> Vec<(&'static str, Outcome)> {
     // The runner's own resolution, not a second copy of it: a test that
     // worked out inclusion for itself would be grading its own reading of
     // the rule rather than the one a run applies.
-    m2_runner::real::resolve_assurance_inclusion(&mut assurances_offered, &nut_blocks);
+    let lost = m2_runner::real::LostTurns {
+        slots: lost_slots,
+        chain: harness_chain
+            .chain_blocks()
+            .unwrap_or_default()
+            .iter()
+            .map(|block| (block.header.slot, block.header.hash().0))
+            .collect(),
+    };
+    m2_runner::real::resolve_assurance_inclusion(&mut assurances_offered, &nut_blocks, &lost);
 
     let ctx = N4Ctx {
         nut_index: NUT_INDEX as u16,

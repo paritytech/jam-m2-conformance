@@ -660,7 +660,7 @@ hidden it.
 | Milestone | Lanes | Coverage | Status |
 |---|---|---|---|
 | **M2-A** — Foundations live | N0, N1 | 6 / 41 | ✅ **complete** — §1 |
-| **M2-B** — Self-tested | N2 | 8 / 41 | ✅ **complete** — the N2 lane is complete, and the self-test mechanism now covers every implemented lane: 75 named faults, 22 integration tests, one file per lane. See below |
+| **M2-B** — Self-tested | N2 | 8 / 41 | ✅ **complete** — the N2 lane is complete, and the self-test mechanism now covers every implemented lane: 76 named faults, 24 integration tests, one file per lane. See below |
 | **M2-C** — Guaranteeing | N3 | 21 / 41 | ✅ **complete** — the lane runs against polkajam and every submission row is held to the fault bar (`m2-sim/tests/n3_*_sim_it.rs`, 36 tests) |
 | **M2-D** — Availability | N4 | 30 / 41 | ✅ **complete** — the lane runs; serve, assurance and inclusion rows all proven by injected faults (`n4_sim_it.rs`, `n4_inclusion_sim_it.rs`, 14 tests) |
 | **M2-E** — Audit & preimages | N5, N6 | 41 / 41 | ◑ **half** — N6 complete and passing (2026-11-20, `n6_sim_it.rs`, 9 tests). **N5 parked**, see below |
@@ -700,7 +700,7 @@ assertable for a fault delivered over CE 132. DESIGN §10 and §11 N2 record eac
 
 *Proven by deliberately faulty simulated clients* now **holds across every implemented
 lane**. The machinery — an in-process transport, a virtual clock and `m2-sim`, a node-shaped
-stand-in that can be broken in one named way at a time — carries 75 named faults and 22
+stand-in that can be broken in one named way at a time — carries 76 named faults and 24
 integration tests, one file per lane: each row is shown to pass against an honest simulated
 node and to *fail, present in the report*, against one that gets exactly that thing wrong.
 
@@ -807,7 +807,7 @@ Result: the node accepts every ticket the emulator offers. `invalid ticket signa
 | Rust | 40.3k lines under `crates/*/src`, 46.0k with the integration tests |
 | `cargo test --workspace` | **592 passed / 0 failed** (plus the oracle tree's own) |
 | Lanes implemented | N0, N1, N2, N3, N4, N6, and N7 in part. N5 parked — see the ladder |
-| Fault injection | 75 named `SimFault` variants, 22 integration tests across 16 files, one per lane |
+| Fault injection | 76 named `SimFault` variants, 24 integration tests across 17 files, one per lane |
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets` | 3 warnings, all pre-existing |
 | Dry-run baseline | exits 0 — 137 rows, 122 hard and 15 soft, all passing |
@@ -1153,11 +1153,11 @@ list of real gaps rather than of unstarted work.
   N1 and N2 were the only lanes and they count 65 rows, of which 38 were then proven. That
   arithmetic no longer describes anything: four more lanes have landed, each with its own
   fault file. Rather than invent a new total, the current state is the per-lane files
-  themselves — `crates/m2-sim/tests/`, 16 of them, 22 tests, 75 named faults. The two
+  themselves — `crates/m2-sim/tests/`, 17 of them, 24 tests, 76 named faults. The two
   sections are kept for the method they describe and the ten rows they rule out of scope,
   not for their totals.
 - **Negative testing now exists in every implemented lane.** 75 named `SimFault` variants
-  and 22 integration tests, one file per lane, each showing a row passing against an honest
+  and 24 integration tests, one file per lane, each showing a row passing against an honest
   stand-in and failing against one broken in exactly that way. Three N7 rows are the
   exception and cannot be covered this way: `m2-sim` runs in the test process, so there is no
   process to kill and no stand-in that can pose "came back but will not serve"

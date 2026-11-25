@@ -607,6 +607,9 @@ pub async fn drive_availability(
                 sent_in_slot: slot,
                 included: false,
                 had_opportunity: false,
+                // Both resolved after the window, from the blocks the node
+                // authored and the turns it did not take.
+                cost_a_slot: None,
                 fault,
             });
         }

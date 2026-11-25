@@ -241,10 +241,12 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // Keep authoring for the whole observation window, announcing each
         // block as its slot arrives (A10). Aborted with the dial tasks when the
         // window closes.
+        let lost_slots: crate::real::LostSlots = Arc::new(Mutex::new(Vec::new()));
         let mut dial_tasks = vec![tokio::spawn(drive_slots(
             Arc::clone(&ref_chain),
             emu.announce_tx(),
             Arc::clone(&epoch_contexts),
+            Arc::clone(&lost_slots),
         ))];
         for &i in &plan.initiate_now {
             let shared = shared.clone();
@@ -519,6 +521,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             assurances_seen,
             assurances_offered,
             avail_shard_count,
+            lost_slots: Arc::clone(&lost_slots),
         };
         (
             ObsSource::Emulator {
@@ -858,6 +861,7 @@ async fn drive_slots(
     chain: Arc<RefChain>,
     announce: broadcast::Sender<Vec<u8>>,
     contexts: EpochContexts,
+    lost_slots: crate::real::LostSlots,
 ) {
     let mut next = chain.next_slot() + 1;
     let mut captured_epoch = None;
@@ -888,8 +892,11 @@ async fn drive_slots(
                     let _ = announce.send(wire);
                 }
             }
-            // The NUT's own slot, or nothing to author.
-            Ok(None) => {}
+            // The NUT's own slot. The head has not reached `next`, so no
+            // block occupies it -- a turn the node had and did not take,
+            // which `n4_ce141_inclusion` needs to tell a lost block from an
+            // unexercised row (`findings.md` §22).
+            Ok(None) => m2_emu::emu::lock(&lost_slots).push(next),
             Err(_) => break,
         }
         // A ticket proof is bound to the tickets-entropy of the epoch it

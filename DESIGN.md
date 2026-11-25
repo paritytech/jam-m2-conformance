@@ -645,7 +645,7 @@ building it twice.
 | CE 137 serve `:523-556` | `BundleShard ++ [SegShard] ++ Justification` equals reference erasure coding; co-path `T(s,i,H)` `:530-543` | unknown root or index ≥6 → reset |
 | CE 137 fetch | NUT requests only its own index from a guarantor after seeing the report | wrong shard / bad justification → no assurance for that core; tries another guarantor *(soft)* |
 | CE 141 send `:678-698` | `Anchor ++ Bitfield[1] ++ Sig`; bit set iff shard verified; ~2 s before the slot to all possible authors `:682-683`; epoch edge +4 s / −2 s `:683-687` | — |
-| CE 141 receive → inclusion | all valid assurances included; report available at ≥5 of 6 | wrong anchor, bad signature, bit set for an empty core → excluded |
+| CE 141 receive → inclusion | all valid assurances included; report available at ≥5 of 6; **a faulty one costs the node no slot** | wrong anchor, bad signature, bit set for an empty core → excluded, and the node still authors (`findings.md` §22) |
 | CE 138 serve `:558-583` | bundle shard + justification with segment-shard root `:566-568` | unknown → reset |
 | CE 139/140 serve `:600-651` | 139 `[SegShard]`; 140 adds justification discriminator 0/1/2 `:640`; ≤2·3072 | over limit → reset |
 | CE 139/140 fetch | NUT reconstructs imports from **3** shards; 139 first, 140 on inconsistency `:628-633` | one corrupt shard → retries via 140 and completes |

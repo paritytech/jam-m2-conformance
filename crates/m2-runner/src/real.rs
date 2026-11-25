@@ -77,11 +77,26 @@ pub(crate) struct RealRunData {
     pub(crate) nut_alive_after: Arc<Mutex<Option<bool>>>,
     pub(crate) restart: Arc<Mutex<Option<m2_scenario::scenarios::n7::RestartFacts>>>,
     pub(crate) flood: Arc<Mutex<Option<m2_scenario::scenarios::n7::FloodFacts>>>,
+    /// Slots the NUT owned and left empty, as the slot driver saw them.
+    pub(crate) lost_slots: LostSlots,
 }
 
 /// Ticket contexts the slot driver captured, one per epoch the run crossed,
 /// keyed by the epoch whose tickets each one seals.
 pub(crate) type EpochContexts = Arc<Mutex<Vec<(u32, TicketCtx)>>>;
+
+/// Slots the NUT owned and left empty.
+///
+/// `RefChain::author_block` answers `None` for a slot whose author is the
+/// NUT, and the slot driver only ever reaches a slot the chain's head has
+/// not already passed. So a slot recorded here is one the reference could
+/// not author and no block occupies: a turn the node had and did not take.
+///
+/// Worth recording because `n4_ce141_inclusion` cannot otherwise tell
+/// "the node never authored in the window" from "the node lost the block
+/// to the very assurance being graded", and those are opposite facts
+/// (`findings.md` §22).
+pub(crate) type LostSlots = Arc<Mutex<Vec<u32>>>;
 
 /// The emulated validators' tickets for the epoch after the current one.
 ///
@@ -418,7 +433,20 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
     );
 
     let mut assurances_offered = lock(&data.assurances_offered).clone();
-    resolve_assurance_inclusion(&mut assurances_offered, nut_blocks);
+    // The chain as the reference holds it, which already includes the NUT
+    // blocks it adopted: that is the sequence a parent is read off.
+    let chain: Vec<(u32, [u8; 32])> = data
+        .ref_chain
+        .chain_blocks()
+        .unwrap_or_default()
+        .iter()
+        .map(|block| (block.header.slot, block.header.hash().0))
+        .collect();
+    let lost = LostTurns {
+        slots: lock(&data.lost_slots).clone(),
+        chain,
+    };
+    resolve_assurance_inclusion(&mut assurances_offered, nut_blocks, &lost);
 
     N4Ctx {
         nut_index: data.nut_index as u16,
@@ -444,7 +472,11 @@ fn build_n4_ctx(data: &RealRunData, nut_blocks: &[NutBlock]) -> N4Ctx {
 ///
 /// Public because `m2-sim`'s inclusion test grades the same facts the runner
 /// does, through this function rather than a second copy of the rule.
-pub fn resolve_assurance_inclusion(offered: &mut [AssuranceOffered], nut_blocks: &[NutBlock]) {
+pub fn resolve_assurance_inclusion(
+    offered: &mut [AssuranceOffered],
+    nut_blocks: &[NutBlock],
+    lost: &LostTurns,
+) {
     for offer in &mut *offered {
         // `sent_in_slot` is the slot the assurance was sent *for*: it goes
         // out a couple of seconds before that slot begins, aiming at the
@@ -462,8 +494,51 @@ pub fn resolve_assurance_inclusion(offered: &mut [AssuranceOffered], nut_blocks:
                 .iter()
                 .any(|a| a.signature.val_index == offer.validator)
         });
+        // Only asked where there was no opportunity: a block that carried
+        // the assurance, or left it out, answers the row on its own.
+        offer.cost_a_slot = (!offer.had_opportunity)
+            .then(|| lost.turn_lost_on(offer.anchor, offer.sent_in_slot))
+            .flatten();
     }
     report_inclusion_opportunity(offered, nut_blocks);
+}
+
+/// The slots the NUT owned and left empty, with the chain they sit in.
+///
+/// Enough to answer one question: when the node was due to author and did
+/// not, was the block it would have built a child of *this* anchor? Only
+/// then can an assurance anchored there be what cost it the slot — a node
+/// whose head had already moved on would not have had that assurance in
+/// play at all.
+pub struct LostTurns {
+    /// Slots the reference could not author and no block occupies.
+    pub slots: Vec<u32>,
+    /// Every block on the chain as `(slot, hash)`, ascending by slot.
+    pub chain: Vec<(u32, [u8; 32])>,
+}
+
+impl LostTurns {
+    /// The first lost turn at or after `sent_in_slot` whose parent would
+    /// have been `anchor`, if any.
+    ///
+    /// "Would have been" is read off the chain rather than guessed: the
+    /// parent of a block authored at slot `s` is the last block before `s`,
+    /// so the anchor had to still be the head there.
+    pub fn turn_lost_on(&self, anchor: [u8; 32], sent_in_slot: u32) -> Option<u32> {
+        self.slots
+            .iter()
+            .copied()
+            .filter(|&slot| slot >= sent_in_slot)
+            .find(|&slot| self.head_before(slot) == Some(anchor))
+    }
+
+    fn head_before(&self, slot: u32) -> Option<[u8; 32]> {
+        self.chain
+            .iter()
+            .filter(|(at, _)| *at < slot)
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, hash)| *hash)
+    }
 }
 
 /// Say why no assurance had an opportunity, when none did.
@@ -476,7 +551,11 @@ pub fn resolve_assurance_inclusion(offered: &mut [AssuranceOffered], nut_blocks:
 /// reader concludes the rows are broken when the window simply missed.
 ///
 /// Printed rather than made a finding: it is a fact about this run's
-/// timing, not about the node.
+/// timing, not about the node — *except* where a lost turn explains it,
+/// and that case is now a row of its own
+/// (`n4_ce141_invalid_assurance_cost_a_block`) rather than a line in the
+/// log. This still prints, because a reader looking at a window that
+/// simply missed needs the same help it always did.
 fn report_inclusion_opportunity(offered: &[AssuranceOffered], nut_blocks: &[NutBlock]) {
     if offered.is_empty() || offered.iter().any(|offer| offer.had_opportunity) {
         return;
@@ -1398,5 +1477,75 @@ mod tests {
             "and its twin, which shares id and epoch, is not"
         );
         Ok(())
+    }
+
+    /// The anchor was still the head when the turn came, so the assurance
+    /// pooled under it is what the node would have been building with.
+    #[test]
+    fn a_turn_lost_while_the_anchor_was_head_is_attributed_to_it() {
+        let lost = LostTurns {
+            slots: vec![11, 12],
+            chain: vec![(8, [0x11; 32]), (10, [0x33; 32])],
+        };
+        assert_eq!(lost.turn_lost_on([0x33; 32], 10), Some(11));
+    }
+
+    /// The head moved on before the turn, so an assurance anchored at the
+    /// older block was never in play and cannot be what cost it.
+    ///
+    /// Without this the row would blame whichever assurance happened to be
+    /// oldest for every empty slot in the run.
+    #[test]
+    fn a_turn_lost_after_the_head_moved_on_is_not_attributed() {
+        let lost = LostTurns {
+            slots: vec![13],
+            chain: vec![(10, [0x33; 32]), (12, [0x44; 32])],
+        };
+        assert_eq!(lost.turn_lost_on([0x33; 32], 10), None);
+    }
+
+    /// A turn before the assurance went out could not have been lost to it.
+    #[test]
+    fn a_turn_before_the_assurance_is_not_attributed() {
+        let lost = LostTurns {
+            slots: vec![9],
+            chain: vec![(8, [0x33; 32])],
+        };
+        assert_eq!(lost.turn_lost_on([0x33; 32], 10), None);
+    }
+
+    /// No lost turns at all is the ordinary case and answers nothing.
+    #[test]
+    fn a_run_that_lost_no_turns_attributes_nothing() {
+        let lost = LostTurns {
+            slots: Vec::new(),
+            chain: vec![(10, [0x33; 32])],
+        };
+        assert_eq!(lost.turn_lost_on([0x33; 32], 10), None);
+    }
+
+    /// Resolution only asks about offers that had no opportunity: a block
+    /// that carried the assurance, or left it out, has already answered.
+    #[test]
+    fn an_offer_with_an_opportunity_is_never_blamed_for_a_lost_turn() {
+        let mut offered = vec![AssuranceOffered {
+            validator: 2,
+            anchor: [0x33; 32],
+            cores: vec![0],
+            sent_in_slot: 10,
+            included: false,
+            had_opportunity: false,
+            cost_a_slot: None,
+            fault: Some(m2_scenario::scenarios::n4::AssuranceFaultKind::EmptyCore),
+        }];
+        let lost = LostTurns {
+            slots: vec![11],
+            chain: vec![(10, [0x33; 32])],
+        };
+        // No NUT block anchors it, so `had_opportunity` stays false and the
+        // lost turn is attributed.
+        resolve_assurance_inclusion(&mut offered, &[], &lost);
+        assert_eq!(offered[0].cost_a_slot, Some(11));
+        assert!(!offered[0].had_opportunity);
     }
 }

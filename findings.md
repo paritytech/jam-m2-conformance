@@ -1491,17 +1491,56 @@ single clearest way to put the question: block composition re-checks every
 guarantee it holds and **skips** the ones that no longer apply. Assurances
 are fatal instead. Whether that is deliberate is the first thing to ask.
 
-### What the harness cannot see, and why that matters
+### The lane could not see it, which is now fixed
 
 `n4_ce141_invalid_assurance_excluded` exists to ask whether an invalid
-assurance stayed out of the block. In this run it never appears at all —
-113 rows of `n4_ce141_inclusion_not_exercised` instead — because the node
-does not produce the block that would have excluded it.
+assurance stayed out of the block. In the runs above it never appears at
+all — 113 rows of `n4_ce141_inclusion_not_exercised` instead — because the
+node does not produce the block that would have excluded it.
 
-**A lane that only ever looks at blocks cannot see a missing one.** The
-node's failure mode is worse than the row models, and the row scores it as
-no coverage rather than as a failure. That is a gap in the lane as much as
-a defect in the node, and it is not fixed here.
+**A lane that only ever looks at blocks cannot see a missing one**, and
+"the node authored no block" was this row's own precondition. So the lane
+graded itself out of existence at exactly the moment it mattered: the
+node's worst answer scored as *no coverage*, which on a report is
+indistinguishable from a window that simply missed.
+
+`n4_ce141_invalid_assurance_cost_a_block` closes it. The slot driver
+already learns which slots the NUT owns — `author_block` answers `None` for
+them — and the driver only reaches a slot the head has not passed, so a
+slot it records is one the node had and did not take. `LostTurns` then
+attributes a lost turn to an assurance only when all three hold: the turn
+came after the assurance was sent, the anchor was **still the head** at
+that slot (read off the chain, so the block the node would have built was
+that anchor's child), and the assurance was one of the deliberately faulty
+ones. An honest assurance the node could not author past is a node that
+cannot build from valid input, which is N1's to report.
+
+The row grades the **slot**, not the offer. A slot is lost once however
+many peers had a false claim pooled for it, and one row per offer turned
+three lost slots into eight hard failures in the first live run — which
+reads as eight defects.
+
+It also blames only `EmptyCore`. The other two faults are refusable the
+moment they arrive — `WrongAnchor` names no block the node has, and
+polkajam answers `BadSignature` by closing the connection, which every
+run's log shows four times over. `EmptyCore` passes every check a receiver
+makes: well formed, signed by the validator it claims, anchored at a real
+block, and false only in the claim. It is the one fault that can still be
+in the pool at composition, so it is the only one that can cost a slot.
+The first version blamed all three and named peers whose assurances the
+node had already thrown away.
+
+Posed in the stand-in by `SimFault::AssuranceCostsTheSlot`, which pools an
+assurance that does not hold and lets the engine refuse to compose. That
+refusal is the engine's own rather than something the test simulates: it is
+the same code polkajam runs.
+
+**It under-counts, deliberately.** Across three runs the node logged five
+`core not engaged` errors and the row claimed three of them. The other two
+fail the "anchor was still the head" test, and the harness does not guess:
+a lost turn it cannot tie to a specific assurance is one it does not
+attribute. So the row is a floor on what the defect costs, not a measure
+of it.
 
 ### What is deliberately not claimed
 

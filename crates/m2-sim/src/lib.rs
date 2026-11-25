@@ -286,6 +286,19 @@ pub enum SimFault {
     AssuranceIncludesInvalid,
     /// Pool nothing, so no assurance a peer sends is ever carried.
     AssuranceOmitsValid,
+    /// Pool an assurance that does not hold, and so author nothing at all.
+    ///
+    /// The one assurance fault that cannot be posed by rewriting the
+    /// authored body, because the point is that **no body is produced**.
+    /// The engine refuses to compose a block whose assurances extrinsic
+    /// names an unengaged core, so a stand-in that pools a peer's false
+    /// claim loses its turn exactly as polkajam does (`findings.md` §22).
+    ///
+    /// This is what `n4_ce141_invalid_assurance_cost_a_block` grades, and
+    /// it is the one failure the lane could not previously see: "the node
+    /// authored no block" was the row's own precondition, so the worse
+    /// failure scored as no coverage.
+    AssuranceCostsTheSlot,
     /// Distribute a guarantee carrying one signature.
     ///
     /// Below the quorum a guarantee needs, and the shape of a guarantor that
@@ -1619,6 +1632,14 @@ impl SimNode {
             return;
         }
         let received = m2_reference::assurance::as_received(&assurance, peer);
+        // Pooled without asking whether it holds, which is the whole fault:
+        // the engine will then refuse to compose a block and the slot goes
+        // empty. Checked before `assurance_holds` because the claim this
+        // poses is precisely about an assurance that does *not* hold.
+        if self.fault == SimFault::AssuranceCostsTheSlot {
+            let _ = self.chain.submit_assurances(&[received]);
+            return;
+        }
         if self.assurance_holds(&assurance, peer) {
             let _ = self.chain.submit_assurances(&[received]);
             return;
