@@ -602,7 +602,11 @@ pub(crate) fn fabricated_run_ctx(
             sent_in_slot: fab_block_slot - 1,
             sent_at_wall_ms: submitted_at,
         }],
-        included: vec![(FAB_INCLUDED_HASH, fab_block_slot)],
+        included: vec![m2_scenario::scenarios::n3::IncludedReport {
+            report_hash: FAB_INCLUDED_HASH,
+            slot: fab_block_slot,
+            core: 1,
+        }],
         authored_slots: vec![fab_block_slot],
     };
 

@@ -2395,7 +2395,7 @@ answered this in one command, and did.
 
 ---
 
-## 33. The harness put a length prefix on every CE 144 and CE 145 message
+## 33. The harness put a length prefix on every CE 144 and CE 145 message — CLOSED 2026-11-20
 
 **Status:** CLOSED 2026-11-20, same day. A harness defect, introduced by
 §28's re-spec and found before N5 shipped — but only by accident, which is
@@ -2960,10 +2960,14 @@ lane's honest ceiling until the oracle can do those two things.
 
 ---
 
-## 41. Two more rows are index-dependent, and the cause is not yet known
+## 41. Two more rows were index-dependent, and both were the harness's timing — CLOSED 2026-11-25
 
-**Status:** open, cause undiagnosed. Found 2026-11-24 by rotating every
-lane rather than only N0, which is what §39 bought.
+**Status:** closed. Found 2026-11-24 by rotating every lane rather than only
+N0, which is what §39 bought. Diagnosed and fixed 2026-11-25. **Neither row
+was a node defect.** They are the fourth and fifth index-dependent rows
+found, after §39's three, and all five have been the harness accusing the
+node of the harness's own arrangement — the mistake §8, §18 and §25 record
+in forms that did not happen to follow the index.
 
 Seven lanes at validator indices 1, 3 and 5, 300 s windows:
 
@@ -2978,59 +2982,149 @@ n3_ce135_inclusion.n3_ce135_report_included            — passed at [3, 5], fai
 n6_ce142_announce.n6_ce143_requested_after_announcement — passed at [5], failed at [1, 3]
 ```
 
-**Not run-to-run variance.** Both lanes depend on which slots the node wins
-and when packages land, which varies at a *fixed* index too — the row
-counts above differ by 73 between configurations that differ only in index.
-So the sharper test was two further runs at index 1: both rows failed in
-both, and pass at index 5. Three runs, one verdict.
+Not run-to-run variance: both rows failed in three further runs at index 1
+and passed at index 5. The two rows turned out to have **different causes
+of the same shape** — each lane measured a precondition by a proxy, and the
+distance between the proxy and the real condition moved with the index.
 
-### What each failure says
+### N6: the lane announced before the request existed
 
-`n3_ce135_report_included`: "the report 526a86e5c75c2de7 guaranteed on core
-1 and distributed in slot 9967152 was never included; the NUT's blocks
-carried ["04c74d2a848d2001"]" — the node authored, and included a different
-report.
+The row reads "the NUT did not ask for the preimage b16ae7fe that service 0
+had solicited on chain, within the 10000 ms the announcer held the
+connection open". A node may only ask for a preimage the chain has asked
+for (`simple.md:705-707`), so the lane has to wait for the solicit before
+it announces. It waited for **a block carrying the soliciting package, plus
+two slots**.
 
-`n6_ce143_requested_after_announcement`: "the NUT did not ask for the
-preimage b16ae7fe that service 0 had solicited on chain, within the
-10000 ms the announcer held the connection open."
+A package reaches a block at *inclusion*. The request only exists once the
+package has **accumulated**, which waits on availability. Measured from the
+three sessions, announcement against the node's own `Solicited` line:
 
-### What has been ruled out
+| index | announced | solicit accumulated | row |
+|---|---|---|---|
+| 1 | 16:55:30 | 16:55:48 | announced 3 slots **early** — fail |
+| 3 | 17:01:36 | 17:01:48 | announced 2 slots **early** — fail |
+| 5 | 17:07:30 | 17:07:24 | announced 1 slot **late** — pass |
 
-- **The grid restriction of §39.** CE 135 is `GuaranteeBroadcast`, which
-  polkajam permits from any validator, neighbour or not. CE 142 is
-  `PreimageAnnouncement`, which it permits from an ordinary peer — and the
-  N6 announcer is deliberately an ordinary peer for that reason. CE 143's
-  `PreimageRequest` is disallowed inbound from an ordinary peer, but the
-  node *opening* CE 143 is outbound and unrestricted.
-- **The harness distributing on the node's own core.** Core assignment
-  moves with the index — at k=1 core 0 is [0,1,4] and core 1 is [2,3,5];
-  at k=5 core 0 is [2,3,4] and core 1 is [0,1,5] — but in both the harness
-  distributed on the core the node is *not* a guarantor of. Same relative
-  position, different outcome.
-- **The solicit never reaching a block**, for N6: the announcer bails with
-  "no block carries the solicit" when that happens, and it did not. The
-  solicit was on chain and the node still did not ask.
+The node was right every time. At index 5 the two-slot lead happened to
+clear the gap; at 1 and 3 it did not, and the harness graded a node for not
+answering a request that did not yet exist. §5's mistake in a new place,
+and the fourth row to make it.
 
-### What to look at next
+**Fixed** by asking the state instead of approximating it.
+`RefChain::preimage_requested` reads the `(service, hash, len)` request key
+at the chain's best block and reports whether its slot sequence is still
+empty — the same key the node reads before deciding whether to follow up,
+so the gate *is* the condition rather than a lead that stands in for it.
+A test drives the real engine through solicit, inclusion and accumulation
+and pins the ordering; it does not reproduce the five-slot lag, which only
+a real run shows.
 
-The two rows may share one cause or none. The ones worth testing, cheapest
-first:
+### N3: the core was full when the node's one chance came
 
-1. Whether the core the harness distributes on is already *engaged* — a
-   core holds a report until availability clears it, so a second report on
-   it cannot be included. The `[assignment]` lines carry the core, and the
-   chain can be asked which cores were engaged at that slot.
-2. Whether the solicit *accumulated* rather than merely being included.
-   The N6 gate watches for a block carrying the package and then waits two
-   slots; inclusion-to-accumulation lag depends on when the package was
-   guaranteed, which moves with the index. If that is it, the lane
-   announces too early and the node is right to decline — §5's mistake in
-   a new place.
-3. Whether index 2 and 4 behave like 1 or like 5, which would say whether
-   this follows the grid or something else.
+The row reads "the report 526a86e5c75c2de7 guaranteed on core 1 and
+distributed in slot 9967152 was never included; the NUT's blocks carried
+["04c74d2a848d2001"]". The node received the distribution in all three runs
+— one 602-byte CE 135 `rx` at the distribution slot, identical in each
+trace — so this was never about the wire.
 
-**Until then neither row should be read as a node defect.** Three of the
-four index-dependent rows found so far were the harness's own doing (§39),
-and the fourth has not been diagnosed. The rows are reported here as
-unstable, not as failures.
+Two rules decide whether a distributed report can be included at all, and
+the old gate knew neither of them. It asked only whether the node authored
+*any* block after the distribution.
+
+1. **The guarantee goes stale.** polkajam refuses a guarantee from before
+   the previous rotation: `guarantee_slot / rp + 1 < block_slot / rp` is
+   `ReportRotationBeforeLast` (`chain/exec/reports.rs:504`). With
+   `rotation_period = 4` the window is between one and eight slots
+   depending on where in the rotation the report lands, and the node's
+   authoring turns do not move with it.
+2. **A core carries one report at a time.** A block that put some other
+   report on that core had no room for this one.
+
+At index 1 both bit. The distribution went out in slot 9967152 on core 1;
+the node's only block inside the window was 9967158, and at slot 9967157 it
+had refined a package of its own on core 1 (`@1#0 Bootstrap Service
+Refine`) and carried that instead. At index 3 the node authored 9967213,
+one slot after the distribution; at index 5, 9967274, two slots after. Both
+included it.
+
+Choosing between two reports for one core is a choice neither the GP nor
+the NP takes away from a node. The row was failing the node for making it.
+
+**Fixed** by `had_an_opportunity`, which requires a block that is after the
+distribution, inside the guarantee's rotation window, and not already
+carrying another report on that core. Without all three the row reports
+itself unexercised. `N3Ctx::included` carries the core now, because that is
+what says whether there was room.
+
+**It is not exact.** A core engaged by an *earlier* block and not yet freed
+by availability is still invisible, so a block can be counted an
+opportunity when the core was in fact taken. That direction leaves the row
+able to fail rather than quietly stopping it grading, which is the safer
+way round for a row whose whole job is to fail. Narrowing it further needs
+the per-slot engagement the emulator reads live
+(`RefChain::engaged_cores`), recorded rather than sampled.
+
+### Verified
+
+Three runs at indices 1, 3 and 5 after the fix (`sessions/fix41-k1`,
+`-k3`, `-k5`), same seed and window as the ones that found it:
+
+```
+--compare sessions/fix41-k1 sessions/fix41-k3 sessions/fix41-k5
+  Compared validator indices [1, 3, 5].
+  No row passed at one index and failed at another.
+```
+
+| index | `n3_ce135_report_included` | `n6_ce143_requested_after_announcement` |
+|---|---|---|
+| 1 | not exercised (was FAIL) | **HARD PASS** (was FAIL) |
+| 3 | not exercised | not exercised (was FAIL) |
+| 5 | **HARD PASS** | **HARD PASS** |
+
+All three indices now fail exactly the same three rows, every one of them
+index-independent and already known: `ce129_boundary_parent_before_child`
+(a standing node defect), `n2_unknown_epoch_reset_observed`, and
+`n3_ce146_oversized_refused` (the verdict §4 asks the NP owner about).
+
+Index 1 reproduced the original N3 shape beat for beat, which is what makes
+the diagnosis more than a plausible story: the distribution went out on
+core 1 in slot 9977388, the node's only block inside the guarantee's window
+was 9977394, and at 9977393 it had refined a package of its own onto core 1
+(`@1#0 Bootstrap Service Refine`) and carried that. The next block, 9977398,
+is past the window.
+
+**Index 5 is the control that matters.** `n3_ce135_report_included` still
+passes there, so the new gate has not quietly stopped the row grading —
+which is the failure mode a gate like this invites and the one worth
+checking for. The sim test `the_inclusion_check_catches_a_node_that_drops_a_distributed_report`
+still shows it failing against a stand-in that drops the report.
+
+**Two costs worth naming rather than burying.**
+
+Neither row grades at index 1 any more. `n3_ce135_report_included` reports
+itself unexercised because at that index the node genuinely never has a
+free core inside the window. That is honest where a pass would not be, but
+it is less coverage than the report used to claim, and it is §39's
+consequence in a new place: a row that is now conditional on topology.
+
+The index 3 run was degenerate for a reason that has nothing to do with
+this finding — the node authored two blocks in the whole 300 s window
+(against ten at index 1) and the soliciting package went out at slot
+9977460, after its last authoring turn. So index 3 does not confirm either
+row; it only fails to contradict them. A run that thin is its own question
+and is not one this finding answers.
+
+### What this says about the rotation row
+
+Both causes were preconditions measured by proxy, and in both the proxy's
+error moved with the index because the node's authoring turns do. **That is
+what an index rotation is for.** Neither row could have been caught by
+re-running at a fixed index: the failures were perfectly reproducible
+there, three runs out of three.
+
+It also sharpens §39's lesson. Of the five index-dependent rows found so
+far, five were the harness's. A row that disagrees across indices is
+evidence about the harness until proven otherwise, and the rotation's value
+is not that it finds node defects but that it finds the rows that were only
+ever passing by arrangement.

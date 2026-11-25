@@ -319,15 +319,29 @@ pub struct N3Ctx {
     pub shared_to_nut: Vec<SharedToNut>,
     /// Reference-guaranteed reports the harness distributed to the NUT.
     pub distributed: Vec<DistributedReport>,
-    /// Report hashes the NUT's own blocks carried in their guarantees, with
-    /// the slot of the block that carried each.
+    /// Reports the NUT's own blocks carried in their guarantees.
     ///
     /// Read out of the blocks the node announced, so a report the node
     /// included is one it actually put on chain rather than one it merely
     /// acknowledged.
-    pub included: Vec<([u8; 32], u32)>,
+    pub included: Vec<IncludedReport>,
     /// Slots the NUT authored a block in.
     pub authored_slots: Vec<u32>,
+}
+
+/// A report one of the NUT's own blocks carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncludedReport {
+    pub report_hash: [u8; 32],
+    /// Slot of the block that carried it.
+    pub slot: u32,
+    /// The core it was guaranteed on.
+    ///
+    /// Carried because a core holds one report at a time: a block that put
+    /// some other report on the core a distributed report wanted is a block
+    /// that had no room for it, and that is the difference between a node
+    /// declining to include something and a node having nowhere to put it.
+    pub core: u16,
 }
 
 /// Fewest signatures a guaranteed work-report may carry (`simple.md:464-467`):
@@ -622,9 +636,11 @@ pub fn n3_ce135_distribution(ctx: &N3Ctx) -> Check {
 /// distributed is included in the NUT's next block (DESIGN §11 N3).
 ///
 /// Gated twice. On a report having been distributed, and on the node having
-/// authored a block after it went out: a node that authored nothing has not
-/// failed to include anything, it has failed to author, which is N1's
-/// finding and not this lane's to report a second time.
+/// had somewhere to put it — see [`had_an_opportunity`]. A node that
+/// authored nothing has not failed to include anything, it has failed to
+/// author, which is N1's finding and not this lane's to report a second
+/// time; and a node whose only block in the window had the core full was
+/// never asked the question this row is about.
 pub fn n3_ce135_inclusion(ctx: &N3Ctx) -> Check {
     let ctx = ctx.clone();
     check("n3_ce135_inclusion", Severity::Hard, move |_obs| {
@@ -639,15 +655,12 @@ pub fn n3_ce135_inclusion(ctx: &N3Ctx) -> Check {
 
         let mut results = Vec::new();
         for report in &ctx.distributed {
-            // Only blocks the node authored *after* the report went out could
-            // have carried it. Without this a run whose only block predates
-            // the distribution would fail the node for a report it had not
-            // yet been given.
-            if !ctx.authored_after(report.sent_in_slot) {
+            if !had_an_opportunity(&ctx, report) {
                 results.push(
                     Control::new(
                         "n3_ce135_inclusion_not_exercised",
-                        "a NUT block authored after the report was distributed",
+                        "a NUT block that could have carried the report: authored after it was \
+                         distributed, while its guarantee was still valid, with its core free",
                         false,
                     )
                     .absent("n3_ce135_inclusion_not_exercised"),
@@ -656,9 +669,9 @@ pub fn n3_ce135_inclusion(ctx: &N3Ctx) -> Check {
             }
             results.push(log::check_detail(
                 "n3_ce135_report_included",
-                ctx.included
-                    .iter()
-                    .any(|(hash, slot)| *hash == report.report_hash && *slot > report.sent_in_slot),
+                ctx.included.iter().any(|carried| {
+                    carried.report_hash == report.report_hash && carried.slot > report.sent_in_slot
+                }),
                 Severity::Hard,
                 || {
                     format!(
@@ -669,13 +682,69 @@ pub fn n3_ce135_inclusion(ctx: &N3Ctx) -> Check {
                         report.sent_in_slot,
                         ctx.included
                             .iter()
-                            .map(|(hash, _)| short(hash))
+                            .map(|carried| short(&carried.report_hash))
                             .collect::<Vec<_>>()
                     )
                 },
             ));
         }
         results
+    })
+}
+
+/// Whether the NUT ever had a block it could have put `report` in.
+///
+/// Three conditions, every one of them the chain's rather than this lane's.
+/// The row may only fail a node that had all three and still did not
+/// include the report.
+///
+/// 1. **After the distribution.** A block authored before the report went
+///    out could not have carried it.
+/// 2. **While the guarantee was still valid.** polkajam refuses a guarantee
+///    from before the previous rotation —
+///    `guarantee_slot / rp + 1 < block_slot / rp` is
+///    `ReportRotationBeforeLast` (`chain/exec/reports.rs:504`) — so the
+///    window is what is left of the distribution's rotation plus all of the
+///    next. Depending on where in the rotation the report lands that is
+///    between one and `2 * rotation_period` slots, and the node's authoring
+///    turns do not move with it.
+/// 3. **With the core free.** A core carries one report at a time. A block
+///    that put some other report on that core had no room for this one, and
+///    choosing between two reports for one core is a choice neither the GP
+///    nor the NP takes away from a node.
+///
+/// Condition 3 is what `findings.md` §41 turned on: at validator index 1
+/// the node's single block inside the window carried a report it had
+/// refined itself five slots after ours, on the same core. The old gate
+/// asked only for condition 1, so the row failed the node for making a
+/// choice it was free to make — three runs in a row, which is what made it
+/// look like a node defect that followed the index.
+///
+/// **It is not exact, and the residual error is a false failure.** A core
+/// engaged by an earlier block and not yet freed by availability is not
+/// visible here, so a block can still be counted an opportunity when the
+/// core was in fact taken. That is the error this gate exists to remove,
+/// left in only because the opposite one is worse: widening the gate until
+/// no such case could slip through would stop the row grading on runs
+/// where the node really did drop a report, and a row that cannot fail is
+/// not a row. Closing it properly needs the per-slot engagement the
+/// emulator reads live (`RefChain::engaged_cores`), recorded through the
+/// window rather than sampled.
+fn had_an_opportunity(ctx: &N3Ctx, report: &DistributedReport) -> bool {
+    let rp = jam_types::rotation_period();
+    ctx.authored_slots.iter().any(|&authored| {
+        authored > report.sent_in_slot
+            && report.sent_in_slot / rp + 1 >= authored / rp
+            && !ctx.included.iter().any(|carried| {
+                carried.slot == authored
+                    && carried.core == report.core
+                    // Our own report filling the core is the row passing,
+                    // not the core being full. Without this the block that
+                    // carries it reads as no opportunity and a node that
+                    // did exactly the right thing is graded "not
+                    // exercised".
+                    && carried.report_hash != report.report_hash
+            })
     })
 }
 
@@ -1249,7 +1318,27 @@ mod tests {
     }
 
     /// A context whose harness distributed one report in slot 100.
+    ///
+    /// Everything the node included lands on core 1, the core the
+    /// distributed report wanted. That is the awkward case rather than the
+    /// easy one: a fixture that put the node's own reports on some other
+    /// core could not tell a full core from an empty one, which is the
+    /// distinction `had_an_opportunity` exists to draw.
     fn incl_ctx(included: Vec<([u8; 32], u32)>, authored: Vec<u32>) -> N3Ctx {
+        incl_ctx_on(
+            included
+                .into_iter()
+                .map(|(report_hash, slot)| IncludedReport {
+                    report_hash,
+                    slot,
+                    core: 1,
+                })
+                .collect(),
+            authored,
+        )
+    }
+
+    fn incl_ctx_on(included: Vec<IncludedReport>, authored: Vec<u32>) -> N3Ctx {
         N3Ctx {
             distributed: vec![distributed(REPORT, 100)],
             included,
@@ -1288,6 +1377,62 @@ mod tests {
         let results = run(&n3_ce135_inclusion(&incl_ctx(Vec::new(), vec![99])));
         assert_eq!(names(&results), vec!["n3_ce135_inclusion_not_exercised"]);
         assert!(results.iter().all(|r| r.outcome != Outcome::Pass));
+    }
+
+    /// The block in the window put another report on the core ours wanted,
+    /// so there was nowhere to put ours and nothing to grade.
+    ///
+    /// This is `findings.md` §41's N3 half. At validator index 1 the node's
+    /// one block inside the guarantee's window carried a report it had
+    /// refined itself, on core 1, five slots after the harness distributed
+    /// its own — and the row failed the node for choosing between two
+    /// reports for one core, which nothing takes away from it.
+    #[test]
+    fn a_block_whose_core_was_full_is_not_a_chance_to_include() {
+        let results = run(&n3_ce135_inclusion(&incl_ctx_on(
+            vec![IncludedReport {
+                report_hash: [0x5a; 32],
+                slot: 101,
+                core: 1,
+            }],
+            vec![101],
+        )));
+        assert_eq!(names(&results), vec!["n3_ce135_inclusion_not_exercised"]);
+        assert!(
+            !failed(&results, "n3_ce135_report_included", Severity::Hard),
+            "a full core is not the node declining to include"
+        );
+    }
+
+    /// The same block filling a *different* core leaves ours free, so the
+    /// node had room and the row grades it.
+    ///
+    /// The pair with the test above is the point: without it, "the core was
+    /// full" would be indistinguishable from "the node included anything at
+    /// all", and the gate would stop the row grading whenever the node was
+    /// busy.
+    #[test]
+    fn a_block_that_filled_another_core_is_still_a_chance_to_include() {
+        let results = run(&n3_ce135_inclusion(&incl_ctx_on(
+            vec![IncludedReport {
+                report_hash: [0x5a; 32],
+                slot: 101,
+                core: 0,
+            }],
+            vec![101],
+        )));
+        assert!(failed(&results, "n3_ce135_report_included", Severity::Hard));
+    }
+
+    /// Past the guarantee's rotation the node *cannot* include it: polkajam
+    /// refuses a guarantee from before the previous rotation, so a block
+    /// there is not a missed chance, it is a block that could not have
+    /// carried it.
+    #[test]
+    fn a_block_past_the_guarantees_rotation_is_not_a_chance_to_include() {
+        let late = 100 + 3 * jam_types::rotation_period();
+        let results = run(&n3_ce135_inclusion(&incl_ctx(Vec::new(), vec![late])));
+        assert_eq!(names(&results), vec!["n3_ce135_inclusion_not_exercised"]);
     }
 
     /// A node that authored nothing has not failed to include; it has failed

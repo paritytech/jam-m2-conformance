@@ -70,6 +70,58 @@ impl RefChain {
             keyvals,
         }))
     }
+
+    /// Whether `service` is still waiting for `blob`'s preimage, read from
+    /// the chain's own state at its best block.
+    ///
+    /// N6's announcement row needs this and nothing weaker. A node may only
+    /// ask for a preimage the chain has asked for (`simple.md:705-707`), so
+    /// announcing before the request exists grades the node on a request it
+    /// had no reason to make. The lane used to approximate that with "a
+    /// block carries the soliciting package, plus two slots" -- but a
+    /// package reaches a block at *inclusion*, and the request only exists
+    /// once the package has **accumulated**, which waits on availability.
+    /// The gap between the two is not a constant: it moved from one slot to
+    /// five across three runs that differed only in validator index, which
+    /// is what made `n6_ce143_requested_after_announcement` look
+    /// index-dependent (`findings.md` §41).
+    ///
+    /// Asking the state is not an approximation of the condition, it *is*
+    /// the condition -- the same key the node reads before deciding whether
+    /// to follow up.
+    ///
+    /// A request is keyed on `(service, hash, len)` and its value is the
+    /// sequence of slots the preimage has been available over. Empty means
+    /// asked for and not yet provided, which is the only state in which the
+    /// node should answer an announcement. A key that is absent (never
+    /// solicited) and one whose sequence is non-empty (already provided)
+    /// both answer `false`, and for this lane's purpose they mean the same
+    /// thing: do not announce yet.
+    pub fn preimage_requested(&self, service: u32, blob: &[u8]) -> Result<bool, ChainError> {
+        let (head, _) = self.best_block()?;
+        let Some(state) = self.storage_state(&head)? else {
+            return Ok(false);
+        };
+        let key: jam_std_common::StorageKey = jam_std_common::ServiceKey::Request {
+            id: service,
+            len: blob.len() as u32,
+            hash: jam_std_common::hash_raw(blob),
+        }
+        .into();
+        let Some(kv) = state.keyvals.iter().find(|kv| kv.key == key.0) else {
+            return Ok(false);
+        };
+        // The bound is three slots and the encoding is a plain sequence, so
+        // `Vec<u32>` decodes it. Decoded rather than compared against the
+        // one byte an empty sequence encodes to: a value that does not
+        // decode is a key this harness has misidentified, and that should
+        // read as "not requested" rather than as "requested".
+        let slots: Vec<u32> = match jam_types::Decode::decode(&mut kv.value.as_slice()) {
+            Ok(slots) => slots,
+            Err(_) => return Ok(false),
+        };
+        Ok(slots.is_empty())
+    }
 }
 
 /// Diff two states: compare roots and report every key whose value differs

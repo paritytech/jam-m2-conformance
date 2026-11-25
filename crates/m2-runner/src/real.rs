@@ -249,11 +249,13 @@ pub(crate) fn build_real_run_ctx(
             .iter()
             .flat_map(|nut| {
                 let slot = nut.block.header.slot;
-                nut.block
-                    .extrinsic
-                    .guarantees_prehashed()
-                    .into_iter()
-                    .map(move |(hash, _, _)| (hash.0, slot))
+                nut.block.extrinsic.guarantees.iter().map(move |g| {
+                    m2_scenario::scenarios::n3::IncludedReport {
+                        report_hash: g.report.hash().0,
+                        slot,
+                        core: g.report.core_index,
+                    }
+                })
             })
             .collect(),
         authored_slots: nut_blocks.iter().map(|n| n.block.header.slot).collect(),
