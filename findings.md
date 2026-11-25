@@ -1288,8 +1288,10 @@ test found was the harness.
 (`sessions/n3n4-3`), the first half the same day
 (`sessions/n3n4-4` measured it), the second after PR #16
 (`sessions/n4-cores-1`). A residual remains and belongs to §22 rather than
-here: the harness now reads the engaged cores correctly, and what is left
-is what a node does with an assurance that was valid when it was sent.
+here. **Its description was wrong until 2026-11-25** and read "what a node
+does with an assurance that was valid when it was sent" — the harness had a
+second race of its own, and what is left after closing it is what a node
+does with an assurance a peer knows to be false.
 
 An assurance says "I hold my shard of the report on core *c*". It is valid
 only where core *c* is **engaged** — carrying a report that is on chain
@@ -1391,105 +1393,170 @@ making it bigger.
 
 ---
 
-## 22. The node loses a block to an assurance that was valid when it was sent
+## 22. One peer can stop a validator authoring, for as long as it keeps sending
 
-**Status:** open, and now the strongest candidate for a real polkajam
-defect this harness has produced. First seen 2026-11-18
-(`sessions/n3n4-3`) when the harness's own assurances were all invalid;
-reproduced in `sessions/n4-cores-1` after §21 closed, when they were not.
-Still needs the settling §4 and §5 do before it is reported.
+**Status:** open, settled 2026-11-25, and now a reportable polkajam defect
+rather than a candidate. First seen 2026-11-18 (`sessions/n3n4-3`),
+reproduced through §21, and **re-diagnosed from scratch on 2026-11-25
+because the mechanism recorded here was wrong.**
 
-The other half of §21, read from the node's side. Sent an assurance naming a
-core that carries no report, polkajam **accepted it into its pool** and then
-could not author:
+### What this finding used to say, and why it was wrong
 
-```
-ERROR authoring  Error authoring block: block execution error:
-  assurances error: core not engaged
-```
+It said: *"the node loses a block to an assurance that was valid when it
+was sent"* — a core freed between the sender reading the engaged set and
+the author checking it. That is not what was happening, and two sessions of
+measurement went past it because the harness's log could not tell an
+injected fault from an accident of the harness's own.
 
-Three of three authoring slots lost, in one run, to assurances from peers.
-The node is right that the core is not engaged — that is §21, the harness's
-error — but it discovered this while composing its own block, not while
-deciding whether to pool what a peer sent it.
+Two things were true at once and neither was the recorded one.
 
-This is what `n4_ce141_invalid_assurance_excluded` exists to catch, and the
-node's failure mode is worse than the row models. The row asks whether an
-invalid assurance stayed out of the block; this node answers by not
-producing a block at all, which the row scores as *not exercised*. A lane
-that only ever looks at blocks cannot see a missing one.
+**The harness had a race of its own.** It read the anchor and the engaged
+set in two separate oracle calls, which is two views of the chain: the
+reference chain can import a block in between. A run showed the cost
+plainly — at one slot validators 0 and 4 claimed core 1 while 2, 3 and 5
+still claimed core 0, for the same slot, because their reads landed either
+side of the same transition. An assurance whose two halves come from
+different blocks is not imprecise, it is **invalid**, and the node is right
+to refuse it.
 
-**Before this is reported as a node defect it needs settling:**
+Note which direction that race fires in, because it is the opposite of the
+one this finding assumed. If the head *frees* a core between the two reads,
+the bitfield claims a subset of what the anchor engaged — still valid. Only
+a head that *engages* a core produces an invalid pair. "Valid when sent,
+stale when used" was not merely unproven, it was the safe case.
 
-1. Does JAMNP-S require a receiver to validate an assurance against the
-   engaged cores *before* pooling it? `simple.md` is thinner here than the
-   on-chain rule is.
-2. Is a validator expected to defend its own authoring against what peers
-   send it, or is an unauthored slot the accepted cost of a bad peer? The
-   practical reading is that one peer should not be able to cost a validator
-   its blocks by sending one malformed assurance.
-3. ~~Observed in one run, and in a run whose assurances were all invalid
-   for the harness's own reason. Reproduce against a run that sends valid
-   ones — which means §21 first.~~ §21 is closed, and the behaviour
-   survives it.
+Closed by `stable_anchor_and_cores`: read the head, read the cores, read
+the head again, and use the pair only if it did not move. That is provable
+from what the oracle already offers and needs no rebuild of it.
 
-**What §21 closing did to this.** With the engaged cores read per slot, the
-node still lost two of seven authoring slots (`sessions/n4-cores-1`), and
-the two were consecutive and immediately after availability completed. So
-the sharpened question is narrower and better than the one first recorded:
+**Doing so removed two of the five lost slots** at validator index 1
+(`sessions/fix22-k1`, against `sessions/fix41-k1`), and blocks authored
+went from 10 to 14. So the race was real and was part of it. It was not all
+of it.
 
-> The harness reads the engaged cores about two seconds before the slot and
-> the node checks them when it authors. A core freed in between leaves an
-> assurance that was **valid when it was sent** and stale when it is used.
-> polkajam refuses to author at all rather than dropping it.
+### What is actually happening
 
-That is not a harness aiming badly any more. It is a validator losing a
-block to a peer that did nothing wrong, and in a real network reports
-become available constantly, so the window this needs is not rare.
-
-**How wide the window is.** A run now prints the engaged set whenever it
-moves, and the answer is that it moves constantly
-(`sessions/n4-cores-2`, one validator's view):
+The harness injects `AssuranceFaultKind::EmptyCore` from the midpoint of
+its assurance plan: an assurance claiming a core that carries no report,
+signed properly, anchored properly, so that **only the claim is false**. At
+index 1 validators 2 and 5 pose it. The run log now says so at the moment
+it goes out, which is what finally made the correlation visible:
 
 ```
-slot 9884653 -> []
-slot 9884654 -> [1]
-slot 9884655 -> [0]
-...
-slot 9884665 -> []
+EmptyCore sent in slots   9977695 .. 9977712
+node authored (14)        every one at slot <= 9977694
+node lost (3)             9977702, 9977703, 9977710
+node authored again       9977716
 ```
 
-A core is engaged for about a slot at a time. Against that turnover a
-two-second lead is most of the life of the value, so "valid when sent,
-stale when used" is not an edge case — it is the ordinary case, and it is
-why the harness reading the set correctly still leaves the node losing
-blocks.
+**Every block the node authored was before the first faulty assurance, and
+every authoring slot it owned inside the window was lost.** It recovered
+the slot after the window closed. One peer, one false bit, and the
+validator stops producing blocks until that peer stops.
 
-That also disposes of the lag question: the harness is tracking the set
-slot by slot and sending what it sees. What is stale by authoring time is
-the assurance already sitting in the node's pool, which no sender can do
-anything about. In a real network reports become available constantly and
-every validator's pool is full of assurances for cores that have since
-been freed.
+Reproduced exactly across two consecutive runs (`fix22-k1`, `fix22-k1b`):
+three lost slots, fourteen blocks, same window.
 
-Guarantees are the instructive contrast, verified while writing §21: block
-composition re-checks every guarantee it holds and **skips** the ones that
-no longer apply. Assurances are fatal instead. Whether that asymmetry is
-deliberate is the first question to put to the conformance group.
+### Where it goes wrong, in the node
 
-**Why receive-time checking cannot be the answer**, traced through the node
-2026-11-19. `AssuranceTracker::on_assurance_received`
-(`availability/assurance_tracker.rs:140`) accepts an assurance when the
-leaf is known, the signer is known, it is not a duplicate and the signature
-verifies. It does not read the bitfield — and at that moment it has no
-reason to, because the assurance *is* valid. The staleness appears
-afterwards, between pooling and authoring. `assurances_at` (`:58`) then
-returns the pool unfiltered and the author puts all of it in the block. So
-the filter has to sit at composition, which is exactly where the guarantee
-equivalent already sits.
+Three places, and polkajam already has the code for two of them.
 
-Written up for the node's authors as `ask_polkajam.md`, with the code path,
-the three runs, and what is deliberately not being claimed.
+1. **Receive.** `AssuranceTracker::on_assurance_received`
+   (`availability/assurance_tracker.rs:140`) accepts an assurance when the
+   leaf is known, the signer is known, it is not a duplicate and the
+   signature verifies. It never reads the bitfield — though at that moment
+   it holds the anchor, and so could check the claim against that block's
+   ρ. A peer's false claim is pooled.
+2. **Composition.** `assurances_at` (`:58`) returns the pool unfiltered.
+   But `chain/authoring/mod.rs:327-343` *does* hold exactly the filter this
+   needs — it drops any assurance claiming a core not engaged in ρ† — and
+   gates it on `!disputes.verdicts.is_empty()`, with the reasoning stated
+   in its own comment:
+
+   > "So with no verdicts ρ† == ρ and every assurance is still valid,
+   > letting us skip the per-core scan entirely (the common case)."
+
+   The premise holds for an honest sender and fails for a dishonest one.
+   Nothing makes every pooled assurance valid; a peer need only lie.
+3. **Execution.** `progress` (`chain/exec/assurances.rs:63`) then returns
+   `CoreNotEngaged` for the whole extrinsic, and authoring fails.
+
+The chain rule at (3) is correct: a block carrying such an assurance *is*
+invalid. That is precisely why the filter at (2) has to run unconditionally
+— the author is the last party who can keep a peer's lie out of its own
+block, and it already knows how.
+
+**Guarantees are the instructive contrast**, and the asymmetry is the
+single clearest way to put the question: block composition re-checks every
+guarantee it holds and **skips** the ones that no longer apply. Assurances
+are fatal instead. Whether that is deliberate is the first thing to ask.
+
+### The lane could not see it, which is now fixed
+
+`n4_ce141_invalid_assurance_excluded` exists to ask whether an invalid
+assurance stayed out of the block. In the runs above it never appears at
+all — 113 rows of `n4_ce141_inclusion_not_exercised` instead — because the
+node does not produce the block that would have excluded it.
+
+**A lane that only ever looks at blocks cannot see a missing one**, and
+"the node authored no block" was this row's own precondition. So the lane
+graded itself out of existence at exactly the moment it mattered: the
+node's worst answer scored as *no coverage*, which on a report is
+indistinguishable from a window that simply missed.
+
+`n4_ce141_invalid_assurance_cost_a_block` closes it. The slot driver
+already learns which slots the NUT owns — `author_block` answers `None` for
+them — and the driver only reaches a slot the head has not passed, so a
+slot it records is one the node had and did not take. `LostTurns` then
+attributes a lost turn to an assurance only when all three hold: the turn
+came after the assurance was sent, the anchor was **still the head** at
+that slot (read off the chain, so the block the node would have built was
+that anchor's child), and the assurance was one of the deliberately faulty
+ones. An honest assurance the node could not author past is a node that
+cannot build from valid input, which is N1's to report.
+
+The row grades the **slot**, not the offer. A slot is lost once however
+many peers had a false claim pooled for it, and one row per offer turned
+three lost slots into eight hard failures in the first live run — which
+reads as eight defects.
+
+It also blames only `EmptyCore`. The other two faults are refusable the
+moment they arrive — `WrongAnchor` names no block the node has, and
+polkajam answers `BadSignature` by closing the connection, which every
+run's log shows four times over. `EmptyCore` passes every check a receiver
+makes: well formed, signed by the validator it claims, anchored at a real
+block, and false only in the claim. It is the one fault that can still be
+in the pool at composition, so it is the only one that can cost a slot.
+The first version blamed all three and named peers whose assurances the
+node had already thrown away.
+
+Posed in the stand-in by `SimFault::AssuranceCostsTheSlot`, which pools an
+assurance that does not hold and lets the engine refuse to compose. That
+refusal is the engine's own rather than something the test simulates: it is
+the same code polkajam runs.
+
+**It under-counts, deliberately.** Across three runs the node logged five
+`core not engaged` errors and the row claimed three of them. The other two
+fail the "anchor was still the head" test, and the harness does not guess:
+a lost turn it cannot tie to a specific assurance is one it does not
+attribute. So the row is a floor on what the defect costs, not a measure
+of it.
+
+### What is deliberately not claimed
+
+- Not that the node must accept the assurance. It must not; the block
+  would be invalid.
+- Not that the sender is doing anything the protocol permits. It is not —
+  this is the harness misbehaving on purpose, which is what fault injection
+  is for.
+- Only this: **a node should lose the peer, not the slot.** One peer's
+  provable lie costing a validator every block it owns is a denial of
+  service that one unconditional filter — already written, already in the
+  file — would close.
+
+`simple.md` does not settle whether a receiver must validate an assurance's
+bitfield before pooling it; it is thinner here than the on-chain rule is.
+That is worth asking alongside the defect rather than instead of it.
 
 ---
 
@@ -2395,7 +2462,7 @@ answered this in one command, and did.
 
 ---
 
-## 33. The harness put a length prefix on every CE 144 and CE 145 message
+## 33. The harness put a length prefix on every CE 144 and CE 145 message — CLOSED 2026-11-20
 
 **Status:** CLOSED 2026-11-20, same day. A harness defect, introduced by
 §28's re-spec and found before N5 shipped — but only by accident, which is
@@ -2770,6 +2837,16 @@ distinction §32 draws for N5. Of DESIGN's nine N7 rows: five done, two
 blocked here, and two left that need nothing new — epoch-transition with a
 validator-set change, and index rotation.
 
+**That last sentence did not survive the week** (2026-11-25). Index
+rotation was built and found two defects on first use (§39), and the
+epoch-transition row turned out to be blocked too, for a third unrelated
+reason (§40). The standing count is **six built, three blocked, none
+unstarted**, and DESIGN §11 N7 now carries it in the table itself rather
+than in prose underneath, so the next reader does not have to reconcile
+three documents to learn what is left. The note is kept rather than the
+line rewritten because the arithmetic was right when it was written; what
+changed is the world, which is the thing a finding is for.
+
 ---
 
 ## 39. N0's sync rows pass at index 5 by luck of the grid
@@ -2957,3 +3034,174 @@ the checks being hard to write.
 
 N7 therefore stands at **five rows done and four blocked**, which is the
 lane's honest ceiling until the oracle can do those two things.
+
+---
+
+## 41. Two more rows were index-dependent, and both were the harness's timing — CLOSED 2026-11-25
+
+**Status:** closed. Found 2026-11-24 by rotating every lane rather than only
+N0, which is what §39 bought. Diagnosed and fixed 2026-11-25. **Neither row
+was a node defect.** They are the fourth and fifth index-dependent rows
+found, after §39's three, and all five have been the harness accusing the
+node of the harness's own arrangement — the mistake §8, §18 and §25 record
+in forms that did not happen to follow the index.
+
+Seven lanes at validator indices 1, 3 and 5, 300 s windows:
+
+| index | rows | hard pass | failures |
+|---|---|---|---|
+| 1 | 703 | 463 | 5 |
+| 3 | 667 | 421 | 4 |
+| 5 | 630 | 408 | 3 |
+
+```
+n3_ce135_inclusion.n3_ce135_report_included            — passed at [3, 5], failed at [1]
+n6_ce142_announce.n6_ce143_requested_after_announcement — passed at [5], failed at [1, 3]
+```
+
+Not run-to-run variance: both rows failed in three further runs at index 1
+and passed at index 5. The two rows turned out to have **different causes
+of the same shape** — each lane measured a precondition by a proxy, and the
+distance between the proxy and the real condition moved with the index.
+
+### N6: the lane announced before the request existed
+
+The row reads "the NUT did not ask for the preimage b16ae7fe that service 0
+had solicited on chain, within the 10000 ms the announcer held the
+connection open". A node may only ask for a preimage the chain has asked
+for (`simple.md:705-707`), so the lane has to wait for the solicit before
+it announces. It waited for **a block carrying the soliciting package, plus
+two slots**.
+
+A package reaches a block at *inclusion*. The request only exists once the
+package has **accumulated**, which waits on availability. Measured from the
+three sessions, announcement against the node's own `Solicited` line:
+
+| index | announced | solicit accumulated | row |
+|---|---|---|---|
+| 1 | 16:55:30 | 16:55:48 | announced 3 slots **early** — fail |
+| 3 | 17:01:36 | 17:01:48 | announced 2 slots **early** — fail |
+| 5 | 17:07:30 | 17:07:24 | announced 1 slot **late** — pass |
+
+The node was right every time. At index 5 the two-slot lead happened to
+clear the gap; at 1 and 3 it did not, and the harness graded a node for not
+answering a request that did not yet exist. §5's mistake in a new place,
+and the fourth row to make it.
+
+**Fixed** by asking the state instead of approximating it.
+`RefChain::preimage_requested` reads the `(service, hash, len)` request key
+at the chain's best block and reports whether its slot sequence is still
+empty — the same key the node reads before deciding whether to follow up,
+so the gate *is* the condition rather than a lead that stands in for it.
+A test drives the real engine through solicit, inclusion and accumulation
+and pins the ordering; it does not reproduce the five-slot lag, which only
+a real run shows.
+
+### N3: the core was full when the node's one chance came
+
+The row reads "the report 526a86e5c75c2de7 guaranteed on core 1 and
+distributed in slot 9967152 was never included; the NUT's blocks carried
+["04c74d2a848d2001"]". The node received the distribution in all three runs
+— one 602-byte CE 135 `rx` at the distribution slot, identical in each
+trace — so this was never about the wire.
+
+Two rules decide whether a distributed report can be included at all, and
+the old gate knew neither of them. It asked only whether the node authored
+*any* block after the distribution.
+
+1. **The guarantee goes stale.** polkajam refuses a guarantee from before
+   the previous rotation: `guarantee_slot / rp + 1 < block_slot / rp` is
+   `ReportRotationBeforeLast` (`chain/exec/reports.rs:504`). With
+   `rotation_period = 4` the window is between one and eight slots
+   depending on where in the rotation the report lands, and the node's
+   authoring turns do not move with it.
+2. **A core carries one report at a time.** A block that put some other
+   report on that core had no room for this one.
+
+At index 1 both bit. The distribution went out in slot 9967152 on core 1;
+the node's only block inside the window was 9967158, and at slot 9967157 it
+had refined a package of its own on core 1 (`@1#0 Bootstrap Service
+Refine`) and carried that instead. At index 3 the node authored 9967213,
+one slot after the distribution; at index 5, 9967274, two slots after. Both
+included it.
+
+Choosing between two reports for one core is a choice neither the GP nor
+the NP takes away from a node. The row was failing the node for making it.
+
+**Fixed** by `had_an_opportunity`, which requires a block that is after the
+distribution, inside the guarantee's rotation window, and not already
+carrying another report on that core. Without all three the row reports
+itself unexercised. `N3Ctx::included` carries the core now, because that is
+what says whether there was room.
+
+**It is not exact.** A core engaged by an *earlier* block and not yet freed
+by availability is still invisible, so a block can be counted an
+opportunity when the core was in fact taken. That direction leaves the row
+able to fail rather than quietly stopping it grading, which is the safer
+way round for a row whose whole job is to fail. Narrowing it further needs
+the per-slot engagement the emulator reads live
+(`RefChain::engaged_cores`), recorded rather than sampled.
+
+### Verified
+
+Three runs at indices 1, 3 and 5 after the fix (`sessions/fix41-k1`,
+`-k3`, `-k5`), same seed and window as the ones that found it:
+
+```
+--compare sessions/fix41-k1 sessions/fix41-k3 sessions/fix41-k5
+  Compared validator indices [1, 3, 5].
+  No row passed at one index and failed at another.
+```
+
+| index | `n3_ce135_report_included` | `n6_ce143_requested_after_announcement` |
+|---|---|---|
+| 1 | not exercised (was FAIL) | **HARD PASS** (was FAIL) |
+| 3 | not exercised | not exercised (was FAIL) |
+| 5 | **HARD PASS** | **HARD PASS** |
+
+All three indices now fail exactly the same three rows, every one of them
+index-independent and already known: `ce129_boundary_parent_before_child`
+(a standing node defect), `n2_unknown_epoch_reset_observed`, and
+`n3_ce146_oversized_refused` (the verdict §4 asks the NP owner about).
+
+Index 1 reproduced the original N3 shape beat for beat, which is what makes
+the diagnosis more than a plausible story: the distribution went out on
+core 1 in slot 9977388, the node's only block inside the guarantee's window
+was 9977394, and at 9977393 it had refined a package of its own onto core 1
+(`@1#0 Bootstrap Service Refine`) and carried that. The next block, 9977398,
+is past the window.
+
+**Index 5 is the control that matters.** `n3_ce135_report_included` still
+passes there, so the new gate has not quietly stopped the row grading —
+which is the failure mode a gate like this invites and the one worth
+checking for. The sim test `the_inclusion_check_catches_a_node_that_drops_a_distributed_report`
+still shows it failing against a stand-in that drops the report.
+
+**Two costs worth naming rather than burying.**
+
+Neither row grades at index 1 any more. `n3_ce135_report_included` reports
+itself unexercised because at that index the node genuinely never has a
+free core inside the window. That is honest where a pass would not be, but
+it is less coverage than the report used to claim, and it is §39's
+consequence in a new place: a row that is now conditional on topology.
+
+The index 3 run was degenerate for a reason that has nothing to do with
+this finding — the node authored two blocks in the whole 300 s window
+(against ten at index 1) and the soliciting package went out at slot
+9977460, after its last authoring turn. So index 3 does not confirm either
+row; it only fails to contradict them. A run that thin is its own question
+and is not one this finding answers.
+
+### What this says about the rotation row
+
+Both causes were preconditions measured by proxy, and in both the proxy's
+error moved with the index because the node's authoring turns do. **That is
+what an index rotation is for.** Neither row could have been caught by
+re-running at a fixed index: the failures were perfectly reproducible
+there, three runs out of three.
+
+It also sharpens §39's lesson. Of the five index-dependent rows found so
+far, five were the harness's. A row that disagrees across indices is
+evidence about the harness until proven otherwise, and the rotation's value
+is not that it finds node defects but that it finds the rows that were only
+ever passing by arrangement.

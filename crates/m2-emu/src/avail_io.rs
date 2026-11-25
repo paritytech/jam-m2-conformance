@@ -539,7 +539,11 @@ pub async fn drive_availability(
             continue;
         }
         sleep_until_lead(slot).await;
-        let Some(anchor) = anchor_of() else { continue };
+        // The anchor and the bitfield have to come from one view of the
+        // chain, and two oracle calls are two views (`findings.md` §22).
+        let Some((anchor, engaged)) = stable_anchor_and_cores(&anchor_of, &engaged_cores) else {
+            continue;
+        };
         // The head has not moved, so there is nothing new to assure. Sending
         // anyway would put two assurances from this validator under one
         // anchor -- and if one of them were the spoiled one, the two rows
@@ -555,10 +559,6 @@ pub async fn drive_availability(
             held.insert(peer, anchor);
         }
 
-        // Read here rather than above the loop: the answer changes as
-        // reports are guaranteed and become available, and this slot's
-        // assurance has to claim this slot's cores.
-        let engaged = engaged_cores();
         // Said when it moves, because when it moves is the whole question.
         // The harness reads this a couple of seconds before the slot and
         // the node checks it when it authors; anything that frees a core in
@@ -577,7 +577,19 @@ pub async fn drive_availability(
             // Sending some other fault instead would mean the run graded a
             // different rule from the one it recorded.
             match spoil(peer, anchor, &engaged, kind) {
-                Some((assurance, claimed)) => (assurance, claimed, Some(kind)),
+                Some((assurance, claimed)) => {
+                    // Said, because a run that is deliberately misbehaving
+                    // should say so in its own log. Without this a reader
+                    // correlating the node's errors against the harness's
+                    // output cannot tell an injected fault from an accident
+                    // of the harness's own -- which is exactly the
+                    // confusion `findings.md` §22 spent three sessions in.
+                    eprintln!(
+                        "[availability] validator {peer} sends a deliberately faulty assurance \
+                         ({kind:?}) claiming cores {claimed:?} at slot {slot}"
+                    );
+                    (assurance, claimed, Some(kind))
+                }
                 None => continue,
             }
         } else {
@@ -595,12 +607,63 @@ pub async fn drive_availability(
                 sent_in_slot: slot,
                 included: false,
                 had_opportunity: false,
+                // Both resolved after the window, from the blocks the node
+                // authored and the turns it did not take.
+                cost_a_slot: None,
                 fault,
             });
         }
     }
     reached
 }
+
+/// Read the chain head and the cores engaged *under that head*, as one
+/// value.
+///
+/// An assurance is a claim about one block: its anchor names the block and
+/// its bitfield claims cores that block has engaged. The node enforces
+/// exactly that — it takes only assurances anchored at its parent
+/// (`chain/authoring/mod.rs:327`) and refuses the whole block if any
+/// claimed core is not engaged in that parent's state
+/// (`chain/exec/assurances.rs:63`, `CoreNotEngaged`). An assurance whose
+/// two halves came from different blocks is therefore not merely imprecise,
+/// it is **invalid**, and it costs the node the slot.
+///
+/// The harness read them with two oracle calls, which is two views: the
+/// reference chain can import a block in between. A run showed the cost
+/// plainly — at one slot validators 0 and 4 claimed core 1 while 2, 3 and 5
+/// still claimed core 0, for the same slot, because their reads landed
+/// either side of the same transition (`findings.md` §22).
+///
+/// Read-check-reread rather than a new oracle message: if the head is the
+/// same before and after, it did not move across the cores read, so the two
+/// belong together. That is provable from what the oracle already offers
+/// and needs no rebuild of it.
+///
+/// `None` when the head keeps moving, which is the honest answer — this
+/// validator skips the slot rather than sending a pair it cannot vouch for.
+/// A skipped assurance costs coverage; an inconsistent one costs the node a
+/// block and then gets recorded as the node's fault.
+fn stable_anchor_and_cores(
+    anchor_of: &impl Fn() -> Option<[u8; 32]>,
+    engaged_cores: &impl Fn() -> Vec<u16>,
+) -> Option<([u8; 32], Vec<u16>)> {
+    for _ in 0..STABLE_READ_ATTEMPTS {
+        let before = anchor_of()?;
+        let engaged = engaged_cores();
+        if anchor_of()? == before {
+            return Some((before, engaged));
+        }
+    }
+    None
+}
+
+/// How many times to retry the read above before giving the slot up.
+///
+/// Three, because the head moves once a slot and the three reads take
+/// microseconds: landing on a boundary twice running is already unlikely
+/// and three times is not worth waiting out.
+const STABLE_READ_ATTEMPTS: usize = 3;
 
 /// Which fault this validator poses.
 ///
@@ -737,6 +800,47 @@ mod tests {
             .iter()
             .map(|(_, o)| o.kind.code())
             .collect()
+    }
+
+    /// A head that stays put gives the anchor and the cores read under it.
+    #[test]
+    fn a_still_head_yields_its_own_cores() {
+        let pair = stable_anchor_and_cores(&|| Some([0x11; 32]), &|| vec![0, 1]);
+        assert_eq!(pair, Some(([0x11; 32], vec![0, 1])));
+    }
+
+    /// A head that moves *across* the cores read is refused, because the
+    /// pair would name one block and claim another's cores — which the node
+    /// answers by refusing to author at all.
+    #[test]
+    fn a_head_that_moves_across_the_read_is_refused() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let anchor_of = || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some([n as u8; 32])
+        };
+        assert_eq!(stable_anchor_and_cores(&anchor_of, &|| vec![0]), None);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            STABLE_READ_ATTEMPTS * 2,
+            "every attempt reads the anchor twice, and none of them settles"
+        );
+    }
+
+    /// It settles rather than giving up on the first stumble: a head that
+    /// moves once and then stops yields the pair on a later attempt.
+    #[test]
+    fn a_head_that_settles_yields_a_pair() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let anchor_of = || {
+            // Reads 0 and 1 straddle a move; everything after is settled.
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some([if n == 0 { 0 } else { 9 }; 32])
+        };
+        assert_eq!(
+            stable_anchor_and_cores(&anchor_of, &|| vec![1]),
+            Some(([9; 32], vec![1]))
+        );
     }
 
     #[test]

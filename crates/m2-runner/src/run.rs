@@ -241,10 +241,12 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
         // Keep authoring for the whole observation window, announcing each
         // block as its slot arrives (A10). Aborted with the dial tasks when the
         // window closes.
+        let lost_slots: crate::real::LostSlots = Arc::new(Mutex::new(Vec::new()));
         let mut dial_tasks = vec![tokio::spawn(drive_slots(
             Arc::clone(&ref_chain),
             emu.announce_tx(),
             Arc::clone(&epoch_contexts),
+            Arc::clone(&lost_slots),
         ))];
         for &i in &plan.initiate_now {
             let shared = shared.clone();
@@ -519,6 +521,7 @@ pub(crate) async fn run_once(cli: Cli) -> Result<Evaluation, RunError> {
             assurances_seen,
             assurances_offered,
             avail_shard_count,
+            lost_slots: Arc::clone(&lost_slots),
         };
         (
             ObsSource::Emulator {
@@ -858,6 +861,7 @@ async fn drive_slots(
     chain: Arc<RefChain>,
     announce: broadcast::Sender<Vec<u8>>,
     contexts: EpochContexts,
+    lost_slots: crate::real::LostSlots,
 ) {
     let mut next = chain.next_slot() + 1;
     let mut captured_epoch = None;
@@ -888,8 +892,11 @@ async fn drive_slots(
                     let _ = announce.send(wire);
                 }
             }
-            // The NUT's own slot, or nothing to author.
-            Ok(None) => {}
+            // The NUT's own slot. The head has not reached `next`, so no
+            // block occupies it -- a turn the node had and did not take,
+            // which `n4_ce141_inclusion` needs to tell a lost block from an
+            // unexercised row (`findings.md` §22).
+            Ok(None) => m2_emu::emu::lock(&lost_slots).push(next),
             Err(_) => break,
         }
         // A ticket proof is bound to the tickets-entropy of the epoch it
@@ -1397,28 +1404,33 @@ async fn announce_preimage(
         return;
     };
 
-    // And then for a block carrying its guarantee. Accumulation follows
-    // inclusion, so a couple of slots after the block is the earliest the
-    // request can be looked up.
-    let on_chain = wait_for(SOLICIT_WAIT_SLOTS, || {
+    // And then for the request itself to exist in the chain's state.
+    //
+    // Not for a block carrying the guarantee plus a fixed lead, which is
+    // what this did until `findings.md` §41: a package reaches a block at
+    // inclusion and the request appears only once it has accumulated, and
+    // the distance between the two moved from one slot to five across runs
+    // that differed only in validator index. Announcing inside that gap
+    // fails a node that is right to say nothing.
+    let requested = wait_for(SOLICIT_WAIT_SLOTS, || {
         shared
             .ref_chain
-            .carries_package(&package)
+            .preimage_requested(m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID, &blob)
             .ok()
-            .filter(|c| *c)
+            .filter(|requested| *requested)
     })
     .await
     .is_some();
-    if !on_chain {
+    if !requested {
         eprintln!(
-            "[preimage] no block carries the solicit for package {}; not announcing, so N6 \
-             reports itself unexercised rather than failing the node for our timing",
+            "[preimage] the solicit in package {} never reached the chain's state; not \
+             announcing, so N6 reports itself unexercised rather than failing the node for our \
+             timing",
             hex8(&package)
         );
         return;
     }
     *m2_emu::emu::lock(&shared.preimage_solicited) = true;
-    sleep_until_slot(m2_reference::chain::wall_clock_slot() + ACCUMULATE_LEAD_SLOTS).await;
 
     // An ordinary peer: a key outside the validator set, and no builder
     // suffix. The builder's connection would do on the wire, but asking for
@@ -1753,17 +1765,16 @@ const SUBMISSION_SPACING_SLOTS: u32 = 1;
 /// Slots the preimage announcer will wait for its precondition.
 ///
 /// Generous, because every step it waits on is the node's: guaranteeing the
-/// package, distributing the report, collecting assurances and authoring the
-/// block that carries it. A short wait would turn a slow node into a lane
-/// that reports itself unexercised.
-const SOLICIT_WAIT_SLOTS: u32 = 12;
-
-/// Slots between the block carrying the solicit and the announcement.
+/// package, distributing the report, collecting assurances, authoring the
+/// block that carries it and then accumulating it. A short wait would turn
+/// a slow node into a lane that reports itself unexercised.
 ///
-/// Accumulation runs after inclusion, and the request only exists once it
-/// has. Two slots is the same lead the package builder uses, for the same
-/// reason: long enough to be true, short enough not to spend the window.
-const ACCUMULATE_LEAD_SLOTS: u32 = 2;
+/// It is spent twice over -- once waiting for the submission to go out and
+/// again for the request to reach state -- and the second wait starts when
+/// the first ends, so the budget is per step rather than shared. The last
+/// step alone, inclusion to accumulation, was measured between one and five
+/// slots (`findings.md` §41).
+const SOLICIT_WAIT_SLOTS: u32 = 12;
 
 /// Slots to let an epoch settle before submitting into it.
 ///
@@ -2836,6 +2847,113 @@ mod tests {
         assert!(
             chain.core_for(TEST_NUT_INDEX, slot)?.is_some(),
             "the NUT must guarantee some core at the slot a package is submitted in"
+        );
+        Ok(())
+    }
+
+    /// The key `preimage_requested` reads is the one the engine writes, and
+    /// a solicit reaches state at **accumulation** rather than at inclusion.
+    ///
+    /// The assertion that matters is the middle one: the request is absent
+    /// while the block carrying the soliciting package is already on the
+    /// chain. That is the ordering `findings.md` §41's N6 half turns on --
+    /// the lane used to announce at inclusion plus two slots, and the
+    /// request does not exist there.
+    ///
+    /// It drives the real engine rather than asserting against a key
+    /// computed twice. A hand-made expectation would agree with a key this
+    /// harness derived wrongly, since both sides would be mine; the engine
+    /// writing the entry and this reading it back is the only version of
+    /// the check with two parties in it.
+    ///
+    /// **It does not reproduce the failure.** Here the gap is one slot,
+    /// because the assurances go in the moment the core engages, and the
+    /// old two-slot lead would have cleared it. What made the lane
+    /// index-dependent is that the gap reached five slots in a real run
+    /// (`findings.md` §41), and only a real run shows that. What this test
+    /// pins is the part a unit test can own: the key, and that inclusion is
+    /// not accumulation.
+    #[test]
+    fn a_solicit_reaches_state_only_once_it_accumulates(
+    ) -> Result<(), m2_reference::chain::ChainError> {
+        let chain = anchored_chain(45000)?;
+        let blob = m2_reference::reports::n6_preimage();
+        let service = m2_oracle_proto::DEV_BOOTSTRAP_SERVICE_ID;
+        assert!(
+            !chain.preimage_requested(service, &blob)?,
+            "nothing has solicited the blob at genesis"
+        );
+
+        let item = m2_reference::reports::work_item_that_solicits(&blob, [0x41; 32]);
+        let work = chain.guarantee_work(vec![item], 0)?;
+        let package = m2_reference::reports::package_hash(&work.package).0;
+        chain.submit_guarantee(&work.guarantee)?;
+
+        // Past the head rather than at the wall clock: seeding has already
+        // authored up to now, and `author_block` refuses a slot it holds.
+        let mut slot = chain.best_slot()? + 1;
+        let mut included = false;
+        for _ in 0..24 {
+            chain.author_block(slot)?;
+            slot += 1;
+            if chain.carries_package(&package)? {
+                included = true;
+                break;
+            }
+        }
+        assert!(included, "the guarantee reaches a block within 24 slots");
+
+        assert!(
+            !chain.preimage_requested(service, &blob)?,
+            "a block carries the solicit and the request does not exist yet: inclusion is not \
+             accumulation, and this is the window the old gate announced in"
+        );
+
+        // Assure the engaged core, which is what accumulation waits on, and
+        // keep authoring. The anchor is re-read each slot because the pool
+        // files by it and the author reads only the entry for its parent.
+        let mut requested = false;
+        for _ in 0..24 {
+            let (anchor, _) = chain.best_block()?;
+            let engaged = chain.engaged_cores()?;
+            if !engaged.is_empty() {
+                let assurances: Vec<_> = (0..jam_types::max_val_count())
+                    .map(|v| {
+                        m2_reference::assurance::as_received(
+                            &m2_reference::assurance::sign_assurance(v, anchor, &engaged),
+                            v,
+                        )
+                    })
+                    .collect();
+                chain.submit_assurances(&assurances)?;
+            }
+            chain.author_block(slot)?;
+            slot += 1;
+            if chain.preimage_requested(service, &blob)? {
+                requested = true;
+                break;
+            }
+        }
+        assert!(
+            requested,
+            "the request appears in state once the package accumulates; if this is the \
+             assertion that fails, the key may be right and the chain merely slow, so check \
+             `engaged_cores` before changing the key"
+        );
+
+        // A blob nobody solicited is not requested, so the gate cannot be
+        // passing on the mere presence of some entry.
+        assert!(
+            !chain
+                .preimage_requested(service, &m2_reference::reports::n6_unsolicited_preimage())?,
+            "a blob nobody solicited has no request"
+        );
+        // Nor on the hash alone: the request is keyed on length too.
+        let mut longer = blob.clone();
+        longer.push(0);
+        assert!(
+            !chain.preimage_requested(service, &longer)?,
+            "a different blob of a different length has no request"
         );
         Ok(())
     }

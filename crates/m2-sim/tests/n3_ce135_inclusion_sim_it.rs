@@ -213,9 +213,13 @@ async fn grade_inclusion(fault: SimFault) -> Vec<(&'static str, Outcome)> {
                 let slot = nut.block.header.slot;
                 nut.block
                     .extrinsic
-                    .guarantees_prehashed()
-                    .into_iter()
-                    .map(move |(hash, _, _)| (hash.0, slot))
+                    .guarantees
+                    .iter()
+                    .map(move |g| n3::IncludedReport {
+                        report_hash: g.report.hash().0,
+                        slot,
+                        core: g.report.core_index,
+                    })
             })
             .collect(),
         authored_slots: nut_blocks.iter().map(|n| n.block.header.slot).collect(),

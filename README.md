@@ -303,7 +303,7 @@ and pins `PvmBackend::Interpreter`.
 | P1 | `m2-reference` (now an oracle client), N1 authoring, N2 tickets | ✅ implemented |
 | P2 | N3 guaranteeing, N4 availability | ✅ implemented — graded by name (`--lanes n0,n1,n2,n3,n4`), not by default; see below |
 | P3 | N5 auditing/disputes, N6 preimages | ◑ — **N6 implemented** 2026-11-20 and passing against polkajam. **N5 parked**: its codecs are written and correct against `aa0e2b8`, but polkajam `main` still speaks the superseded CE 144/145 format and the replacement sits on an unmerged branch, so there is nothing current to grade (`findings.md` §32) |
-| P4 | N7 adversarial, index rotation, IPv6, web UI | ◑ — **N7 implemented in part** 2026-11-23: four of DESIGN §11 N7's nine rows, run against polkajam (`findings.md` §34–36). Index rotation, IPv6 and the web UI not started |
+| P4 | N7 adversarial, index rotation, IPv6, web UI | ◑ — **N7 as far as it goes** 2026-11-25: six of DESIGN §11 N7's nine rows built, including index rotation (`findings.md` §34–37, §39). The other three are **blocked, not unstarted** — §38 and §40. IPv6 and the web UI not started |
 
 **Why N3 and N4 are not in the default lane set.** A check nobody has seen
 fail is a check nobody knows is a check. Every N4 check is now held to that
@@ -390,10 +390,11 @@ engaged a core, so the node never sent an assurance and the rows reported
 themselves *not exercised* — which on a green report reads exactly like a
 node that did nothing. §21's second half then closed too: the engaged cores
 are read per slot rather than fixed when the plan is written. What is left
-is on the node's side, written up as `findings.md` §22 — a core is engaged
-for about one slot at a time, so an assurance is routinely valid when sent
-and stale when the node authors with it, and polkajam refuses to author at
-all rather than dropping it.
+is on the node's side, written up as `findings.md` §22: a peer that sends
+one signature-valid, anchor-valid assurance claiming a core that carries no
+report costs the node **every** authoring slot it owns until that peer
+stops. polkajam refuses to author at all rather than dropping the
+assurance, though it already holds the filter that would drop it.
 
 **The pin is on upstream main.** `Cargo.toml` and `oracle/Cargo.toml` point
 at polkajam `d92cadd30`, which exports three things the harness cannot do
