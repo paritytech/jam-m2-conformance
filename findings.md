@@ -1288,8 +1288,10 @@ test found was the harness.
 (`sessions/n3n4-3`), the first half the same day
 (`sessions/n3n4-4` measured it), the second after PR #16
 (`sessions/n4-cores-1`). A residual remains and belongs to §22 rather than
-here: the harness now reads the engaged cores correctly, and what is left
-is what a node does with an assurance that was valid when it was sent.
+here. **Its description was wrong until 2026-11-25** and read "what a node
+does with an assurance that was valid when it was sent" — the harness had a
+second race of its own, and what is left after closing it is what a node
+does with an assurance a peer knows to be false.
 
 An assurance says "I hold my shard of the report on core *c*". It is valid
 only where core *c* is **engaged** — carrying a report that is on chain
@@ -1391,105 +1393,131 @@ making it bigger.
 
 ---
 
-## 22. The node loses a block to an assurance that was valid when it was sent
+## 22. One peer can stop a validator authoring, for as long as it keeps sending
 
-**Status:** open, and now the strongest candidate for a real polkajam
-defect this harness has produced. First seen 2026-11-18
-(`sessions/n3n4-3`) when the harness's own assurances were all invalid;
-reproduced in `sessions/n4-cores-1` after §21 closed, when they were not.
-Still needs the settling §4 and §5 do before it is reported.
+**Status:** open, settled 2026-11-25, and now a reportable polkajam defect
+rather than a candidate. First seen 2026-11-18 (`sessions/n3n4-3`),
+reproduced through §21, and **re-diagnosed from scratch on 2026-11-25
+because the mechanism recorded here was wrong.**
 
-The other half of §21, read from the node's side. Sent an assurance naming a
-core that carries no report, polkajam **accepted it into its pool** and then
-could not author:
+### What this finding used to say, and why it was wrong
 
-```
-ERROR authoring  Error authoring block: block execution error:
-  assurances error: core not engaged
-```
+It said: *"the node loses a block to an assurance that was valid when it
+was sent"* — a core freed between the sender reading the engaged set and
+the author checking it. That is not what was happening, and two sessions of
+measurement went past it because the harness's log could not tell an
+injected fault from an accident of the harness's own.
 
-Three of three authoring slots lost, in one run, to assurances from peers.
-The node is right that the core is not engaged — that is §21, the harness's
-error — but it discovered this while composing its own block, not while
-deciding whether to pool what a peer sent it.
+Two things were true at once and neither was the recorded one.
 
-This is what `n4_ce141_invalid_assurance_excluded` exists to catch, and the
-node's failure mode is worse than the row models. The row asks whether an
-invalid assurance stayed out of the block; this node answers by not
-producing a block at all, which the row scores as *not exercised*. A lane
-that only ever looks at blocks cannot see a missing one.
+**The harness had a race of its own.** It read the anchor and the engaged
+set in two separate oracle calls, which is two views of the chain: the
+reference chain can import a block in between. A run showed the cost
+plainly — at one slot validators 0 and 4 claimed core 1 while 2, 3 and 5
+still claimed core 0, for the same slot, because their reads landed either
+side of the same transition. An assurance whose two halves come from
+different blocks is not imprecise, it is **invalid**, and the node is right
+to refuse it.
 
-**Before this is reported as a node defect it needs settling:**
+Note which direction that race fires in, because it is the opposite of the
+one this finding assumed. If the head *frees* a core between the two reads,
+the bitfield claims a subset of what the anchor engaged — still valid. Only
+a head that *engages* a core produces an invalid pair. "Valid when sent,
+stale when used" was not merely unproven, it was the safe case.
 
-1. Does JAMNP-S require a receiver to validate an assurance against the
-   engaged cores *before* pooling it? `simple.md` is thinner here than the
-   on-chain rule is.
-2. Is a validator expected to defend its own authoring against what peers
-   send it, or is an unauthored slot the accepted cost of a bad peer? The
-   practical reading is that one peer should not be able to cost a validator
-   its blocks by sending one malformed assurance.
-3. ~~Observed in one run, and in a run whose assurances were all invalid
-   for the harness's own reason. Reproduce against a run that sends valid
-   ones — which means §21 first.~~ §21 is closed, and the behaviour
-   survives it.
+Closed by `stable_anchor_and_cores`: read the head, read the cores, read
+the head again, and use the pair only if it did not move. That is provable
+from what the oracle already offers and needs no rebuild of it.
 
-**What §21 closing did to this.** With the engaged cores read per slot, the
-node still lost two of seven authoring slots (`sessions/n4-cores-1`), and
-the two were consecutive and immediately after availability completed. So
-the sharpened question is narrower and better than the one first recorded:
+**Doing so removed two of the five lost slots** at validator index 1
+(`sessions/fix22-k1`, against `sessions/fix41-k1`), and blocks authored
+went from 10 to 14. So the race was real and was part of it. It was not all
+of it.
 
-> The harness reads the engaged cores about two seconds before the slot and
-> the node checks them when it authors. A core freed in between leaves an
-> assurance that was **valid when it was sent** and stale when it is used.
-> polkajam refuses to author at all rather than dropping it.
+### What is actually happening
 
-That is not a harness aiming badly any more. It is a validator losing a
-block to a peer that did nothing wrong, and in a real network reports
-become available constantly, so the window this needs is not rare.
-
-**How wide the window is.** A run now prints the engaged set whenever it
-moves, and the answer is that it moves constantly
-(`sessions/n4-cores-2`, one validator's view):
+The harness injects `AssuranceFaultKind::EmptyCore` from the midpoint of
+its assurance plan: an assurance claiming a core that carries no report,
+signed properly, anchored properly, so that **only the claim is false**. At
+index 1 validators 2 and 5 pose it. The run log now says so at the moment
+it goes out, which is what finally made the correlation visible:
 
 ```
-slot 9884653 -> []
-slot 9884654 -> [1]
-slot 9884655 -> [0]
-...
-slot 9884665 -> []
+EmptyCore sent in slots   9977695 .. 9977712
+node authored (14)        every one at slot <= 9977694
+node lost (3)             9977702, 9977703, 9977710
+node authored again       9977716
 ```
 
-A core is engaged for about a slot at a time. Against that turnover a
-two-second lead is most of the life of the value, so "valid when sent,
-stale when used" is not an edge case — it is the ordinary case, and it is
-why the harness reading the set correctly still leaves the node losing
-blocks.
+**Every block the node authored was before the first faulty assurance, and
+every authoring slot it owned inside the window was lost.** It recovered
+the slot after the window closed. One peer, one false bit, and the
+validator stops producing blocks until that peer stops.
 
-That also disposes of the lag question: the harness is tracking the set
-slot by slot and sending what it sees. What is stale by authoring time is
-the assurance already sitting in the node's pool, which no sender can do
-anything about. In a real network reports become available constantly and
-every validator's pool is full of assurances for cores that have since
-been freed.
+Reproduced exactly across two consecutive runs (`fix22-k1`, `fix22-k1b`):
+three lost slots, fourteen blocks, same window.
 
-Guarantees are the instructive contrast, verified while writing §21: block
-composition re-checks every guarantee it holds and **skips** the ones that
-no longer apply. Assurances are fatal instead. Whether that asymmetry is
-deliberate is the first question to put to the conformance group.
+### Where it goes wrong, in the node
 
-**Why receive-time checking cannot be the answer**, traced through the node
-2026-11-19. `AssuranceTracker::on_assurance_received`
-(`availability/assurance_tracker.rs:140`) accepts an assurance when the
-leaf is known, the signer is known, it is not a duplicate and the signature
-verifies. It does not read the bitfield — and at that moment it has no
-reason to, because the assurance *is* valid. The staleness appears
-afterwards, between pooling and authoring. `assurances_at` (`:58`) then
-returns the pool unfiltered and the author puts all of it in the block. So
-the filter has to sit at composition, which is exactly where the guarantee
-equivalent already sits.
+Three places, and polkajam already has the code for two of them.
 
-Written up for the node's authors as `ask_polkajam.md`, with the code path,
-the three runs, and what is deliberately not being claimed.
+1. **Receive.** `AssuranceTracker::on_assurance_received`
+   (`availability/assurance_tracker.rs:140`) accepts an assurance when the
+   leaf is known, the signer is known, it is not a duplicate and the
+   signature verifies. It never reads the bitfield — though at that moment
+   it holds the anchor, and so could check the claim against that block's
+   ρ. A peer's false claim is pooled.
+2. **Composition.** `assurances_at` (`:58`) returns the pool unfiltered.
+   But `chain/authoring/mod.rs:327-343` *does* hold exactly the filter this
+   needs — it drops any assurance claiming a core not engaged in ρ† — and
+   gates it on `!disputes.verdicts.is_empty()`, with the reasoning stated
+   in its own comment:
+
+   > "So with no verdicts ρ† == ρ and every assurance is still valid,
+   > letting us skip the per-core scan entirely (the common case)."
+
+   The premise holds for an honest sender and fails for a dishonest one.
+   Nothing makes every pooled assurance valid; a peer need only lie.
+3. **Execution.** `progress` (`chain/exec/assurances.rs:63`) then returns
+   `CoreNotEngaged` for the whole extrinsic, and authoring fails.
+
+The chain rule at (3) is correct: a block carrying such an assurance *is*
+invalid. That is precisely why the filter at (2) has to run unconditionally
+— the author is the last party who can keep a peer's lie out of its own
+block, and it already knows how.
+
+**Guarantees are the instructive contrast**, and the asymmetry is the
+single clearest way to put the question: block composition re-checks every
+guarantee it holds and **skips** the ones that no longer apply. Assurances
+are fatal instead. Whether that is deliberate is the first thing to ask.
+
+### What the harness cannot see, and why that matters
+
+`n4_ce141_invalid_assurance_excluded` exists to ask whether an invalid
+assurance stayed out of the block. In this run it never appears at all —
+113 rows of `n4_ce141_inclusion_not_exercised` instead — because the node
+does not produce the block that would have excluded it.
+
+**A lane that only ever looks at blocks cannot see a missing one.** The
+node's failure mode is worse than the row models, and the row scores it as
+no coverage rather than as a failure. That is a gap in the lane as much as
+a defect in the node, and it is not fixed here.
+
+### What is deliberately not claimed
+
+- Not that the node must accept the assurance. It must not; the block
+  would be invalid.
+- Not that the sender is doing anything the protocol permits. It is not —
+  this is the harness misbehaving on purpose, which is what fault injection
+  is for.
+- Only this: **a node should lose the peer, not the slot.** One peer's
+  provable lie costing a validator every block it owns is a denial of
+  service that one unconditional filter — already written, already in the
+  file — would close.
+
+`simple.md` does not settle whether a receiver must validate an assurance's
+bitfield before pooling it; it is thinner here than the on-chain rule is.
+That is worth asking alongside the defect rather than instead of it.
 
 ---
 

@@ -194,13 +194,19 @@ harness assured actually became available.
 
 **What the residual turned out to be.** Two slots still went, and a new
 diagnostic that prints the engaged set whenever it moves says why: a core
-is engaged for about **one slot at a time**. Against that turnover the
-two-second assurance lead is most of the life of the value, so an assurance
-is routinely valid when sent and stale when the node authors with it. That
-is not the harness aiming badly any more, and §22 is rewritten around it —
-*the node loses a block to an assurance that was valid when it was sent* —
-now the strongest candidate for a real polkajam defect this harness has
-produced.
+is engaged for about **one slot at a time**.
+
+That turnover was read, for a week, as the cause: an assurance valid when
+sent and stale when the node authors with it. **It was not.** Re-diagnosed
+2026-11-25, the losses split in two — a second race of the harness's own,
+reading the anchor and the engaged set in separate oracle calls, and then
+the harness's *deliberate* `EmptyCore` fault. With the race closed the
+correlation is total: every block the node authored was before the first
+faulty assurance, and every authoring slot it owned inside the fault window
+was lost. §22 is rewritten around what that actually shows — **one peer can
+stop a validator authoring, for as long as it keeps sending** — which is a
+stronger finding than the one it replaces and is now reportable rather than
+a candidate.
 
 **CE 134 receive.** The simulated node refines a bundle it is sent and
 answers with the report's hash; three faults cost `n3_ce134_answered`,

@@ -390,10 +390,11 @@ engaged a core, so the node never sent an assurance and the rows reported
 themselves *not exercised* — which on a green report reads exactly like a
 node that did nothing. §21's second half then closed too: the engaged cores
 are read per slot rather than fixed when the plan is written. What is left
-is on the node's side, written up as `findings.md` §22 — a core is engaged
-for about one slot at a time, so an assurance is routinely valid when sent
-and stale when the node authors with it, and polkajam refuses to author at
-all rather than dropping it.
+is on the node's side, written up as `findings.md` §22: a peer that sends
+one signature-valid, anchor-valid assurance claiming a core that carries no
+report costs the node **every** authoring slot it owns until that peer
+stops. polkajam refuses to author at all rather than dropping the
+assurance, though it already holds the filter that would drop it.
 
 **The pin is on upstream main.** `Cargo.toml` and `oracle/Cargo.toml` point
 at polkajam `d92cadd30`, which exports three things the harness cannot do
