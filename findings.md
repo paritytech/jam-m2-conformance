@@ -2837,6 +2837,16 @@ distinction §32 draws for N5. Of DESIGN's nine N7 rows: five done, two
 blocked here, and two left that need nothing new — epoch-transition with a
 validator-set change, and index rotation.
 
+**That last sentence did not survive the week** (2026-11-25). Index
+rotation was built and found two defects on first use (§39), and the
+epoch-transition row turned out to be blocked too, for a third unrelated
+reason (§40). The standing count is **six built, three blocked, none
+unstarted**, and DESIGN §11 N7 now carries it in the table itself rather
+than in prose underneath, so the next reader does not have to reconcile
+three documents to learn what is left. The note is kept rather than the
+line rewritten because the arithmetic was right when it was written; what
+changed is the world, which is the thing a finding is for.
+
 ---
 
 ## 39. N0's sync rows pass at index 5 by luck of the grid

@@ -664,7 +664,7 @@ hidden it.
 | **M2-C** — Guaranteeing | N3 | 21 / 41 | ✅ **complete** — the lane runs against polkajam and every submission row is held to the fault bar (`m2-sim/tests/n3_*_sim_it.rs`, 36 tests) |
 | **M2-D** — Availability | N4 | 30 / 41 | ✅ **complete** — the lane runs; serve, assurance and inclusion rows all proven by injected faults (`n4_sim_it.rs`, `n4_inclusion_sim_it.rs`, 14 tests) |
 | **M2-E** — Audit & preimages | N5, N6 | 41 / 41 | ◑ **half** — N6 complete and passing (2026-11-20, `n6_sim_it.rs`, 9 tests). **N5 parked**, see below |
-| **M2-F** — Adversarial | N7 | + fault matrix | ◑ **started** — four of DESIGN §11 N7's nine rows, run against polkajam 2026-11-23 (§34–36 of `findings.md`) |
+| **M2-F** — Adversarial | N7 | + fault matrix | ◑ **as far as it goes** — six of DESIGN §11 N7's nine rows built; the other three are blocked, not unstarted (§34–40 of `findings.md`). See below |
 | **M2-G** — Rollout | — | ecosystem-gated | ⏳ not started — one node has ever been graded |
 
 **On N5, the one designed lane with no implementation.** Not blocked on effort. `jam-np`
@@ -677,13 +677,33 @@ redesign makes N5 *harder* rather than easier, because the current format derive
 tranche and cores from a Bandersnatch VRF output instead of declaring them; and the two
 formats are separable by message length, if a tolerant reader is ever wanted.
 
-**On N7.** Four rows of nine: unknown stream kind, malformed and truncated messages,
-slow-loris, and kill-and-restart. The five still to come are flood, equivocation, reorg,
-epoch-transition with a validator-set change, and index rotation. Three of the rows that
-exist have no fault-injection coverage and cannot get it from `m2-sim`, which runs
-in-process: there is no process to kill and no stand-in that can pose "came back but will
-not serve". §36 records that as a real gap in the terms the project holds every other lane
-to.
+**On N7.** Six rows of nine are built: unknown stream kind, malformed and truncated
+messages, slow-loris, flood (§37), kill-and-restart, and index rotation (§39). **The
+remaining three are blocked rather than unstarted** — equivocation and reorg both need
+the harness to hold a block its own chain does not contain, which the reference engine
+will not author (§38), and the epoch-transition row needs a validator-set change the
+reference chain cannot follow (§40). Each would be easy to *check*; none can be
+*driven*. Unblocking any of them means a change in the oracle or in polkajam's authoring
+rather than in the lanes, so the milestone is as far as it goes rather than part-done, and
+DESIGN §11 N7 marks the three in its own table.
+
+Index rotation is unlike the other five: it grades across runs rather than within one, so
+it produces no row in a single report. `--validator-index` re-runs the suite and
+`rotation.rs` compares the reports, calling out only a row that passed at one index and
+failed at another. It has found two things so far — §39 and §41 — and both were the
+harness's, not the node's.
+
+**Separately, and not the same three:** three of the rows that *are* built have no
+fault-injection coverage and cannot get it from `m2-sim`, which runs in-process —
+`n7_restart_serves_again`, `n7_restart_authors_again` and `n7_node_alive_after`. There is
+no process to kill and no stand-in that can pose "came back but will not serve". §36
+records that as a real gap in the terms the project holds every other lane to.
+
+The flood rows sit just short of the bar rather than under it. `StopsServingUnderLoad`
+proves the *measurement* — a stand-in that answers its bystander throughout against one
+that stops — but the test asserts on `connection_answers` rather than on the row's
+verdict, so the row itself is still proven only by unit tests over fabricated facts.
+Closing that is a few lines, not a design problem.
 
 **On M2-B.** Its bar is *"Safrole tickets covered, **and** the harness's own checks are proven
 by deliberately faulty simulated clients"* — the delivery plan calls it the structural
@@ -711,8 +731,9 @@ block (`findings.md` §14). Writing N6's found a row that *vanished* instead of 
 the node asked for the wrong preimage. Writing N7's found two defects in its own rows —
 caught not by a test but by reading the first real report, which is the rule §35 ends on.
 
-What remains: three N7 rows that cannot be covered this way at all, because `m2-sim` runs in
-the test process and there is no process to kill (§36); and the fact that nothing drives a
+What remains: N7's two restart rows and its liveness row, which cannot be covered this
+way at all, because `m2-sim` runs in the test process and there is no process to kill
+(§36); and the fact that nothing drives a
 simulated run from the CLI — the proofs live in the test suite, which is where they run on
 every commit.
 
@@ -806,7 +827,7 @@ Result: the node accepts every ticket the emulator offers. `invalid ticket signa
 | Crates | 7 (`jamnp-s`, `m2-oracle-proto`, `m2-reference`, `m2-emu`, `m2-scenario`, `m2-runner`, `m2-sim`) |
 | Rust | 40.3k lines under `crates/*/src`, 46.0k with the integration tests |
 | `cargo test --workspace` | **592 passed / 0 failed** (plus the oracle tree's own) |
-| Lanes implemented | N0, N1, N2, N3, N4, N6, and N7 in part. N5 parked — see the ladder |
+| Lanes implemented | N0, N1, N2, N3, N4, N6, and N7 — six of N7's nine rows, the other three blocked rather than unstarted. N5 parked — see the ladder |
 | Fault injection | 76 named `SimFault` variants, 24 integration tests across 17 files, one per lane |
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets` | 3 warnings, all pre-existing |
@@ -1158,10 +1179,11 @@ list of real gaps rather than of unstarted work.
   not for their totals.
 - **Negative testing now exists in every implemented lane.** 75 named `SimFault` variants
   and 24 integration tests, one file per lane, each showing a row passing against an honest
-  stand-in and failing against one broken in exactly that way. Three N7 rows are the
-  exception and cannot be covered this way: `m2-sim` runs in the test process, so there is no
-  process to kill and no stand-in that can pose "came back but will not serve"
-  (`findings.md` §36).
+  stand-in and failing against one broken in exactly that way. The exception is N7's two
+  restart rows and its liveness row, which cannot be covered this way: `m2-sim` runs in the
+  test process, so there is no process to kill and no stand-in that can pose "came back but
+  will not serve" (`findings.md` §36). These are three of the six N7 rows that exist, and
+  not the three that DESIGN §11 N7 marks blocked.
 
 - **One real node has been graded, and the bar it clears is the harness's own.** Several
   rows assert deliberately less than DESIGN's wording reads like, each recorded where it is

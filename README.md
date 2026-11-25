@@ -303,7 +303,7 @@ and pins `PvmBackend::Interpreter`.
 | P1 | `m2-reference` (now an oracle client), N1 authoring, N2 tickets | ✅ implemented |
 | P2 | N3 guaranteeing, N4 availability | ✅ implemented — graded by name (`--lanes n0,n1,n2,n3,n4`), not by default; see below |
 | P3 | N5 auditing/disputes, N6 preimages | ◑ — **N6 implemented** 2026-11-20 and passing against polkajam. **N5 parked**: its codecs are written and correct against `aa0e2b8`, but polkajam `main` still speaks the superseded CE 144/145 format and the replacement sits on an unmerged branch, so there is nothing current to grade (`findings.md` §32) |
-| P4 | N7 adversarial, index rotation, IPv6, web UI | ◑ — **N7 implemented in part** 2026-11-23: four of DESIGN §11 N7's nine rows, run against polkajam (`findings.md` §34–36). Index rotation, IPv6 and the web UI not started |
+| P4 | N7 adversarial, index rotation, IPv6, web UI | ◑ — **N7 as far as it goes** 2026-11-25: six of DESIGN §11 N7's nine rows built, including index rotation (`findings.md` §34–37, §39). The other three are **blocked, not unstarted** — §38 and §40. IPv6 and the web UI not started |
 
 **Why N3 and N4 are not in the default lane set.** A check nobody has seen
 fail is a check nobody knows is a check. Every N4 check is now held to that

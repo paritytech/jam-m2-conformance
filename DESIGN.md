@@ -754,23 +754,35 @@ validator chosen by the same helper above.
 
 ### N7 — adversarial and robustness (cross-cutting)
 
-| Fault | Expected |
-|---|---|
-| Unknown stream byte (130, 200) | reset stream, connection stays up |
-| Length prefix mismatch / truncated / trailing bytes | reset, no crash, connection reusable |
-| Slow-loris CE stream (kind byte then 30 s silence) | timeout and reset *(soft)* |
-| Flood: 500 CE 141 streams per second from one peer | stays responsive; authors on time |
-| Equivocating emulated author | builds on neither; no re-announce *(soft)* — **blocked**, `findings.md` §38 |
-| Reorg: emulated majority extends a sibling | NUT follows the reference best chain; CE 128 ascending reflects it — **blocked**, `findings.md` §38 |
-| Epoch-transition connectivity `:86-98` | with a scheduled validator-set change: connect to the next set, keep the old set until the first block of the epoch is finalized **and** one slot elapsed; UP 0 topology re-evaluated `:200-202` — **blocked**, `findings.md` §40 |
-| Kill and restart NUT mid-epoch | re-syncs via CE 128/129; authors again in its next slot |
-| NUT index rotation | every lane re-run with `k ∈ {1..5}` to catch index-dependent bugs (grid neighbours, shard index) |
+| Fault | Expected | Status |
+|---|---|---|
+| Unknown stream byte (130, 200) | reset stream, connection stays up | **built** |
+| Length prefix mismatch / truncated / trailing bytes | reset, no crash, connection reusable | **built** |
+| Slow-loris CE stream (kind byte then 30 s silence) | timeout and reset *(soft)* | **built** |
+| Flood: 500 CE 141 streams per second from one peer | stays responsive; authors on time | **built**, `findings.md` §37 |
+| Kill and restart NUT mid-epoch | re-syncs via CE 128/129; authors again in its next slot | **built**, `findings.md` §36 |
+| NUT index rotation | every lane re-run with `k ∈ {1..5}` to catch index-dependent bugs (grid neighbours, shard index) | **built**, `findings.md` §39 |
+| Equivocating emulated author | builds on neither; no re-announce *(soft)* | **blocked**, `findings.md` §38 |
+| Reorg: emulated majority extends a sibling | NUT follows the reference best chain; CE 128 ascending reflects it | **blocked**, `findings.md` §38 |
+| Epoch-transition connectivity `:86-98` | with a scheduled validator-set change: connect to the next set, keep the old set until the first block of the epoch is finalized **and** one slot elapsed; UP 0 topology re-evaluated `:200-202` | **blocked**, `findings.md` §40 |
 
 Out of scope: GRANDPA/BEEFY (no JAMNP-S spec). Finality is emulated by the harness (§10).
 
-**Three rows are blocked rather than unstarted**, all for the same class of
-reason: the harness cannot *drive* the scenario, and in every case the
-checks themselves would be easy to write.
+**Six of the nine are built and three are blocked; none is unstarted.**
+That is the whole lane accounted for, and the distinction matters because
+a blocked row and an unwritten one look identical in a plan and are not
+the same thing: the three below are not waiting on effort here.
+
+Index rotation is the odd one of the six. It grades *across* runs rather
+than within one — `--validator-index` re-runs the suite and
+`m2-runner`'s `rotation.rs` compares the reports, calling out only a row
+that passed at one index and failed at another. So it produces no row of
+its own in a single run's report, and a run at one index has not
+exercised it. `findings.md` §39 and §41 are what it has found so far.
+
+**The three blocked rows** are blocked for the same class of reason: the
+harness cannot *drive* the scenario, and in every case the checks
+themselves would be easy to write.
 
 The epoch-transition row needs a validator-set change. The spec can
 schedule one — writing a different keyset into `Designates` (ι) activates
@@ -779,8 +791,8 @@ index, at session open, so after the change the reference chain can no
 longer author for the active set and stalls exactly when the row wants to
 watch. `findings.md` §40 has the measurement.
 
-Equivocation and reorg both
-need the harness to hold a block its own chain does not contain, and the
+Equivocation and reorg both need the harness to hold a block its own
+chain does not contain, and the
 reference engine will not author one: it refuses any parent that is not the
 chain's best block, because its preimage and guarantee tables are keyed to
 the head. Building them needs either a change inside polkajam's authoring
