@@ -177,19 +177,24 @@ pub fn work_item_that_exports(count: u16, salt: [u8; 32]) -> WireItem {
 
 /// The exporting item, optionally also soliciting a preimage on chain.
 ///
-/// The two jobs ride one item because only one package in a run can do the
-/// second. A `Solicit` takes effect in *accumulate*, and a report is only
-/// accumulated once it is available -- which means assured, which means the
-/// availability plan covered it. That plan is built from the first report
-/// the node distributes, so the first package is the only one whose
-/// accumulate ever runs. A solicit on any later package is guaranteed,
-/// included, and then sits unaccumulated for the rest of the run.
+/// The two jobs ride one item because a solicit on a submission of its own
+/// has not yet been made to work, **not** because only one package per run
+/// accumulates. Several do: a run assures every engaged core, and two and
+/// three accumulates in one run have both been measured (`findings.md`
+/// §31, which said the opposite until 2026-11-26).
 ///
-/// Measured rather than assumed: `sessions/n6-2` put the solicit on its own
-/// submission a slot behind the honest one, the node guaranteed and
-/// included it, and the bootstrap service accumulated exactly once -- for
-/// the honest package. The announcement that followed was correctly
-/// ignored, because no service had asked for anything.
+/// What defeats the obvious arrangement is core engagement. A core carries
+/// one report at a time and the guarantor rotation holds a validator on one
+/// core for `rotation_period()` slots, so a soliciting package submitted a
+/// slot behind the honest one is addressed to the core the honest package
+/// has just engaged. It is never guaranteed, so it never accumulates.
+/// Measured 2026-11-26: the package was built and submitted, two other
+/// packages accumulated in the same run, and this one reached no block.
+///
+/// The untried arrangement is a submission on the *next* rotation, four or
+/// more slots out, when the node holds a different core. §31 records it as
+/// one live run's worth of work. Until someone does it, leave this alone —
+/// tidying the two jobs apart is what costs a run.
 pub fn work_item_that_exports_and_solicits(
     count: u16,
     salt: [u8; 32],

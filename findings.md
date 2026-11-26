@@ -2231,32 +2231,101 @@ all, which is why validator 1 went unnoticed through five sessions.
 
 ---
 
-## 31. Only the first package a run submits is ever accumulated
+## 31. Only one package a run submits can carry an on-chain effect — REWRITTEN 2026-11-26
 
-**Status:** open, and it is a harness limitation rather than a node defect.
-Found 2026-11-20 while building N6, which is the first lane to need
-anything from *accumulate* rather than from the wire.
+**Status:** open as a harness limitation, and **rewritten on 2026-11-26
+because the mechanism and the measurement recorded here were both wrong.**
+The limitation is real; almost everything this finding said about why was
+not. Found 2026-11-20 while building N6, the first lane to need anything
+from *accumulate* rather than from the wire.
 
-A work item's `Solicit`, `Transfer`, `Bless` or any other on-chain effect
-takes place in accumulate. A report is accumulated only once it is
-available; available means assured; and the harness assures exactly one
-report per run, because the availability plan is built from the first report
-the node distributes (`m2-runner`'s `plan_package`). So **the first package
-is the only one whose accumulate ever runs.** Every later package is
-guaranteed, included, and then sits there.
+### What this finding used to say, and why it was wrong
 
-**Measured** (`sessions/n6-2`). The solicit was given its own submission one
-slot behind the honest one. The node guaranteed it, included it, and the
-bootstrap service accumulated exactly once -- for the honest package, at
-slot 9907730. The announcement that followed was correctly ignored, because
-no service had asked for anything. Moving the solicit onto the honest
-package made the same run pass (`sessions/n6-3`).
+It said: the availability plan is built from the first report the node
+distributes, so the harness assures exactly one report per run, so **the
+first package is the only one whose accumulate ever runs**. And it cited
+`sessions/n6-2` as having accumulated exactly once.
+
+**Neither half survives contact with the evidence.**
+
+The plan governs the *fetches* — CE 137 through CE 140 and CE 148 all name
+`plan.erasure_root` or `plan.segments_root`. It does not govern the
+assurance. `drive_availability` signs with
+`sign_assurance(peer, anchor, &engaged)`, where `engaged` is **every core
+carrying a report at that moment**, read fresh each slot. That has been true
+since `cafeba3` on 2026-11-18 — two days *before* this finding was written,
+which is the part worth being uncomfortable about. The claim was never
+checked against the code it described.
+
+And `sessions/n6-2`, the session cited as proof, did not accumulate once:
+
+```
+13:53:00 ... #0 Bootstrap Service Accumulate, 0h @9907730
+13:53:30 ... #0 Bootstrap Service Accumulate, 0h @9907735
+```
+
+Two packages, five slots apart, one per core. A fresh run at index 1
+produced three. The harness log says plainly that both cores are assured:
+
+```
+[availability] validator 0 sees cores [0, 1] engaged at slot 9992222, was Some([])
+```
+
+So "every later package is guaranteed, included, and then sits there" is
+false, and the rule drawn from it — that no later package's accumulate can
+run — is false with it.
+
+### What is actually constraining it
+
+A core carries one report at a time. It is engaged when a block carries its
+guarantee and freed once the report is available, and the guarantor rotation
+holds a validator on one core for `rotation_period()` slots, which is four
+under tiny.
+
+So a soliciting package submitted one slot behind the honest one is
+addressed to **the core the node is still holding, which the honest package
+has just engaged**. It is not guaranteed, so it is not included, so it never
+accumulates — and the reason has nothing to do with being second.
+
+**Measured 2026-11-26**, solicit moved to its own submission one slot behind
+the honest one, 300 s window, index 1:
+
+```
+[builder] slot 9992221 solicits N6's preimage in package 00f47753
+[preimage] the solicit in package 00f47753 never reached the chain's state
+```
+
+while two other packages accumulated at 9992226 and 9992228 inside the same
+run. The solicit package appears nowhere between those two lines: never
+guaranteed, never included.
+
+A second run placed the solicit last of eight submissions instead, eight
+slots out, and failed a *different* way — the announcer's first wait, for
+the submission to go out at all, expired before it did. Two placements, two
+unrelated failures, neither of them "later packages do not accumulate".
+
+### What is not settled
+
+Whether a soliciting package placed on the **next rotation** — four or more
+slots out, when the node holds a different core — is guaranteed and
+accumulates in time for N6's announcer. That is the experiment this finding
+should have run in the first place, and it is one live run. Both the
+budget (`SOLICIT_WAIT_SLOTS` is 12) and the window look sufficient on
+paper; paper is what produced this finding's first two claims.
+
+**The workaround stays until that is measured.** N6's `Solicit` still rides
+the honest package. What changes today is that the comment explaining why
+no longer tells the next reader something untrue.
 
 **What it costs today.** N6's `Solicit` rides the honest package rather than
 a submission of its own, which is not where it belongs: the honest package
 is what N3 and N4 grade, and it now has a second job. The comment on
-`work_item_that_exports_and_solicits` says why it has to, so the next reader
-does not "tidy" it apart and spend a run finding out.
+`work_item_that_exports_and_solicits` says why, and now says the right why.
+
+**What it costs a lane that needs two on-chain effects** is less than this
+finding claimed. Two packages do accumulate. What a second effect needs is a
+submission on a core the node holds and has not just engaged, which is a
+scheduling problem rather than a wall.
 
 **What it would cost a lane that needs two.** Any future row that needs two
 independent on-chain effects -- a solicit and a forget, a transfer and a
@@ -2264,11 +2333,20 @@ lookup -- cannot have them, because the second package's accumulate will
 never run. That is the shape to watch for, and it is a property of the
 harness's availability plan rather than of the protocol.
 
-**What would fix it.** The availability plan would have to cover every
-report the node distributes rather than the first, which means assuring more
-than one core's worth per run. `findings.md` §12 records why the plan cannot
-be written before the run; this is the other half of the same constraint and
-is worth solving together with it.
+**What would fix the part that is real.** The plan would have to cover every
+report the node distributes rather than the first, which means fetching
+against more than one erasure root per run. §12 records why the plan cannot
+be written before the run; that is still the other half of this constraint.
+Note what this is *not*: it is about the fetches and therefore about N4's
+serve rows, not about accumulation, which needs nothing from the plan.
+
+**The rule, and it is the second time this month.** §22 recorded a
+mechanism that the code contradicted, and three sessions went past it
+because the write-up read as settled. This finding did the same thing two
+days after the code had already made it false. *A finding that names a
+cause must cite the line that makes it true* — a plausible mechanism and a
+measured symptom are not the same claim, and pairing them reads like
+evidence when it is a guess wearing one.
 
 **Why this is not a node finding.** Nothing polkajam did here was wrong. A
 report that is not available must not be accumulated, and the node declining
