@@ -325,22 +325,26 @@ async fn the_flood_row_measures_bystanders_not_the_flooder() {
         let bystander = dial(0x7e).await;
         let trace = Mutex::new(Trace::default());
 
-        let opened = robustness::flood_streams(
-            &flooder,
-            PEER,
-            jamnp_s::framing::CE141,
-            500,
-            std::time::Duration::from_millis(500),
-            &trace,
-        )
-        .await;
-        // `connection_answers`, not `connection_still_serves`: the defect
-        // here is a node that answers nobody while every connection stays
-        // open, which a connection-liveness check reports as healthy.
-        let served = robustness::connection_answers(&bystander, PEER, genesis, &trace).await;
+        // The flood and the bystander's question run together, as the live
+        // runner does it: asking only after the flood stopped would measure
+        // recovery, which is the other row.
+        let duration = std::time::Duration::from_millis(500);
+        let flooding =
+            robustness::flood_streams(&flooder, PEER, jamnp_s::framing::CE141, 500, duration, &trace);
+        let watching = async {
+            // Let the flood build before asking, or the question lands while
+            // the node is still idle and answers something that proves nothing.
+            clock::current().sleep(duration / 2).await;
+            // `connection_answers`, not `connection_still_serves`: the defect
+            // here is a node that answers nobody while every connection stays
+            // open, which a connection-liveness check reports as healthy.
+            robustness::connection_answers(&bystander, PEER, genesis, &trace).await
+        };
+        let (opened, during) = tokio::join!(flooding, watching);
+        let after = robustness::connection_answers(&bystander, PEER, genesis, &trace).await;
 
         assert_eq!(
-            served,
+            during,
             bystander_should_be_served,
             "with {fault:?} the bystander should{} have been served; {opened} streams opened",
             if bystander_should_be_served {
@@ -349,6 +353,90 @@ async fn the_flood_row_measures_bystanders_not_the_flooder() {
                 " not"
             }
         );
+
+        // The measurement above is only half of it. What the report says is
+        // the row's verdict, and a measurement that never reaches one grades
+        // nothing -- which is what this test used to assert and all it
+        // asserted (`findings.md` §42).
+        let ctx = N7Ctx {
+            provocations: Vec::new(),
+            alive_after: None,
+            restart: None,
+            flood: Some(n7::FloodFacts {
+                target_rate_per_sec: 500,
+                duration_ms: duration.as_millis() as u64,
+                streams_opened: opened,
+                flooder_survived: flooder.end_reason().is_none(),
+                served_bystander_during: Some(during),
+                served_bystander_after: Some(after),
+                authored_during: Vec::new(),
+            }),
+        };
+        let obs = m2_scenario::dsl::ObsLog::new();
+        let rows: Vec<(&'static str, Outcome)> = (n7::flood_serves_bystanders(&ctx).run)(&obs)
+            .into_iter()
+            .map(|row| (row.name, row.outcome))
+            .collect();
+
+        let expected = if bystander_should_be_served {
+            Outcome::Pass
+        } else {
+            Outcome::Fail(Severity::Soft)
+        };
+        assert_eq!(
+            outcomes_of(&rows, "n7_flood_serves_bystander_during"),
+            [&expected],
+            "with {fault:?} the during row must reach that verdict"
+        );
+        assert_eq!(
+            outcomes_of(&rows, "n7_flood_serves_bystander_after"),
+            [&expected],
+            "with {fault:?} the recovery row must reach that verdict too: this stand-in counts              streams over its whole life, so once past tolerance it never comes back"
+        );
+        assert!(
+            outcomes_of(&rows, "n7_flood_bystander_not_measured").is_empty(),
+            "a measured run must not also report itself unmeasured"
+        );
+
         serving.abort();
     }
+}
+
+/// A flood nobody watched must report itself unmeasured, not pass.
+///
+/// The failure this guards is the one §19 records in another lane: a row
+/// whose subject never arrived reporting a clean verdict. Here the flood
+/// runs and no bystander asks anything, so there is nothing to grade and the
+/// row has to say so.
+#[tokio::test(start_paused = true)]
+async fn a_flood_with_no_bystander_is_not_a_pass() {
+    let ctx = N7Ctx {
+        provocations: Vec::new(),
+        alive_after: None,
+        restart: None,
+        flood: Some(n7::FloodFacts {
+            target_rate_per_sec: 500,
+            duration_ms: 500,
+            streams_opened: 2400,
+            flooder_survived: true,
+            served_bystander_during: None,
+            served_bystander_after: None,
+            authored_during: Vec::new(),
+        }),
+    };
+    let obs = m2_scenario::dsl::ObsLog::new();
+    let rows: Vec<(&'static str, Outcome)> = (n7::flood_serves_bystanders(&ctx).run)(&obs)
+        .into_iter()
+        .map(|row| (row.name, row.outcome))
+        .collect();
+
+    assert_eq!(
+        outcomes_of(&rows, "n7_flood_bystander_not_measured"),
+        [&Outcome::Fail(Severity::Soft)],
+        "an unmeasured flood is reported, not passed"
+    );
+    assert!(
+        outcomes_of(&rows, "n7_flood_serves_bystander_during").is_empty(),
+        "and it must not also claim the node served anyone"
+    );
 }

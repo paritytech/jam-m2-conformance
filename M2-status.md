@@ -699,11 +699,16 @@ fault-injection coverage and cannot get it from `m2-sim`, which runs in-process 
 no process to kill and no stand-in that can pose "came back but will not serve". §36
 records that as a real gap in the terms the project holds every other lane to.
 
-The flood rows sit just short of the bar rather than under it. `StopsServingUnderLoad`
-proves the *measurement* — a stand-in that answers its bystander throughout against one
-that stops — but the test asserts on `connection_answers` rather than on the row's
-verdict, so the row itself is still proven only by unit tests over fabricated facts.
-Closing that is a few lines, not a design problem.
+The flood rows **were** in that position and no longer are (§42, closed 2026-11-26). The
+test proved the measurement — a stand-in that answers its bystander throughout against one
+that stops — and asserted on `connection_answers` rather than on the row's verdict. It now
+builds the `FloodFacts` the live runner builds and asserts the outcomes, and a mutation
+confirms it fails when the row is rewired to pass regardless.
+
+One flood row stays short of the bar on purpose: `n7_flood_authors` reports `true` or
+reports nothing, so no input makes it fail. The reason was that this harness could not tell
+which slots the node was due in — which §22's work has since made false, so §42 records
+the row as worth rebuilding rather than as settled.
 
 **On M2-B.** Its bar is *"Safrole tickets covered, **and** the harness's own checks are proven
 by deliberately faulty simulated clients"* — the delivery plan calls it the structural

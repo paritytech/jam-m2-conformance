@@ -2939,11 +2939,15 @@ changed is the world, which is the thing a finding is for.
 
 ---
 
-## 39. N0's sync rows pass at index 5 by luck of the grid
+## 39. N0's sync rows pass at index 5 by luck of the grid — CLOSED 2026-11-26
 
-**Status:** open. Two defects, one in the harness and one a node/spec
-divergence, found 2026-11-24 by the first use of N7's index-rotation row
-and reproduced across two rounds of runs.
+**Status:** closed 2026-11-26. Two defects, one in the harness and one a
+node/spec divergence, found 2026-11-24 by the first use of N7's
+index-rotation row and reproduced across two rounds of runs. **Both are
+settled:** the harness defect was fixed the same day, and the divergence
+was answered by polkajam on 2026-11-25 — the restriction is intended and
+the NP is the document that moves. The note under *The node/spec
+divergence* below has the answer and which way the amendment runs.
 
 N0 graded at three validator indices, same seed, same window:
 
@@ -3309,3 +3313,80 @@ far, five were the harness's. A row that disagrees across indices is
 evidence about the harness until proven otherwise, and the rotation's value
 is not that it finds node defects but that it finds the rows that were only
 ever passing by arrangement.
+
+---
+
+## 42. The flood rows were measured and never graded, and one of them cannot fail — CLOSED 2026-11-26
+
+**Status:** closed 2026-11-26 for the first half; the second half is
+recorded and deliberately left. Found 2026-11-25 while reconciling N7's row
+bookkeeping (§38), which is the point — nobody set out to look for this.
+
+### The gap
+
+`m2-sim`'s flood test built both halves of the experiment correctly: a
+stand-in that answers its bystander throughout, and `StopsServingUnderLoad`,
+which stops answering anybody once one peer crosses its tolerance. It then
+asserted on `connection_answers` — the **measurement** — and stopped there.
+
+So the thing proven was that the harness can tell a node defending itself
+from a node falling over. What was never proven is that the *row* says so.
+`n7_flood_serves_bystander_during` and `..._after` were graded only by unit
+tests over a fabricated `N7Ctx`, which is the bar §36 describes for the
+restart rows, in rows nobody had counted as sitting under it.
+
+The distinction is not academic. §19 records a row whose subject never
+arrived reporting a clean verdict, and §14 records two rows asking for the
+wrong block — both were measurements that worked feeding a verdict that did
+not. A measurement that never reaches a verdict grades nothing.
+
+**Closed** by building the `FloodFacts` the live runner builds, running
+`flood_serves_bystanders` and asserting the outcomes: `Pass` against the
+honest stand-in, `Fail(Soft)` against the broken one, for both the during
+and the recovery row. The recovery row fails too because this stand-in
+counts streams over its whole life and never comes back, which the test
+says out loud so the next reader does not take it for a recovery bug.
+
+A second test covers the shape §19 records: a flood that ran with nobody
+watching must report `n7_flood_bystander_not_measured` and must not also
+claim the node served someone.
+
+**Verified by mutation.** With the during row rewired to report `true`
+whatever it measured, the test fails — `left: [Pass], right: [Fail(Soft)]`.
+Restored, it passes. A test that has not been seen to fail is not evidence.
+
+### The half left open: `n7_flood_authors` cannot fail
+
+```rust
+if let Some(first) = flood.authored_during.iter().min().copied() {
+    return vec![log::check_detail("n7_flood_authors", true, Severity::Soft, ...)];
+}
+vec![log::check_detail("n7_flood_authoring_not_exercised", false, ...)]
+```
+
+The row reports `true` or it reports nothing. There is no input that makes
+it say the node failed to author under load — which is *the* thing a flood
+row most wants to know, and the rule §13 closed another lane for.
+
+**It is deliberate and the reason given is real.** The doc comment says
+this harness cannot tell which slots the node was due in, so silence is
+ambiguous and a verdict drawn from it would be a guess — and failing a node
+for its own timing is the mistake §3, §18 and §41 all record.
+
+**But the reason has expired.** §22's work built exactly the machinery this
+needs: `drive_slots` now records on the NUT arm, so the harness *does* know
+which slots the node owned and produced nothing in, and
+`n4_ce141_invalid_assurance_cost_a_block` already grades a lost turn on
+that basis. A node that owns a slot inside the flood window and authors
+nothing there is a verdict, not a guess.
+
+Not done here because it is a row's worth of work rather than a test's, and
+because it wants the same care §22's row needed: attribute the lost slot to
+the flood only where the window actually covers it, and under-count rather
+than guess. Recorded so that the next person to open N7 finds it.
+
+**The rule.** *Proving the measurement is not proving the row.* A test that
+stops at the instrument has tested the instrument. Every lane's bar is that
+the row reaches a verdict and the verdict is wrong against a node that is
+wrong — and three findings now exist because a measurement was right while
+the thing built on it was not.
