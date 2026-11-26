@@ -226,10 +226,15 @@ which closes the sampling gap this entry was left with.
 
 ---
 
-## 4. The node applies the work-package size cap on CE 133 and not on CE 146
+## 4. The node applies the work-package size cap on CE 133 and not on CE 146 — CLOSED 2026-11-25
 
-**Status:** open, narrowed, and most of what this finding used to say was
-wrong. Opened 2026-11-15 as "the node accepts a CE 133 first message over
+**Status:** closed 2026-11-25, a **confirmed node defect**. Answered by
+polkajam in issue #36: *"I mean it's up to the implementation but PolkaJam
+should be rejecting oversized packages in both cases. If it isn't then that
+is a bug."* The row is right, its severity is right, and the hedge it has
+been carrying in three documents is removed.
+
+Opened 2026-11-15 as "the node accepts a CE 133 first message over
 the size cap". Rewritten 2026-11-20, when §8's investigation showed the
 node had been enforcing that cap all along and the harness could not see
 the refusal.
@@ -283,22 +288,30 @@ that carries the spec's number is the one that was written for this
 protocol. `simple.md:383` states CE 146's cap in the same SHOULD form and
 with the same rationale as `:362-364`.
 
-**The question that survives.** Whether the cap binds the receiver at all
-is still unsettled, and it is still a question for the conformance group
-rather than the harness: `:362-364` and `:383` are both **should**, both
-addressed to the message, and both justified by a protection offered to
-guarantors, which reads more like a licence to refuse than a duty to.
+**The question that survived, and its answer.** The question put was
+whether the cap binds the receiver at all: `:362-364` and `:383` are both
+**should**, both addressed to the message, and both justified by a
+protection offered to guarantors, which reads more like a licence to refuse
+than a duty to. The finding had already narrowed it — polkajam could no
+longer be cited as a node taking the permissive reading, because it takes
+the strict one on CE 133, which made CE 146 look like an oversight rather
+than a position.
 
-What has changed is that polkajam can no longer be cited as a node that
-takes the permissive reading. It takes the strict one on CE 133. The
-likelier reading of CE 146 is now an oversight rather than a position.
+It was an oversight. The answer confirms it directly, and the row grades a
+real defect.
 
-**What this costs the question put to the spec authors.** `ask_dave.md` is
-written around the claim corrected above and must not be sent as it stands.
+**What the answer does not settle.** It is about this node's intent, not
+about the protocol: *"it's up to the implementation, but"*. So the
+**should**/**must** reading of `:362` and `:383` stays open, and matters
+the first time this suite is pointed at a second implementation — a node
+that accepts an over-cap package on both protocols has not been shown to
+violate anything the document requires. The row is correct against
+polkajam, which is the only node that has ever been graded. §39's answer
+came with *"we can probably say in JAM-NP that…"*; this one did not, and
+the difference is worth keeping.
 
 `n3_ce133_oversized_refused` passes against polkajam as of 2026-11-20.
-`n3_ce146_oversized_refused` fails, and is the only part of this finding
-with a live failure behind it.
+`n3_ce146_oversized_refused` fails, and that failure is now a verdict.
 
 ---
 
@@ -2066,9 +2079,28 @@ node's. This one differs: the row was right and the *subject* was missing.
 The node really did not reach validator 4, because there was nothing there
 to reach.
 
-## 30. A message the node refuses closes the whole connection
+## 30. A message the node refuses closes the whole connection — CLOSED 2026-11-25
 
-**Status:** open, and it is a node defect. Found 2026-11-19, chasing §29's
+**Status:** closed 2026-11-25. **Not a defect — intended behaviour**,
+answered by polkajam in issue #36: *"If you send a malformed message then
+you are not following the protocol and PolkaJam will close the connection.
+This is intended."* The stated reasons are avoiding a DoS and clearing a
+transient connection fault by turning it off and on again.
+
+The finding had already concluded this was a policy question rather than a
+bug, and had already kept the row **Soft** on that reading. The answer
+settles the policy in the node's favour, so the row stays soft permanently
+rather than pending a decision, and the escalation stops being something
+the harness reports as wrong.
+
+**What the finding keeps.** The cost is real and the measurement stands:
+refusing one message takes down every unrelated protocol in flight with
+that peer, and a peer cannot tell "this message was rejected" from "this
+connection failed". That is recorded as a cost, not an accusation — and
+it is why the harness reports each close in the node's own words rather
+than silently.
+
+Found 2026-11-19, chasing §29's
 open half: a connection to one emulated validator that ended every few
 slots and nothing could explain.
 
@@ -2199,32 +2231,101 @@ all, which is why validator 1 went unnoticed through five sessions.
 
 ---
 
-## 31. Only the first package a run submits is ever accumulated
+## 31. Only one package a run submits can carry an on-chain effect — REWRITTEN 2026-11-26
 
-**Status:** open, and it is a harness limitation rather than a node defect.
-Found 2026-11-20 while building N6, which is the first lane to need
-anything from *accumulate* rather than from the wire.
+**Status:** open as a harness limitation, and **rewritten on 2026-11-26
+because the mechanism and the measurement recorded here were both wrong.**
+The limitation is real; almost everything this finding said about why was
+not. Found 2026-11-20 while building N6, the first lane to need anything
+from *accumulate* rather than from the wire.
 
-A work item's `Solicit`, `Transfer`, `Bless` or any other on-chain effect
-takes place in accumulate. A report is accumulated only once it is
-available; available means assured; and the harness assures exactly one
-report per run, because the availability plan is built from the first report
-the node distributes (`m2-runner`'s `plan_package`). So **the first package
-is the only one whose accumulate ever runs.** Every later package is
-guaranteed, included, and then sits there.
+### What this finding used to say, and why it was wrong
 
-**Measured** (`sessions/n6-2`). The solicit was given its own submission one
-slot behind the honest one. The node guaranteed it, included it, and the
-bootstrap service accumulated exactly once -- for the honest package, at
-slot 9907730. The announcement that followed was correctly ignored, because
-no service had asked for anything. Moving the solicit onto the honest
-package made the same run pass (`sessions/n6-3`).
+It said: the availability plan is built from the first report the node
+distributes, so the harness assures exactly one report per run, so **the
+first package is the only one whose accumulate ever runs**. And it cited
+`sessions/n6-2` as having accumulated exactly once.
+
+**Neither half survives contact with the evidence.**
+
+The plan governs the *fetches* — CE 137 through CE 140 and CE 148 all name
+`plan.erasure_root` or `plan.segments_root`. It does not govern the
+assurance. `drive_availability` signs with
+`sign_assurance(peer, anchor, &engaged)`, where `engaged` is **every core
+carrying a report at that moment**, read fresh each slot. That has been true
+since `cafeba3` on 2026-11-18 — two days *before* this finding was written,
+which is the part worth being uncomfortable about. The claim was never
+checked against the code it described.
+
+And `sessions/n6-2`, the session cited as proof, did not accumulate once:
+
+```
+13:53:00 ... #0 Bootstrap Service Accumulate, 0h @9907730
+13:53:30 ... #0 Bootstrap Service Accumulate, 0h @9907735
+```
+
+Two packages, five slots apart, one per core. A fresh run at index 1
+produced three. The harness log says plainly that both cores are assured:
+
+```
+[availability] validator 0 sees cores [0, 1] engaged at slot 9992222, was Some([])
+```
+
+So "every later package is guaranteed, included, and then sits there" is
+false, and the rule drawn from it — that no later package's accumulate can
+run — is false with it.
+
+### What is actually constraining it
+
+A core carries one report at a time. It is engaged when a block carries its
+guarantee and freed once the report is available, and the guarantor rotation
+holds a validator on one core for `rotation_period()` slots, which is four
+under tiny.
+
+So a soliciting package submitted one slot behind the honest one is
+addressed to **the core the node is still holding, which the honest package
+has just engaged**. It is not guaranteed, so it is not included, so it never
+accumulates — and the reason has nothing to do with being second.
+
+**Measured 2026-11-26**, solicit moved to its own submission one slot behind
+the honest one, 300 s window, index 1:
+
+```
+[builder] slot 9992221 solicits N6's preimage in package 00f47753
+[preimage] the solicit in package 00f47753 never reached the chain's state
+```
+
+while two other packages accumulated at 9992226 and 9992228 inside the same
+run. The solicit package appears nowhere between those two lines: never
+guaranteed, never included.
+
+A second run placed the solicit last of eight submissions instead, eight
+slots out, and failed a *different* way — the announcer's first wait, for
+the submission to go out at all, expired before it did. Two placements, two
+unrelated failures, neither of them "later packages do not accumulate".
+
+### What is not settled
+
+Whether a soliciting package placed on the **next rotation** — four or more
+slots out, when the node holds a different core — is guaranteed and
+accumulates in time for N6's announcer. That is the experiment this finding
+should have run in the first place, and it is one live run. Both the
+budget (`SOLICIT_WAIT_SLOTS` is 12) and the window look sufficient on
+paper; paper is what produced this finding's first two claims.
+
+**The workaround stays until that is measured.** N6's `Solicit` still rides
+the honest package. What changes today is that the comment explaining why
+no longer tells the next reader something untrue.
 
 **What it costs today.** N6's `Solicit` rides the honest package rather than
 a submission of its own, which is not where it belongs: the honest package
 is what N3 and N4 grade, and it now has a second job. The comment on
-`work_item_that_exports_and_solicits` says why it has to, so the next reader
-does not "tidy" it apart and spend a run finding out.
+`work_item_that_exports_and_solicits` says why, and now says the right why.
+
+**What it costs a lane that needs two on-chain effects** is less than this
+finding claimed. Two packages do accumulate. What a second effect needs is a
+submission on a core the node holds and has not just engaged, which is a
+scheduling problem rather than a wall.
 
 **What it would cost a lane that needs two.** Any future row that needs two
 independent on-chain effects -- a solicit and a forget, a transfer and a
@@ -2232,11 +2333,20 @@ lookup -- cannot have them, because the second package's accumulate will
 never run. That is the shape to watch for, and it is a property of the
 harness's availability plan rather than of the protocol.
 
-**What would fix it.** The availability plan would have to cover every
-report the node distributes rather than the first, which means assuring more
-than one core's worth per run. `findings.md` §12 records why the plan cannot
-be written before the run; this is the other half of the same constraint and
-is worth solving together with it.
+**What would fix the part that is real.** The plan would have to cover every
+report the node distributes rather than the first, which means fetching
+against more than one erasure root per run. §12 records why the plan cannot
+be written before the run; that is still the other half of this constraint.
+Note what this is *not*: it is about the fetches and therefore about N4's
+serve rows, not about accumulation, which needs nothing from the plan.
+
+**The rule, and it is the second time this month.** §22 recorded a
+mechanism that the code contradicted, and three sessions went past it
+because the write-up read as settled. This finding did the same thing two
+days after the code had already made it false. *A finding that names a
+cause must cite the line that makes it true* — a plausible mechanism and a
+measured symptom are not the same claim, and pairing them reads like
+evidence when it is a guess wearing one.
 
 **Why this is not a node finding.** Nothing polkajam did here was wrong. A
 report that is not available must not be accumulated, and the node declining
@@ -2247,6 +2357,26 @@ to act on a preimage no service had requested is the rule working.
 ## 32. The node implements the superseded CE 144/145 wire format
 
 **Status:** open, but **not** the node finding it first looked like.
+
+**One answer landed 2026-11-25** (issue #36) and it is a node-side bug for
+whenever N5 unparks: *"Yeah we should accept batched CE 144/145 messages.
+This was recently added to the spec so possibly just not implemented fully
+yet. Possibly there should be a maximum in the spec but this is likely to
+be reworked again for gossiping so not going to worry about that for
+now..."*
+
+So the `ConstU32<1>` receive caps on the tranche-redesign branch are an
+unfinished implementation rather than a position, batching is something a
+receiver **must** accept, and a batch-receive row is a legitimate hard row
+when the lane is built. No maximum is coming, deliberately — which means
+the row asserts that a batch of two is accepted, not that a batch of N is
+refused.
+
+**The other half of that question got no answer**, and is worth re-asking:
+`aa0e2b8` is not backward-compatible with `a96dc6b`, and a single positive
+CE 145 judgment is byte-identical between the two revisions. Two nodes a
+revision apart agree perfectly until the first negative judgment. Nothing
+in the document says so.
 Found 2026-11-20 while starting N5, and corrected the same day: the fix is
 already written upstream, on a branch that has not reached `main`. What is
 left is an integration-timing finding, which is a different thing to report
@@ -2520,10 +2650,22 @@ that governs it, not only the lines that moved.*
 
 ---
 
-## 34. DESIGN's N7 table expects more than the NP requires
+## 34. DESIGN's N7 table expects more than the NP requires — CLOSED 2026-11-25
 
-**Status:** open, and it is a defect in our own design document rather than
-in any node. Found 2026-11-23, writing the N7 lane.
+**Status:** closed 2026-11-25. A defect in our own design document rather
+than in any node, found 2026-11-23 writing the N7 lane, and **fixed where
+it was**: DESIGN §11 N7's first two rows no longer state "reset stream,
+connection stays up" as the expectation. They now say the node is still
+serving afterwards, and that *how* it refuses is reported in its own words
+rather than asserted.
+
+Closing it needed two things. The argument below, which was always the
+harness's own reading of `simple.md`; and polkajam's answer of 2026-11-25
+(issue #36), which confirms the behaviour is deliberate rather than an
+oversight — *"If you send a malformed message then you are not following
+the protocol and PolkaJam will close the connection. This is intended."*
+§30 and §35 record it in full. The table had been describing a
+requirement that neither the document nor the implementer agrees exists.
 
 **Numbering note.** §32 and §33 exist on the unmerged `jv-n5-auditing`
 branch. This is §34 so the two cannot collide; if N7 lands first there will
@@ -2573,11 +2715,37 @@ Every row's severity traces to spec text or to something true without it,
 never to our own table — and where the table and the spec disagree, the
 table is what changes.
 
+**What it cost to leave the table unfixed for two days.** Nothing, as it
+happens, because the lane was written to the spec and not to the table.
+But that is luck rather than process: the next lane written from these
+tables would have inherited the invented requirement, and the finding that
+caught it only exists because someone compared the two by hand. The fix
+belongs in the table, which is where the next reader looks — recording it
+in `findings.md` alone would have left the trap armed.
+
 ---
 
-## 35. The node contains an unassigned stream kind in range, and closes the connection for everything else
+## 35. The node contains an unassigned stream kind in range, and closes the connection for everything else — CLOSED 2026-11-25
 
-**Status:** open, node defect, and a refinement of §30 rather than a new
+**Status:** closed 2026-11-25. **Not a defect — a deliberate exception**,
+answered by polkajam in issue #36: *"As an exception we do not currently
+reject invalid stream protocol IDs. The reason for this is to achieve some
+degree of forward-compatibility. This could change in the future once the
+initial version of the protocol is finalized."*
+
+So the asymmetry this finding measured — kind 130 contained, everything
+else closing — is not an inconsistency. It is one rule with one stated
+exception, for a stated reason, with a stated expiry. The harness should
+not grade a node for being *more* forgiving on exactly the path where
+forward-compatibility is the point.
+
+**Worth keeping for later.** The exception is explicitly temporary. A
+future polkajam may close the connection on an unassigned kind too, and a
+row that hard-asserts today's containment on kind 130 would then fail a
+node for conforming to the finalized protocol. N7's containment rows are
+Soft, which is why this costs nothing — see §34.
+
+A refinement of §30 rather than a new
 one. Measured 2026-11-23 against polkajam `main` at `d92cadd30`, in
 `sessions/n7-1` and reproduced in `sessions/n7-2`. First results from the
 N7 lane.
@@ -2849,11 +3017,15 @@ changed is the world, which is the thing a finding is for.
 
 ---
 
-## 39. N0's sync rows pass at index 5 by luck of the grid
+## 39. N0's sync rows pass at index 5 by luck of the grid — CLOSED 2026-11-26
 
-**Status:** open. Two defects, one in the harness and one a node/spec
-divergence, found 2026-11-24 by the first use of N7's index-rotation row
-and reproduced across two rounds of runs.
+**Status:** closed 2026-11-26. Two defects, one in the harness and one a
+node/spec divergence, found 2026-11-24 by the first use of N7's
+index-rotation row and reproduced across two rounds of runs. **Both are
+settled:** the harness defect was fixed the same day, and the divergence
+was answered by polkajam on 2026-11-25 — the restriction is intended and
+the NP is the document that moves. The note under *The node/spec
+divergence* below has the answer and which way the amendment runs.
 
 N0 graded at three validator indices, same seed, same window:
 
@@ -2946,6 +3118,20 @@ ours to settle — a node that served every peer's block requests would be
 trivially floodable, so the restriction is defensible engineering. But the
 two documents disagree, and a conformance harness cannot grade this until
 they agree.
+
+**Answered 2026-11-25** in issue #36: *"This is working as intended. We can
+probably say in JAM-NP that validators should not make block requests to
+non-neighbour validators."* The node is right and the NP is the document
+that moves.
+
+Note which way the amendment runs. We read the gap as the node being
+stricter than the protocol permits; the fix proposed is to restrict the
+*requester* instead — a validator should not ask a non-neighbour, rather
+than a node must serve whoever asks. The harness's fix is unaffected
+either way, because it stopped the probe asking a non-neighbour, which is
+exactly what the amendment would require of it. But a harness built on our
+reading would have gone on to assert that a node must serve any validator,
+and that row would have been wrong.
 
 ### What the row cost and bought
 
@@ -3162,7 +3348,7 @@ Three runs at indices 1, 3 and 5 after the fix (`sessions/fix41-k1`,
 All three indices now fail exactly the same three rows, every one of them
 index-independent and already known: `ce129_boundary_parent_before_child`
 (a standing node defect), `n2_unknown_epoch_reset_observed`, and
-`n3_ce146_oversized_refused` (the verdict §4 asks the NP owner about).
+`n3_ce146_oversized_refused` (since confirmed a node bug — §4).
 
 Index 1 reproduced the original N3 shape beat for beat, which is what makes
 the diagnosis more than a plausible story: the distribution went out on
@@ -3205,3 +3391,80 @@ far, five were the harness's. A row that disagrees across indices is
 evidence about the harness until proven otherwise, and the rotation's value
 is not that it finds node defects but that it finds the rows that were only
 ever passing by arrangement.
+
+---
+
+## 42. The flood rows were measured and never graded, and one of them cannot fail — CLOSED 2026-11-26
+
+**Status:** closed 2026-11-26 for the first half; the second half is
+recorded and deliberately left. Found 2026-11-25 while reconciling N7's row
+bookkeeping (§38), which is the point — nobody set out to look for this.
+
+### The gap
+
+`m2-sim`'s flood test built both halves of the experiment correctly: a
+stand-in that answers its bystander throughout, and `StopsServingUnderLoad`,
+which stops answering anybody once one peer crosses its tolerance. It then
+asserted on `connection_answers` — the **measurement** — and stopped there.
+
+So the thing proven was that the harness can tell a node defending itself
+from a node falling over. What was never proven is that the *row* says so.
+`n7_flood_serves_bystander_during` and `..._after` were graded only by unit
+tests over a fabricated `N7Ctx`, which is the bar §36 describes for the
+restart rows, in rows nobody had counted as sitting under it.
+
+The distinction is not academic. §19 records a row whose subject never
+arrived reporting a clean verdict, and §14 records two rows asking for the
+wrong block — both were measurements that worked feeding a verdict that did
+not. A measurement that never reaches a verdict grades nothing.
+
+**Closed** by building the `FloodFacts` the live runner builds, running
+`flood_serves_bystanders` and asserting the outcomes: `Pass` against the
+honest stand-in, `Fail(Soft)` against the broken one, for both the during
+and the recovery row. The recovery row fails too because this stand-in
+counts streams over its whole life and never comes back, which the test
+says out loud so the next reader does not take it for a recovery bug.
+
+A second test covers the shape §19 records: a flood that ran with nobody
+watching must report `n7_flood_bystander_not_measured` and must not also
+claim the node served someone.
+
+**Verified by mutation.** With the during row rewired to report `true`
+whatever it measured, the test fails — `left: [Pass], right: [Fail(Soft)]`.
+Restored, it passes. A test that has not been seen to fail is not evidence.
+
+### The half left open: `n7_flood_authors` cannot fail
+
+```rust
+if let Some(first) = flood.authored_during.iter().min().copied() {
+    return vec![log::check_detail("n7_flood_authors", true, Severity::Soft, ...)];
+}
+vec![log::check_detail("n7_flood_authoring_not_exercised", false, ...)]
+```
+
+The row reports `true` or it reports nothing. There is no input that makes
+it say the node failed to author under load — which is *the* thing a flood
+row most wants to know, and the rule §13 closed another lane for.
+
+**It is deliberate and the reason given is real.** The doc comment says
+this harness cannot tell which slots the node was due in, so silence is
+ambiguous and a verdict drawn from it would be a guess — and failing a node
+for its own timing is the mistake §3, §18 and §41 all record.
+
+**But the reason has expired.** §22's work built exactly the machinery this
+needs: `drive_slots` now records on the NUT arm, so the harness *does* know
+which slots the node owned and produced nothing in, and
+`n4_ce141_invalid_assurance_cost_a_block` already grades a lost turn on
+that basis. A node that owns a slot inside the flood window and authors
+nothing there is a verdict, not a guess.
+
+Not done here because it is a row's worth of work rather than a test's, and
+because it wants the same care §22's row needed: attribute the lost slot to
+the flood only where the window actually covers it, and under-count rather
+than guess. Recorded so that the next person to open N7 finds it.
+
+**The rule.** *Proving the measurement is not proving the row.* A test that
+stops at the instrument has tested the instrument. Every lane's bar is that
+the row reaches a verdict and the verdict is wrong against a node that is
+wrong — and three findings now exist because a measurement was right while
+the thing built on it was not.

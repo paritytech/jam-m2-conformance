@@ -699,11 +699,16 @@ fault-injection coverage and cannot get it from `m2-sim`, which runs in-process 
 no process to kill and no stand-in that can pose "came back but will not serve". §36
 records that as a real gap in the terms the project holds every other lane to.
 
-The flood rows sit just short of the bar rather than under it. `StopsServingUnderLoad`
-proves the *measurement* — a stand-in that answers its bystander throughout against one
-that stops — but the test asserts on `connection_answers` rather than on the row's
-verdict, so the row itself is still proven only by unit tests over fabricated facts.
-Closing that is a few lines, not a design problem.
+The flood rows **were** in that position and no longer are (§42, closed 2026-11-26). The
+test proved the measurement — a stand-in that answers its bystander throughout against one
+that stops — and asserted on `connection_answers` rather than on the row's verdict. It now
+builds the `FloodFacts` the live runner builds and asserts the outcomes, and a mutation
+confirms it fails when the row is rewired to pass regardless.
+
+One flood row stays short of the bar on purpose: `n7_flood_authors` reports `true` or
+reports nothing, so no input makes it fail. The reason was that this harness could not tell
+which slots the node was due in — which §22's work has since made false, so §42 records
+the row as worth rebuilding rather than as settled.
 
 **On M2-B.** Its bar is *"Safrole tickets covered, **and** the harness's own checks are proven
 by deliberately faulty simulated clients"* — the delivery plan calls it the structural
@@ -855,7 +860,7 @@ rows — 406 hard passes, 40 soft passes, 3 hard findings.**
 | N0 connectivity and sync | UP 0, CE 128, CE 129 | 43 | 1 hard failure: `ce129_boundary_parent_before_child`, a node defect standing since the first runs |
 | N1 authoring | asserted over UP 0 and CE 128 | 67 | clean; parent, seal and prior/posterior state roots graded per block |
 | N2 Safrole tickets | CE 131, CE 132 | 133 | 1 hard failure: `n2_unknown_epoch_reset_observed` — the ticket is refused, the stream is not reset |
-| N3 guaranteeing | CE 133, CE 146, CE 134, CE 135 | 74 | 1 hard failure: `n3_ce146_oversized_refused` — `findings.md` §4, a question rather than a verdict |
+| N3 guaranteeing | CE 133, CE 146, CE 134, CE 135 | 74 | 1 hard failure: `n3_ce146_oversized_refused` — `findings.md` §4, **confirmed a node bug** by polkajam 2026-11-25 |
 | N4 availability | CE 137–141, CE 148 | 297 | clean on hard rows; 127 soft rows are one unexercised control |
 | N6 preimages | CE 142, CE 143 | 5 | clean |
 | N7 adversarial | malformed streams, restart | 12 | 6 soft failures — `findings.md` §35; the restart row is correctly unexercised outside an N7-only run |

@@ -1064,10 +1064,11 @@ fn plan_package_for_this_run(
         co_guarantors: plan.co_guarantors.clone(),
         fault: None,
         imports: false,
-        // N6's solicit rides the honest package because only the first
-        // report the node distributes is ever made available, and a report
-        // that is not available is never accumulated -- so no later
-        // package's `Solicit` takes effect. Measured in `sessions/n6-2`.
+        // N6's solicit rides the honest package because a submission of its
+        // own lands on the core the honest package has just engaged, and is
+        // never guaranteed. Not because later packages cannot accumulate --
+        // they do, several per run (`findings.md` §31). A submission on the
+        // next rotation is the untried arrangement.
         solicits: solicit_preimage,
     }];
     // The CE 133 faults, then CE 146: the same package over the whole-bundle

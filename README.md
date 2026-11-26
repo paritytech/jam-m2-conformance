@@ -91,7 +91,7 @@ harness's, and they are the same three as the previous run:
 |---|---|
 | `ce129_boundary_parent_before_child` | a node defect, standing since the first N0 runs |
 | `n2_unknown_epoch_reset_observed` | a node defect: the ticket is rejected, the stream is not reset |
-| `n3_ce146_oversized_refused` | `findings.md` §4 — the node applies the work-package size cap on CE 133 and not on CE 146. Whether the cap binds the receiver at all is unsettled, so this is a question rather than a verdict |
+| `n3_ce146_oversized_refused` | `findings.md` §4 — the node applies the work-package size cap on CE 133 and not on CE 146. polkajam confirmed this a bug 2026-11-25: it should reject oversized packages on both |
 
 Rows per lane: N0 43, N1 67, N2 133, N3 74, N4 297, N6 5, N7 12.
 
@@ -344,9 +344,13 @@ usable — while three other paths (a kind outside the span, a short message,
 trailing bytes) close the whole connection. That narrows `findings.md` §30
 from "the node closes connections" to one branch handling the unknown well
 and three others treating a malformed stream as a connection-level offence.
-Those rows are **soft**: the NP defines what a reset *means* but nowhere
-requires one over a connection close, and §34 records why grading them hard
-would fail a node on a rule nobody wrote.
+Those rows are **soft**, and polkajam's 2026-11-25 answer says they must
+stay that way: closing the connection on a malformed message is intended,
+for DoS reasons, and tolerating an unassigned stream kind is a deliberate
+forward-compatibility exception rather than an inconsistency. The NP
+defines what a reset *means* but nowhere requires one over a connection
+close; §34 records why grading these hard would fail a node on a rule
+nobody wrote, and §30 and §35 record the answer that confirms it.
 
 **Every row a node can cause in N3 and N4 has now been seen to fail.** The
 last one that could not be reached was the CE 134 mapping row, and getting
@@ -375,9 +379,12 @@ gone twice over, and what is left is a judgement rather than a gap:
 `n3_ce133_oversized_refused` and `n3_ce146_oversized_refused` are Hard
 against a reading of `simple.md` that §4 records as unsettled, and making
 these lanes default would fail a third-party node on a **should**. They stay
-opt-in until that is settled — the more so now that polkajam is known to
-take the strict reading on one of the two protocols and the permissive one
-on the other, which is how little the wording settles.
+opt-in, and polkajam's 2026-11-25 answer does not change that. It confirms
+the node should reject on both protocols — which makes the failing row a
+real defect — but it is an answer about that node's intent, *"it's up to
+the implementation, but"*, and not about what the protocol requires. A
+third-party node that accepts an over-cap package on both has still not
+been shown to violate anything.
 
 **N4's assurance rows have now been answered by a real node.** As of
 2026-11-18 a live run grades `n4_ce141_well_formed`,
