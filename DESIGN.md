@@ -759,7 +759,7 @@ validator chosen by the same helper above.
 | Unknown stream byte (130, 200) | the node is still serving afterwards. *How* it refuses — stream reset or connection close — is reported in its own words, not asserted *(soft)* | **built**, `findings.md` §34 |
 | Length prefix mismatch / truncated / trailing bytes | no crash, and the node is still serving afterwards. The refusal path is reported, not asserted *(soft)* | **built**, `findings.md` §34 |
 | Slow-loris CE stream (kind byte then 30 s silence) | timeout and reset *(soft)* | **built** |
-| Flood: 500 CE 141 streams per second from one peer | stays responsive; authors on time | **built**, `findings.md` §37 |
+| Flood: 500 CE 141 streams per second from one peer | stays responsive; authors on time | **built**, `findings.md` §37, §42 |
 | Kill and restart NUT mid-epoch | re-syncs via CE 128/129; authors again in its next slot | **built**, `findings.md` §36 |
 | NUT index rotation | every lane re-run with `k ∈ {1..5}` to catch index-dependent bugs (grid neighbours, shard index) | **built**, `findings.md` §39 |
 | Equivocating emulated author | builds on neither; no re-announce *(soft)* | **blocked**, `findings.md` §38 |

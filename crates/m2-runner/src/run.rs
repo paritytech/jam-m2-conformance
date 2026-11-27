@@ -1985,6 +1985,11 @@ async fn flood_node(
         .iter()
         .map(|n| n.block.header.slot)
         .collect();
+    // The first slot that *begins* once the flood is under way. The slot
+    // the flood starts in is part-spent, and a turn the node took early in
+    // it was taken before any load arrived, so counting it would attribute
+    // to the flood something the flood cannot have caused.
+    let window_first = m2_reference::chain::wall_clock_slot() + 1;
 
     // The flood and the bystander's question run together: asking after it
     // stopped would measure recovery, which is the other row.
@@ -2015,11 +2020,30 @@ async fn flood_node(
 
     // A couple of slots so an authoring turn can land.
     sleep_until_slot(m2_reference::chain::wall_clock_slot() + 2).await;
-    let authored_during: Vec<u32> = m2_emu::emu::lock(&data.nut_blocks)
+    let all_nut_slots: Vec<u32> = m2_emu::emu::lock(&data.nut_blocks)
         .iter()
         .map(|n| n.block.header.slot)
+        .collect();
+    let authored_during: Vec<u32> = all_nut_slots
+        .iter()
+        .copied()
         .filter(|slot| !before.contains(slot))
         .collect();
+    // The slot now in progress is still the node's to author in, so the
+    // window ends with the last one that is over.
+    let window_last = m2_reference::chain::wall_clock_slot().saturating_sub(1);
+    let turns_missed = turns_missed_in_window(
+        &m2_emu::emu::lock(&data.lost_slots),
+        &all_nut_slots,
+        window_first,
+        window_last,
+    );
+    if !turns_missed.is_empty() {
+        eprintln!(
+            "[n7] flood: the node owned slots {turns_missed:?} in {window_first}..={window_last} \
+             and no block of its for them reached the harness"
+        );
+    }
 
     Some(FloodFacts {
         target_rate_per_sec: FLOOD_RATE_PER_SEC,
@@ -2029,7 +2053,34 @@ async fn flood_node(
         served_bystander_during: Some(during),
         served_bystander_after: Some(after),
         authored_during,
+        turns_missed,
     })
+}
+
+/// The turns the node dropped inside the flood window.
+///
+/// Both conditions are necessary and the row's honesty rests on them
+/// (`findings.md` §42):
+///
+/// - **`lost` says the slot was the node's.** `drive_slots` records a slot
+///   only where the reference engine declined to author it, which is how
+///   the engine says that slot belongs to the NUT, and only where the head
+///   had not already passed it.
+/// - **No block of the node's for it ever arrived.** The engine looks at
+///   the start of a slot and the node may author part-way through it, so
+///   `lost` on its own over-counts. Checked against every NUT block of the
+///   run rather than the ones inside the window, because a block adopted
+///   late still proves the turn was taken.
+///
+/// Outside `first..=last` nothing is attributed: the slot the flood began
+/// in is part-spent before any load arrives, and the slot in progress when
+/// the measurement ends is one the node can still author in.
+fn turns_missed_in_window(lost: &[u32], nut_slots: &[u32], first: u32, last: u32) -> Vec<u32> {
+    lost.iter()
+        .copied()
+        .filter(|slot| (first..=last).contains(slot))
+        .filter(|slot| !nut_slots.contains(slot))
+        .collect()
 }
 
 /// How long to let the node re-sync and get a chance to author after a
@@ -2397,6 +2448,39 @@ mod tests {
             now - anchor < period,
             "genesis is anchored inside the current epoch: {now} - {anchor} >= {period}"
         );
+    }
+
+    /// A slot the engine declined and the node then filled is not a turn
+    /// dropped. The engine looks at the start of a slot and the node may
+    /// author part-way through it, so without this the row would fail a
+    /// node that authored every block it owed.
+    #[test]
+    fn a_slot_the_node_filled_late_is_not_a_missed_turn() {
+        assert_eq!(
+            turns_missed_in_window(&[100, 101, 102], &[101], 100, 102),
+            vec![100, 102]
+        );
+    }
+
+    /// And the window is closed at both ends: the slot the flood started in
+    /// is part-spent before any load arrives, and the one in progress when
+    /// the measurement ends is still the node's to author in.
+    #[test]
+    fn turns_outside_the_flood_window_are_not_attributed_to_it() {
+        assert_eq!(
+            turns_missed_in_window(&[99, 100, 103], &[], 100, 102),
+            vec![100]
+        );
+        assert!(turns_missed_in_window(&[99, 103], &[], 100, 102).is_empty());
+    }
+
+    /// A node that owned nothing in the window has dropped nothing, which
+    /// is the arm that keeps the row from failing a node for the harness's
+    /// timing (`findings.md` §5).
+    #[test]
+    fn an_empty_window_reports_no_missed_turns() {
+        assert!(turns_missed_in_window(&[], &[100, 101], 100, 102).is_empty());
+        assert!(turns_missed_in_window(&[100], &[100], 100, 102).is_empty());
     }
 
     /// The planner and the lane have to mean the same thing by "early enough

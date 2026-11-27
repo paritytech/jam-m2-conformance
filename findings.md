@@ -1408,8 +1408,11 @@ making it bigger.
 
 ## 22. One peer can stop a validator authoring, for as long as it keeps sending
 
-**Status:** open, settled 2026-11-25, and now a reportable polkajam defect
-rather than a candidate. First seen 2026-11-18 (`sessions/n3n4-3`),
+**Status:** open, settled 2026-11-25, and **fixed upstream**: polkajam
+PR [#1420](https://github.com/paritytech/polkajam/pull/1420) (draft, opened
+2026-11-27) runs the filter below on every block instead of only on
+disputes. Open here until it lands and the pin moves to a commit carrying
+it. First seen 2026-11-18 (`sessions/n3n4-3`),
 reproduced through §21, and **re-diagnosed from scratch on 2026-11-25
 because the mechanism recorded here was wrong.**
 
@@ -3394,11 +3397,11 @@ ever passing by arrangement.
 
 ---
 
-## 42. The flood rows were measured and never graded, and one of them cannot fail — CLOSED 2026-11-26
+## 42. The flood rows were measured and never graded, and one of them cannot fail — CLOSED 2026-11-27
 
-**Status:** closed 2026-11-26 for the first half; the second half is
-recorded and deliberately left. Found 2026-11-25 while reconciling N7's row
-bookkeeping (§38), which is the point — nobody set out to look for this.
+**Status:** closed. The first half on 2026-11-26, the second on 2026-11-27.
+Found 2026-11-25 while reconciling N7's row bookkeeping (§38), which is the
+point — nobody set out to look for this.
 
 ### The gap
 
@@ -3433,7 +3436,7 @@ claim the node served someone.
 whatever it measured, the test fails — `left: [Pass], right: [Fail(Soft)]`.
 Restored, it passes. A test that has not been seen to fail is not evidence.
 
-### The half left open: `n7_flood_authors` cannot fail
+### The half that was left open: `n7_flood_authors` could not fail
 
 ```rust
 if let Some(first) = flood.authored_during.iter().min().copied() {
@@ -3458,10 +3461,49 @@ which slots the node owned and produced nothing in, and
 that basis. A node that owns a slot inside the flood window and authors
 nothing there is a verdict, not a guess.
 
-Not done here because it is a row's worth of work rather than a test's, and
-because it wants the same care §22's row needed: attribute the lost slot to
-the flood only where the window actually covers it, and under-count rather
-than guess. Recorded so that the next person to open N7 finds it.
+**Closed 2026-11-27**, with the care §22's row needed.
+
+`FloodFacts::turns_missed` carries the slots the node owned and left empty,
+and a slot lands there only when **both** hold:
+
+- `drive_slots` recorded it, which happens only where the reference engine
+  declined to author the slot — that is how the engine says the slot is the
+  NUT's — and only where the head had not already passed it.
+- No block of the node's for that slot ever reached the harness. The engine
+  looks at the start of a slot and the node may author part-way through it,
+  so the first condition alone over-counts. Checked against every NUT block
+  of the run rather than the ones inside the window, since a block adopted
+  late still proves the turn was taken.
+
+The window is closed at both ends for the same reason: it starts at the
+first slot that *begins* once the flood is under way, because the slot the
+flood started in is part-spent before any load arrives, and it ends at the
+last slot that is over, because the slot in progress is still the node's to
+author in.
+
+**A missed turn decides the row even where other slots were authored**, and
+that is the one place it parts from `n7_restart_authors_again`. After a
+restart the question is whether the node came back at all, so any block
+answers it. Under load the question is whether it kept its turns, and one
+it dropped is the answer however many it kept.
+
+**Verified by mutation**, both losing arms. With the missed-turn arm
+disabled, the dropped-turn test fails
+(`left: [("n7_flood_authoring_not_exercised", Fail(Soft))]`) and the
+authored-elsewhere test fails with the old verdict
+(`left: [("n7_flood_authors", Pass)]`) — which is the row as it stood
+before this change, failing the tests written for the row as it stands now.
+
+The window arithmetic is a function of its own,
+`turns_missed_in_window`, with its own tests: a slot the node filled late is
+not a missed turn, a slot outside the window is not attributed to the
+flood, and a window holding no turn of the node's reports nothing rather
+than failing it (§5).
+
+**What it still will not say.** A block authored and never announced reads
+here as a turn dropped, because the harness grades what reached it. The
+detail text says exactly that — "no block of its for it ever reached the
+harness" — rather than claiming the node did not author.
 
 **The rule.** *Proving the measurement is not proving the row.* A test that
 stops at the instrument has tested the instrument. Every lane's bar is that
