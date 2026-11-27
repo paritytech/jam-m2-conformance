@@ -713,6 +713,11 @@ fails where the node owned a slot inside the flood window and no block of its fo
 arrived. It under-counts in the two ways §22's own row does, and a mutation confirms both
 of its losing arms.
 
+Its first live reading is `sessions/flood-row-1` (2026-11-27): SOFT PASS, 2350 streams at a
+target of 500/s, bystander answered during and after, no turn missed. That run also made the
+row give a lost slot back — the node lost slot 10007820 to §22's defect, and a lost slot a
+false assurance explains is N4's to report, not the flood's.
+
 **On M2-B.** Its bar is *"Safrole tickets covered, **and** the harness's own checks are proven
 by deliberately faulty simulated clients"* — the delivery plan calls it the structural
 milestone: *before it, the harness reports; after it, the harness can be trusted to judge.*
@@ -1630,6 +1635,9 @@ The image is taken from the `JAM_M2_IMAGE` environment variable of the *runner* 
 
 ### 5.4 Running it
 
+The operator's guide is [RUNNING.md](RUNNING.md); this section is the milestone
+record of the same contract, kept here because the evidence around it is here.
+
 ```sh
 # 1. Build the harness.
 cargo build --workspace
@@ -1768,5 +1776,6 @@ under test and the engine that grades it are the same build.
 - `DESIGN.md` — design contract; §7 environment contract, §11 check catalogue, §13 roadmap
 - `M2 Conformance - Delivery Plan.md` — milestone ladder keyed to JAMNP-S coverage
 - `README.md` — build, run, and current implementation state
+- `RUNNING.md` — operator's guide: grading a node that is not polkajam
 - JAMNP-S: https://github.com/zdave-parity/jam-np (`simple.md`)
 - M1 conformance: https://github.com/davxy/jam-conformance

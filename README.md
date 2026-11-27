@@ -42,6 +42,10 @@ state.
 
 ## Build and run
 
+**Grading a node that is not polkajam: [RUNNING.md](RUNNING.md)** — what to
+install, how to launch your node, how to read the report, and what the harness
+still cannot do for you. What follows here is the short form.
+
 ```sh
 cargo build --workspace
 
@@ -83,17 +87,23 @@ report (`sessions/<id>/report/{report.md,findings.json}`, `traces/jamnp.{bin,jso
 `M2-status.md` records the milestone evidence in full, and how to point the suite at a
 third-party node.
 
-Latest run, `sessions/status-all` (2026-11-24), all seven lanes over a 300 s window:
-**631 rows — 406 hard passes, 40 soft passes, 3 hard findings.** None of the three is the
-harness's, and they are the same three as the previous run:
+Latest run, `sessions/flood-row-1` (2026-11-27), all seven lanes over a 300 s window:
+**640 rows — 410 hard passes, 40 soft passes, 4 hard findings.** None of the four is the
+harness's:
 
 | row | what it is |
 |---|---|
 | `ce129_boundary_parent_before_child` | a node defect, standing since the first N0 runs |
 | `n2_unknown_epoch_reset_observed` | a node defect: the ticket is rejected, the stream is not reset |
 | `n3_ce146_oversized_refused` | `findings.md` §4 — the node applies the work-package size cap on CE 133 and not on CE 146. polkajam confirmed this a bug 2026-11-25: it should reject oversized packages on both |
+| `n4_ce141_invalid_assurance_cost_a_block` | `findings.md` §22 — one false assurance from one peer cost the node slot 10007820 outright. Fixed upstream in polkajam [#1420](https://github.com/paritytech/polkajam/pull/1420), which this run's pin predates |
 
-Rows per lane: N0 43, N1 67, N2 133, N3 74, N4 297, N6 5, N7 12.
+Rows per lane: N0 44, N1 67, N2 139, N3 74, N4 296, N6 5, N7 15.
+
+The fourth finding is not a new defect: it is §22, which the previous run's window
+happened not to catch. `n7_flood_authors` read SOFT PASS here — its first live
+reading, and the run that showed it had to give a §22-explained lost slot back to
+N4's row rather than blame the flood for it (`findings.md` §42).
 
 **The 182 soft rows are mostly one thing.** 127 are
 `n4_ce141_inclusion_not_exercised` — a control the run did not reach, which

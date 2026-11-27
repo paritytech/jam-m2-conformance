@@ -2032,9 +2032,39 @@ async fn flood_node(
     // The slot now in progress is still the node's to author in, so the
     // window ends with the last one that is over.
     let window_last = m2_reference::chain::wall_clock_slot().saturating_sub(1);
+    // A turn the node lost to a pooled false assurance is §22's defect, not
+    // the flood's, and both rows can see the same slot: the emulated
+    // validators go on offering faulty assurances while the flood runs.
+    // Attributing it twice would read as two defects. N4's row owns that
+    // slot, so this one gives it up -- the same rule, from the same helper,
+    // so the two cannot drift apart.
+    let lost = crate::real::LostTurns {
+        slots: m2_emu::emu::lock(&data.lost_slots).clone(),
+        chain: data
+            .ref_chain
+            .chain_blocks()
+            .unwrap_or_default()
+            .iter()
+            .map(|block| (block.header.slot, block.header.hash().0))
+            .collect(),
+    };
+    let explained: Vec<u32> = m2_emu::emu::lock(&data.assurances_offered)
+        .iter()
+        // Only `EmptyCore` reaches block composition; the other two faults
+        // are refused on arrival and were never in the pool to cost
+        // anything (`findings.md` §22).
+        .filter(|offer| {
+            matches!(
+                offer.fault,
+                Some(m2_scenario::scenarios::n4::AssuranceFaultKind::EmptyCore)
+            )
+        })
+        .filter_map(|offer| lost.turn_lost_on(offer.anchor, offer.sent_in_slot))
+        .collect();
     let turns_missed = turns_missed_in_window(
-        &m2_emu::emu::lock(&data.lost_slots),
+        &lost.slots,
         &all_nut_slots,
+        &explained,
         window_first,
         window_last,
     );
@@ -2075,11 +2105,24 @@ async fn flood_node(
 /// Outside `first..=last` nothing is attributed: the slot the flood began
 /// in is part-spent before any load arrives, and the slot in progress when
 /// the measurement ends is one the node can still author in.
-fn turns_missed_in_window(lost: &[u32], nut_slots: &[u32], first: u32, last: u32) -> Vec<u32> {
+///
+/// `explained` are the slots N4's row has already attributed to a pooled
+/// false assurance (§22). They are the flood's only where the flood is what
+/// cost them, and it is not: the emulated validators go on offering faulty
+/// assurances while the flood runs, so without this the same lost slot
+/// would be reported twice, by two lanes, as two defects.
+fn turns_missed_in_window(
+    lost: &[u32],
+    nut_slots: &[u32],
+    explained: &[u32],
+    first: u32,
+    last: u32,
+) -> Vec<u32> {
     lost.iter()
         .copied()
         .filter(|slot| (first..=last).contains(slot))
         .filter(|slot| !nut_slots.contains(slot))
+        .filter(|slot| !explained.contains(slot))
         .collect()
 }
 
@@ -2457,7 +2500,7 @@ mod tests {
     #[test]
     fn a_slot_the_node_filled_late_is_not_a_missed_turn() {
         assert_eq!(
-            turns_missed_in_window(&[100, 101, 102], &[101], 100, 102),
+            turns_missed_in_window(&[100, 101, 102], &[101], &[], 100, 102),
             vec![100, 102]
         );
     }
@@ -2468,10 +2511,25 @@ mod tests {
     #[test]
     fn turns_outside_the_flood_window_are_not_attributed_to_it() {
         assert_eq!(
-            turns_missed_in_window(&[99, 100, 103], &[], 100, 102),
+            turns_missed_in_window(&[99, 100, 103], &[], &[], 100, 102),
             vec![100]
         );
-        assert!(turns_missed_in_window(&[99, 103], &[], 100, 102).is_empty());
+        assert!(turns_missed_in_window(&[99, 103], &[], &[], 100, 102).is_empty());
+    }
+
+    /// A turn N4's row has already attributed to a pooled false assurance
+    /// belongs to that row, not this one. The live run of 2026-11-27 shows
+    /// why it matters: the node lost slot 10007820 to validator 2's
+    /// `EmptyCore` assurance, and the emulated validators go on offering
+    /// those while the flood runs, so the two windows can hold the same
+    /// slot (`findings.md` §22, §42).
+    #[test]
+    fn a_turn_a_false_assurance_cost_is_not_the_floods() {
+        assert_eq!(
+            turns_missed_in_window(&[100, 101], &[], &[101], 100, 102),
+            vec![100]
+        );
+        assert!(turns_missed_in_window(&[101], &[], &[101], 100, 102).is_empty());
     }
 
     /// A node that owned nothing in the window has dropped nothing, which
@@ -2479,8 +2537,8 @@ mod tests {
     /// timing (`findings.md` §5).
     #[test]
     fn an_empty_window_reports_no_missed_turns() {
-        assert!(turns_missed_in_window(&[], &[100, 101], 100, 102).is_empty());
-        assert!(turns_missed_in_window(&[100], &[100], 100, 102).is_empty());
+        assert!(turns_missed_in_window(&[], &[100, 101], &[], 100, 102).is_empty());
+        assert!(turns_missed_in_window(&[100], &[100], &[], 100, 102).is_empty());
     }
 
     /// The planner and the lane have to mean the same thing by "early enough
