@@ -329,8 +329,14 @@ async fn the_flood_row_measures_bystanders_not_the_flooder() {
         // runner does it: asking only after the flood stopped would measure
         // recovery, which is the other row.
         let duration = std::time::Duration::from_millis(500);
-        let flooding =
-            robustness::flood_streams(&flooder, PEER, jamnp_s::framing::CE141, 500, duration, &trace);
+        let flooding = robustness::flood_streams(
+            &flooder,
+            PEER,
+            jamnp_s::framing::CE141,
+            500,
+            duration,
+            &trace,
+        );
         let watching = async {
             // Let the flood build before asking, or the question lands while
             // the node is still idle and answers something that proves nothing.
@@ -370,6 +376,7 @@ async fn the_flood_row_measures_bystanders_not_the_flooder() {
                 served_bystander_during: Some(during),
                 served_bystander_after: Some(after),
                 authored_during: Vec::new(),
+                turns_missed: Vec::new(),
             }),
         };
         let obs = m2_scenario::dsl::ObsLog::new();
@@ -422,6 +429,7 @@ async fn a_flood_with_no_bystander_is_not_a_pass() {
             served_bystander_during: None,
             served_bystander_after: None,
             authored_during: Vec::new(),
+            turns_missed: Vec::new(),
         }),
     };
     let obs = m2_scenario::dsl::ObsLog::new();

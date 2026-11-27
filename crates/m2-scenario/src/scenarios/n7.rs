@@ -68,6 +68,20 @@ pub struct FloodFacts {
     /// Slots the node authored in between the flood starting and the
     /// measurement ending.
     pub authored_during: Vec<u32>,
+    /// Slots inside that window the node owned and no block of its ever
+    /// filled.
+    ///
+    /// This is what makes the authoring row gradable (`findings.md` §42).
+    /// A slot lands here only when the reference engine declined to author
+    /// it — which is how it says the slot is the NUT's — *and* no block of
+    /// the node's for that slot ever reached the harness. Both halves are
+    /// needed: the first alone would count slots the node filled a moment
+    /// after the engine looked.
+    ///
+    /// Empty means "no turn was seen to be missed", which includes the run
+    /// where the node simply had no turn. The row treats it as the absence
+    /// of a subject rather than as a pass.
+    pub turns_missed: Vec<u32>,
 }
 
 /// What a kill-and-restart of the node under test produced.
@@ -536,16 +550,54 @@ pub fn flood_serves_bystanders(ctx: &N7Ctx) -> Check {
 
 /// Did it go on authoring through the flood?
 ///
-/// **Soft**, and reported only where the node authored at all during the
-/// run: this harness cannot say which slots the node was due in (see
-/// [`RestartFacts::first_due_slot`]), so silence is ambiguous and a verdict
-/// drawn from it would be a guess.
+/// DESIGN §11 N7 asks for "authors on time", and until `findings.md` §42
+/// this row could only ever say yes: it reported a pass where the node
+/// authored and nothing at all where it did not, because the harness had no
+/// way to tell a missed turn from no turn. [`FloodFacts::turns_missed`] is
+/// that way — the same machinery §22 built for
+/// `n4_ce141_invalid_assurance_cost_a_block` — so the row now has a losing
+/// side.
+///
+/// **A missed turn decides the row, even where other slots were authored.**
+/// That is the one place this parts from
+/// [`restart_authors_again`]: after a restart the question is whether the
+/// node came back at all, so any block answers it, while under load the
+/// question is whether it kept its turns, and one it dropped is the answer
+/// however many it kept.
+///
+/// **Soft**, like every other flood row: the NP sets no obligation about
+/// behaviour under load (`findings.md` §34).
+///
+/// **It under-counts, deliberately**, in the two ways §22's row does. A slot
+/// is missed only where the reference engine declined it *and* no block of
+/// the node's for it ever arrived — so a block authored and never announced
+/// reads as a missed turn, which the detail text says in those words rather
+/// than claiming the node did not author.
 pub fn flood_authors(ctx: &N7Ctx) -> Check {
     let flood = ctx.flood.clone();
     check("n7_flood_authoring", Severity::Soft, move |_obs| {
         let Some(flood) = &flood else {
             return Vec::new();
         };
+        // The losing side, and it is checked first: a node that authored in
+        // one slot and dropped another has still dropped one.
+        if let Some(missed) = flood.turns_missed.iter().min().copied() {
+            let turns = flood.turns_missed.clone();
+            let duration_ms = flood.duration_ms;
+            let authored = flood.authored_during.clone();
+            return vec![log::check_detail(
+                "n7_flood_authors",
+                false,
+                Severity::Soft,
+                move || {
+                    format!(
+                        "the node owned slot {missed} inside the {duration_ms} ms flood window \
+                         and no block of its for it ever reached the harness (missed {turns:?}, \
+                         authored {authored:?})"
+                    )
+                },
+            )];
+        }
         if let Some(first) = flood.authored_during.iter().min().copied() {
             return vec![log::check_detail(
                 "n7_flood_authors",
@@ -554,14 +606,17 @@ pub fn flood_authors(ctx: &N7Ctx) -> Check {
                 || format!("authored slot {first} under load"),
             )];
         }
+        // Neither a block nor a missed turn: the window held no turn of the
+        // node's, so there is nothing to grade. Saying so is not a pass
+        // (`findings.md` §19).
         vec![log::check_detail(
             "n7_flood_authoring_not_exercised",
             false,
             Severity::Soft,
             || {
                 format!(
-                    "the node authored nothing in the {} ms the flood covered, and this \
-                     harness cannot say whether it was due to",
+                    "the node authored nothing in the {} ms the flood covered, and no slot in \
+                     that window was one the node owned",
                     flood.duration_ms
                 )
             },
@@ -636,6 +691,16 @@ mod tests {
         after: Option<bool>,
         authored: Vec<u32>,
     ) -> N7Ctx {
+        flooded_missing(flooder_survived, during, after, authored, Vec::new())
+    }
+
+    fn flooded_missing(
+        flooder_survived: bool,
+        during: Option<bool>,
+        after: Option<bool>,
+        authored: Vec<u32>,
+        turns_missed: Vec<u32>,
+    ) -> N7Ctx {
         N7Ctx {
             flood: Some(FloodFacts {
                 target_rate_per_sec: 500,
@@ -645,6 +710,7 @@ mod tests {
                 served_bystander_during: during,
                 served_bystander_after: after,
                 authored_during: authored,
+                turns_missed,
             }),
             ..ctx(
                 vec![provocation(StreamOutcome::Reset, Some(true))],
@@ -954,10 +1020,10 @@ mod tests {
         assert!(rows[0].1 != Outcome::Pass);
     }
 
-    /// Authoring under load passes; silence says so rather than failing,
-    /// since the harness cannot tell a missed turn from no turn.
+    /// Authoring under load passes, and a turn the node owned and left
+    /// empty fails: the row §42 rebuilt so that it has a losing side.
     #[test]
-    fn authoring_under_load_is_graded_like_authoring_after_a_restart() {
+    fn a_turn_dropped_under_load_fails_the_authoring_row() {
         assert_eq!(
             run(flood_authors(&flooded(
                 true,
@@ -967,12 +1033,46 @@ mod tests {
             ))),
             [("n7_flood_authors", Outcome::Pass)]
         );
+
+        // The verdict this row could not reach before §42.
+        assert_eq!(
+            run(flood_authors(&flooded_missing(
+                true,
+                Some(true),
+                Some(true),
+                vec![],
+                vec![9_954_401]
+            ))),
+            [("n7_flood_authors", Outcome::Fail(Severity::Soft))]
+        );
+    }
+
+    /// Keeping some turns does not buy back a dropped one. This is where
+    /// the row parts from the restart row, on purpose: "authored at all"
+    /// answers *did it come back*, not *did it stay on time*.
+    #[test]
+    fn authoring_elsewhere_does_not_excuse_the_dropped_turn() {
+        let rows = run(flood_authors(&flooded_missing(
+            true,
+            Some(true),
+            Some(true),
+            vec![9_954_400, 9_954_402],
+            vec![9_954_401],
+        )));
+        assert_eq!(rows, [("n7_flood_authors", Outcome::Fail(Severity::Soft))]);
+    }
+
+    /// No block and no turn is no subject, and must not read as a pass
+    /// (`findings.md` §19).
+    #[test]
+    fn a_window_holding_no_turn_of_the_nodes_grades_nothing() {
         let silent = run(flood_authors(&flooded(
             true,
             Some(true),
             Some(true),
             vec![],
         )));
+        assert_eq!(silent.len(), 1);
         assert_eq!(silent[0].0, "n7_flood_authoring_not_exercised");
         assert!(silent[0].1 != Outcome::Pass);
     }

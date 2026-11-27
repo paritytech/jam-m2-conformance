@@ -705,10 +705,13 @@ that stops — and asserted on `connection_answers` rather than on the row's ver
 builds the `FloodFacts` the live runner builds and asserts the outcomes, and a mutation
 confirms it fails when the row is rewired to pass regardless.
 
-One flood row stays short of the bar on purpose: `n7_flood_authors` reports `true` or
-reports nothing, so no input makes it fail. The reason was that this harness could not tell
-which slots the node was due in — which §22's work has since made false, so §42 records
-the row as worth rebuilding rather than as settled.
+`n7_flood_authors` was the half §42 left open, and it is closed too (2026-11-27). The row
+reported `true` or reported nothing, because the harness could not tell a missed turn from
+no turn. §22's work had already built the answer — `drive_slots` records the slots the
+reference engine declines, which is how it says a slot is the node's — and the row now
+fails where the node owned a slot inside the flood window and no block of its for it ever
+arrived. It under-counts in the two ways §22's own row does, and a mutation confirms both
+of its losing arms.
 
 **On M2-B.** Its bar is *"Safrole tickets covered, **and** the harness's own checks are proven
 by deliberately faulty simulated clients"* — the delivery plan calls it the structural

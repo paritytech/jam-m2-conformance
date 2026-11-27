@@ -401,7 +401,10 @@ is on the node's side, written up as `findings.md` §22: a peer that sends
 one signature-valid, anchor-valid assurance claiming a core that carries no
 report costs the node **every** authoring slot it owns until that peer
 stops. polkajam refuses to author at all rather than dropping the
-assurance, though it already holds the filter that would drop it.
+assurance, though it already holds the filter that would drop it — which is
+what polkajam PR
+[#1420](https://github.com/paritytech/polkajam/pull/1420) now runs on every
+block.
 
 **The pin is on upstream main.** `Cargo.toml` and `oracle/Cargo.toml` point
 at polkajam `d92cadd30`, which exports three things the harness cannot do
