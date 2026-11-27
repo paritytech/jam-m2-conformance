@@ -1048,8 +1048,10 @@ so rather than left to disagree with the code.
 
 ## 17. The segment protocols cannot be exercised against a live node — CLOSED 2026-11-19
 
-**Status:** open. Found while writing the CE 148 rows, by asking what the
-run would actually ask for. Opened 2026-11-18.
+**Status:** closed 2026-11-19, and the status line said "open" until
+2026-11-27 — the heading, the body and this line disagreed for eight days.
+Found while writing the CE 148 rows, by asking what the run would actually
+ask for. Opened 2026-11-18.
 
 Every segment protocol — CE 139, CE 140 and now CE 148 — is driven from the
 availability plan, and the plan's `segment_indices` come from the
@@ -3504,6 +3506,37 @@ than failing it (§5).
 here as a turn dropped, because the harness grades what reached it. The
 detail text says exactly that — "no block of its for it ever reached the
 harness" — rather than claiming the node did not author.
+
+### What the first live run of the row found
+
+`sessions/flood-row-1` (2026-11-27, all seven lanes, 300 s window, 640 rows).
+The row read **SOFT PASS** against the live node: 2350 streams at a target
+of 500/s, the bystander answered during and after, and the node authored
+through it with no turn missed. So the first thing the live run proves is
+that the row does not fail a node that behaves — the failure mode a new
+negative row is most likely to have.
+
+**It also found a way the row could blame the flood for someone else's
+defect.** The same run lost a slot to §22: *"the NUT owned slot 10007820,
+whose parent would have been 960a20b5, and authored nothing there:
+validator 2 sent an assurance claiming a core with no report."* That slot
+is in `lost_slots`, and it is exactly what `turns_missed` collects. It fell
+outside the flood window here only because the flood runs after the
+observation window — but the emulated validators go on offering faulty
+assurances while the flood runs, so the two windows can hold the same slot,
+and the run that does would report one lost slot twice, as two defects, in
+two lanes.
+
+**Closed by giving the slot to N4's row.** `turns_missed_in_window` now
+takes the slots a pooled `EmptyCore` assurance already explains — computed
+with `LostTurns::turn_lost_on`, the same helper N4's row grades with, so the
+two cannot drift apart — and leaves them out. Only `EmptyCore` is
+subtracted, because the other two faults never reach composition and so
+never cost a slot (§22). Verified by mutation: without the subtraction the
+test claims both slots.
+
+That hazard is the kind of thing only a live run finds, and it is the second
+time this row has needed §22's machinery to be honest.
 
 **The rule.** *Proving the measurement is not proving the row.* A test that
 stops at the instrument has tested the instrument. Every lane's bar is that
